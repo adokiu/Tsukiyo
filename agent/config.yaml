@@ -1,0 +1,2 @@
+master: "wss://master.example.com"
+token: "your-node-token"

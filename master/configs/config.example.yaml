@@ -1,0 +1,36 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  ws_port: 8081
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "tsukiyo"
+  password: "tsukiyo_password"
+  dbname: "tsukiyo"
+  sslmode: "disable"
+  max_conns: 20
+  min_conns: 5
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+
+jwt:
+  secret: "change_this_to_a_random_string_at_least_32_chars"
+  expire_hours: 24
+
+log:
+  level: "info"
+  format: "json"
+  output_path: ""
+
+agent:
+  heartbeat_interval: 30
+  heartbeat_timeout: 60
+  task_timeout: 300

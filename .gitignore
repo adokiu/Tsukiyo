@@ -1,0 +1,50 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Build outputs
+/agent/tsukiyo-agent*
+/master/tsukiyo-master*
+/master/cmd/master/master
+
+# Images (large files, built locally)
+/images/vm/*.img
+/images/vm/*.qcow2
+/images/vm/*.raw
+/images/container/*.tar.xz
+/images/container/*.squashfs
+/images/**/*.tar.gz
+/images/**/*.iso
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+/vendor/
+node_modules/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Examples (large reference projects, not part of main codebase)
+examples/
