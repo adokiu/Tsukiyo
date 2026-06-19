@@ -30,13 +30,7 @@ function InitGuard({ children }: { children: React.ReactNode }) {
     apiClient
       .get('/init/status')
       .then((res) => setInitialized(res.data.initialized))
-      .catch((error) => {
-        if (error.response?.status === 404) {
-          setInitialized(false)
-        } else {
-          setInitialized(true)
-        }
-      })
+      .catch(() => setInitialized(true))
   }, [])
 
   if (initialized === null) {
