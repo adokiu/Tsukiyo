@@ -1,0 +1,13 @@
+# Tsukiyo Agent 配置文件示例
+
+# Master 服务器地址
+master: "ws://localhost:8080"
+
+# Agent 认证 Token
+token: "your-token-here"
+
+# 日志配置
+log:
+  level: "info"           # debug, info, warn, error
+  format: "json"          # json, console
+  output_path: ""         # 留空输出到 stdout，可指定文件路径如 /var/log/tsukiyo/agent.log

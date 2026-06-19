@@ -24,6 +24,7 @@ import (
 	"tsukiyo/agent/internal/security"
 	"tsukiyo/agent/internal/task"
 	"tsukiyo/agent/internal/ws"
+	"tsukiyo/agent/pkg/logger"
 )
 
 const agentVersion = "1.0.0"
@@ -39,25 +40,26 @@ func main() {
 	configPath := flag.String("config", getDefaultConfigPath(), "配置文件路径")
 	flag.Parse()
 
-	// 初始化日志
-	logger, _ := zap.NewProduction()
-	if os.Getenv("DEBUG") == "1" {
-		logger, _ = zap.NewDevelopment()
+	// 初始化日志（使用默认配置先初始化）
+	if err := logger.Init("info", "json", ""); err != nil {
+		fmt.Fprintf(os.Stderr, "初始化日志失败: %v\n", err)
+		os.Exit(1)
 	}
-	zap.ReplaceGlobals(logger)
 	defer logger.Sync()
 
 	zap.L().Info("Tsukiyo Agent 启动",
 		zap.String("version", agentVersion),
 		zap.String("config", *configPath))
 
-	// 加载配置（仅 master + token）
-	cfg, err := config.Load(*configPath)
-	if err != nil {
+	// 加载配置
+	if err := config.Init(*configPath); err != nil {
 		zap.L().Fatal("加载配置失败", zap.Error(err))
 	}
 
-	// 各模块引用，初始化后赋值，后续 configHandler 可访问
+	// 重新初始化日志（使用配置文件中的级别）
+	logger.Init(config.AppConfig.Log.Level, config.AppConfig.Log.Format, config.AppConfig.Log.OutputPath)
+
+	// 各模块引用
 	var (
 		incusClient  *incus.Client
 		netManager   *network.Manager
@@ -68,7 +70,7 @@ func main() {
 	)
 
 	// 初始化 WebSocket 客户端
-	wsClient := ws.NewClient(cfg)
+	wsClient := ws.NewClient(config.AppConfig)
 
 	// 用于等待首次配置下发的 channel
 	configReady := make(chan struct{})
@@ -76,20 +78,18 @@ func main() {
 
 	// 设置配置处理器
 	wsClient.SetConfigHandler(func(data map[string]interface{}) {
-		// 首次收到配置：解除 main 阻塞
 		initOnce.Do(func() {
 			close(configReady)
 		})
 
-		// 每次收到配置都尝试应用（幂等）
 		moduleMu.Lock()
 		ic := incusClient
 		moduleMu.Unlock()
 
 		if ic != nil {
-			applyConfig(cfg, ic)
+			applyConfig(config.AppConfig, ic)
 
-			// 解析 VPC 配置并执行全量状态对齐（宿主机重启后恢复 bridge + SNAT）
+			// 解析 VPC 配置并执行全量状态对齐
 			if vpcsRaw, ok := data["vpcs"]; ok {
 				var vpcs []reconcile.VPCConfig
 				if rawJSON, err := json.Marshal(vpcsRaw); err == nil {
@@ -104,7 +104,6 @@ func main() {
 					}
 				}
 			} else {
-				// Master 未下发 VPC 配置，尝试用本地持久化状态恢复
 				if vpcs, err := reconcile.LoadDesiredState(); err == nil && len(vpcs) > 0 {
 					zap.L().Info("使用本地持久化 VPC 状态进行恢复", zap.Int("count", len(vpcs)))
 					r := reconcile.NewReconciler(ic)
@@ -112,7 +111,7 @@ func main() {
 				}
 			}
 
-			// 解析端口映射配置并恢复 proxy 设备（宿主机重启后恢复端口映射）
+			// 解析端口映射配置并恢复 proxy 设备
 			if pmsRaw, ok := data["port_mappings"]; ok {
 				var pms []reconcile.PortMappingConfig
 				if rawJSON, err := json.Marshal(pmsRaw); err == nil {
@@ -126,7 +125,7 @@ func main() {
 				}
 			}
 
-			// 每次收到 Master 配置（含重连后）都同步本地镜像列表
+			// 同步本地镜像列表
 			go syncLocalImages(ic, wsClient)
 		}
 	})
@@ -145,8 +144,8 @@ func main() {
 		zap.L().Fatal("等待 Master 配置超时，请检查 Master 是否已对该节点进行初始化")
 	}
 
-	// ========== 初始化 Incus 客户端 ==========
-	ic, err := incus.NewClient(cfg.IncusSocketPath())
+	// 初始化 Incus 客户端
+	ic, err := incus.NewClient(config.AppConfig.IncusSocketPath())
 	if err != nil {
 		zap.L().Fatal("初始化 Incus 客户端失败", zap.Error(err))
 	}
@@ -163,8 +162,8 @@ func main() {
 		zap.L().Warn("获取 Incus 服务器信息失败", zap.Error(err))
 	}
 
-	// 首次应用配置（存储池等）
-	applyConfig(cfg, ic)
+	// 首次应用配置
+	applyConfig(config.AppConfig, ic)
 
 	// 上报本地已有镜像列表
 	if aliases, err := ic.ListImages(); err == nil && len(aliases) > 0 {
@@ -175,15 +174,15 @@ func main() {
 		}
 	}
 
-	// ========== 初始化网络管理器 ==========
-	netManager = network.NewManager(cfg.NetworkInterface(), cfg.EnableNAT(), cfg.EnableFirewall())
+	// 初始化网络管理器
+	netManager = network.NewManager(config.AppConfig.NetworkInterface(), config.AppConfig.EnableNAT(), config.AppConfig.EnableFirewall())
 	zap.L().Info("网络管理器初始化完成",
 		zap.String("interface", netManager.GetInterfaceName()),
-		zap.Bool("nat", cfg.EnableNAT()),
-		zap.Bool("firewall", cfg.EnableFirewall()))
+		zap.Bool("nat", config.AppConfig.EnableNAT()),
+		zap.Bool("firewall", config.AppConfig.EnableFirewall()))
 
-	// ========== 初始化任务执行器 ==========
-	taskExecutor := task.NewExecutor(cfg, ic, netManager, wsClient)
+	// 初始化任务执行器
+	taskExecutor := task.NewExecutor(config.AppConfig, ic, netManager, wsClient)
 	wsClient.SetTaskHandler(func(taskID string, taskType string, payload json.RawMessage) (json.RawMessage, error) {
 		return taskExecutor.Execute(taskType, payload)
 	})
@@ -232,36 +231,36 @@ func main() {
 		}
 	})
 
-	// ========== 初始化监控采集器 ==========
-	collector = monitor.NewCollector(cfg, wsClient, ic)
+	// 初始化监控采集器
+	collector = monitor.NewCollector(config.AppConfig, wsClient, ic)
 	collector.Start()
 
-	// ========== 初始化安全扫描器 ==========
-	scanner = security.NewScanner(cfg, netManager)
+	// 初始化安全扫描器
+	scanner = security.NewScanner(config.AppConfig, netManager)
 	scanner.Start()
 
-	// ========== 初始化控制台代理 ==========
-	consoleProxy = console.NewProxy(cfg)
+	// 初始化控制台代理
+	consoleProxy = console.NewProxy(config.AppConfig)
 	go func() {
 		if err := consoleProxy.ServeHTTP(); err != nil {
 			zap.L().Error("控制台代理异常", zap.Error(err))
 		}
 	}()
 
-	// ========== 首次上报本地 Incus 镜像列表 ==========
+	// 首次上报本地 Incus 镜像列表
 	go func() {
 		time.Sleep(3 * time.Second)
 		syncLocalImages(ic, wsClient)
 	}()
 
-	// ========== 确保所有 bridge 网络启用 NAT ==========
+	// 确保所有 bridge 网络启用 NAT
 	go func() {
 		time.Sleep(2 * time.Second)
 		r := reconcile.NewReconciler(ic)
 		r.EnsureAllBridgeNAT()
 	}()
 
-	// ========== 健康检查 HTTP ==========
+	// 健康检查 HTTP
 	var wg sync.WaitGroup
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -297,7 +296,7 @@ func main() {
 		}
 	}()
 
-	// systemd notify (如果可用)
+	// systemd notify
 	systemdNotify("READY=1")
 
 	zap.L().Info("Agent 初始化完成，运行中...")
@@ -322,7 +321,6 @@ func main() {
 	zap.L().Info("Agent 已退出")
 }
 
-// syncLocalImages 查询 Incus 本地镜像并上报 Master
 func syncLocalImages(ic *incus.Client, wsClient *ws.Client) {
 	aliases, err := ic.ListImages()
 	if err != nil {
@@ -339,7 +337,6 @@ func syncLocalImages(ic *incus.Client, wsClient *ws.Client) {
 	}
 }
 
-// applyConfig 应用 Master 下发的配置（幂等，每次收到 config 消息都调用）
 func applyConfig(cfg *config.Config, ic *incus.Client) {
 	poolName := cfg.DefaultStoragePool()
 	poolType := cfg.StoragePoolType()
@@ -370,17 +367,14 @@ func applyConfig(cfg *config.Config, ic *incus.Client) {
 	}
 }
 
-// systemdNotify 发送 systemd 通知 (如果支持)
 func systemdNotify(state string) {
 	socket := os.Getenv("NOTIFY_SOCKET")
 	if socket == "" {
 		return
 	}
-	// 简化的 systemd 通知
 	zap.L().Info("发送 systemd 通知", zap.String("state", state))
 }
 
-// getDefaultConfigPath 返回可执行文件同目录下的 config.yaml 路径
 func getDefaultConfigPath() string {
 	exe, err := os.Executable()
 	if err != nil {

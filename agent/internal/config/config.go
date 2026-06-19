@@ -10,10 +10,11 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Config Agent 配置，master 和 token 从配置文件读取，其余由 Master 动态下发
+// Config Agent 配置
 type Config struct {
-	Master string `mapstructure:"master"`
-	Token  string `mapstructure:"token"`
+	Master string    `mapstructure:"master"`
+	Token  string    `mapstructure:"token"`
+	Log    LogConfig `mapstructure:"log"`
 
 	mu                 sync.RWMutex
 	incusSocketPath    string
@@ -30,28 +31,56 @@ type Config struct {
 	storagePoolSource  string
 }
 
-// Load 加载配置
-func Load(path string) (*Config, error) {
-	viper.SetConfigFile(path)
+// LogConfig 日志配置
+type LogConfig struct {
+	Level      string `mapstructure:"level"`
+	Format     string `mapstructure:"format"`
+	OutputPath string `mapstructure:"output_path"`
+}
+
+var AppConfig *Config
+
+// Init 初始化配置
+func Init(configPath string) error {
+	viper.SetConfigFile(configPath)
 	viper.SetConfigType("yaml")
 
+	setDefaults()
+
+	viper.AutomaticEnv()
+	viper.SetEnvPrefix("TSUKIYO_AGENT")
+
 	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+		return fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("解析配置失败: %w", err)
+	AppConfig = &Config{}
+	if err := viper.Unmarshal(AppConfig); err != nil {
+		return fmt.Errorf("解析配置失败: %w", err)
 	}
 
-	if cfg.Master == "" {
-		return nil, fmt.Errorf("master 不能为空")
+	if AppConfig.Master == "" {
+		return fmt.Errorf("master 不能为空")
 	}
-	if cfg.Token == "" {
-		return nil, fmt.Errorf("token 不能为空")
+	if AppConfig.Token == "" {
+		return fmt.Errorf("token 不能为空")
 	}
 
-	return &cfg, nil
+	return nil
+}
+
+// Load 加载配置（兼容旧接口）
+func Load(path string) (*Config, error) {
+	if err := Init(path); err != nil {
+		return nil, err
+	}
+	return AppConfig, nil
+}
+
+func setDefaults() {
+	viper.SetDefault("log.level", "info")
+	viper.SetDefault("log.format", "json")
+	viper.SetDefault("log.output_path", "")
 }
 
 // UpdateFromMaster 由 Master 下发的配置更新
