@@ -10,10 +10,12 @@ import NodesPage from '@/pages/admin/NodesPage'
 import InstancesPage from '@/pages/admin/InstancesPage'
 import InstanceDetailPage from '@/pages/admin/InstanceDetailPage'
 import ImagesPage from '@/pages/admin/ImagesPage'
+import TasksPage from '@/pages/admin/TasksPage'
 import NetworkPage from '@/pages/admin/NetworkPage'
 import SecurityPage from '@/pages/admin/SecurityPage'
 import UsersPage from '@/pages/admin/UsersPage'
 import AuditLogsPage from '@/pages/admin/AuditLogsPage'
+import SettingsPage from '@/pages/admin/SettingsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -71,10 +73,12 @@ export default function AppRoutes() {
           <Route path="instances" element={<InstancesPage />} />
           <Route path="instances/:id" element={<InstanceDetailPage />} />
           <Route path="images" element={<ImagesPage />} />
+          <Route path="tasks" element={<TasksPage />} />
           <Route path="network" element={<NetworkPage />} />
           <Route path="security" element={<SecurityPage />} />
           <Route path="users" element={<UsersPage />} />
           <Route path="audit-logs" element={<AuditLogsPage />} />
+          <Route path="settings" element={<SettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/admin" replace />} />
       </Routes>

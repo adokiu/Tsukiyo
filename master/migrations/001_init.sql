@@ -246,6 +246,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TIMESTAMPTZ
 );
 
+-- 任务日志表
+CREATE TABLE IF NOT EXISTS task_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    level VARCHAR(16) NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- 快照表
 CREATE TABLE IF NOT EXISTS snapshots (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -283,6 +292,8 @@ CREATE INDEX IF NOT EXISTS idx_instances_node_id ON instances(node_id);
 CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_node_id ON tasks(node_id);
+CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_logs_created ON task_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_instance_metrics_instance_time ON instance_metrics(instance_id, timestamp);

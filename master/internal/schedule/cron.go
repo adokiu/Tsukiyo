@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"tsukiyo/master/internal/db"
@@ -122,7 +123,7 @@ func (s *Scheduler) checkTrafficOverLimit() {
 			updates["status"] = models.InstanceStatusStopped
 			// 下发停止任务
 			task := models.Task{
-				ID:         inst.ID,
+				ID:         uuid.New(),
 				Type:       models.TaskTypeStopInstance,
 				NodeID:     inst.NodeID,
 				InstanceID: &inst.ID,
@@ -160,7 +161,7 @@ func (s *Scheduler) cleanupExpiredSnapshots() {
 
 				// 下发删除快照任务
 				task := models.Task{
-					ID:         snap.ID,
+					ID:         uuid.New(),
 					Type:       models.TaskTypeDeleteSnapshot,
 					NodeID:     inst.NodeID,
 					InstanceID: &inst.ID,
@@ -192,9 +193,9 @@ func (s *Scheduler) resetMonthlyTraffic() {
 	for _, inst := range instances {
 		zap.L().Info("重置月度流量", zap.String("instance_id", inst.ID.String()))
 		db.DB.Model(&inst).Updates(map[string]interface{}{
-			"traffic_used_gb":  0,
+			"traffic_used_gb":    0,
 			"traffic_reset_date": currentMonth,
-			"is_over_limit":    false,
+			"is_over_limit":      false,
 		})
 	}
 }

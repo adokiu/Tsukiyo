@@ -23,6 +23,7 @@ type InitSetupRequest struct {
 	SiteDescription string `json:"site_description,omitempty"`
 	SiteURL         string `json:"site_url,omitempty"`
 	ContactEmail    string `json:"contact_email,omitempty"`
+	IncusRemoteURL  string `json:"incus_remote_url,omitempty"`
 	AdminUsername   string `json:"admin_username" binding:"required,min=3,max=32"`
 	AdminEmail      string `json:"admin_email" binding:"required,email"`
 	AdminPassword   string `json:"admin_password" binding:"required,min=6,max=128"`
@@ -77,6 +78,7 @@ func InitSetup(c *gin.Context) {
 		SiteDescription: req.SiteDescription,
 		SiteURL:         req.SiteURL,
 		ContactEmail:    req.ContactEmail,
+		IncusRemoteURL:  req.IncusRemoteURL,
 		IsInitialized:   true,
 	}
 	if err := tx.Create(&site).Error; err != nil {
@@ -130,8 +132,8 @@ func InitSetup(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "初始化成功",
-		"site_name":    site.SiteName,
-		"admin_id":     admin.ID,
+		"message":   "初始化成功",
+		"site_name": site.SiteName,
+		"admin_id":  admin.ID,
 	})
 }

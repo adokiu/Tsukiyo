@@ -350,7 +350,9 @@ func AddPortMapping(c *gin.Context) {
 	}
 
 	for _, t := range tasks {
-		db.DB.Create(&t)
+		if err := db.DB.Create(&t).Error; err != nil {
+			zap.L().Error("创建端口映射任务失败", zap.Error(err))
+		}
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
@@ -401,7 +403,9 @@ func DeletePortMapping(c *gin.Context) {
 		Status:     models.TaskStatusPending,
 		Payload:    payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建删除端口映射任务失败", zap.Error(err))
+	}
 
 	// 删除数据库记录
 	db.DB.Delete(&pm)
@@ -554,7 +558,9 @@ func AddFirewallRule(c *gin.Context) {
 		Status:     models.TaskStatusPending,
 		Payload:    payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建防火墙规则任务失败", zap.Error(err))
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"id":      rule.ID.String(),
@@ -667,7 +673,9 @@ func DeleteFirewallRule(c *gin.Context) {
 		Status:     models.TaskStatusPending,
 		Payload:    payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建删除防火墙规则任务失败", zap.Error(err))
+	}
 
 	db.DB.Delete(&rule)
 
@@ -1070,7 +1078,9 @@ func UpdateVPC(c *gin.Context) {
 		Status:  models.TaskStatusPending,
 		Payload: payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建 VPC 更新任务失败", zap.Error(err))
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
 }
@@ -1119,7 +1129,9 @@ func DeleteVPC(c *gin.Context) {
 		Status:  models.TaskStatusPending,
 		Payload: payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建 VPC 删除任务失败", zap.Error(err))
+	}
 
 	db.DB.Delete(&vpc)
 

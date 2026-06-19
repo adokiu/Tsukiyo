@@ -100,11 +100,8 @@ func (r *Reconciler) Reconcile(desired []VPCConfig) error {
 
 	zap.L().Info("[Reconcile] 开始状态对齐", zap.Int("desired_vpcs", len(desired)))
 
-	// 0. 确保系统级持久化基础设施就绪（ Incus 自启、iptables-persistent、sysctl）
+	// 0. 确保系统级持久化基础设施就绪（ Incus 自启、sysctl）
 	r.ensureSystemPersistence()
-
-	// 0.1 先尝试加载宿主机持久化的 iptables 规则（如果安装了 iptables-persistent）
-	_ = LoadIPTablesRules()
 
 	// 1. 获取当前 Incus 所有网络
 	actualNetworks, err := r.ic.ListNetworks()
@@ -133,13 +130,13 @@ func (r *Reconciler) Reconcile(desired []VPCConfig) error {
 		}
 	}
 
-	// 3. 持久化 iptables 规则到宿主机
-	_ = SaveIPTablesRules()
-
-	// 4. 持久化本次期望状态到本地文件（作为兜底）
+	// 3. 持久化本次期望状态到本地文件（作为兜底）
 	if err := SaveDesiredState(desired); err != nil {
 		zap.L().Warn("[Reconcile] 持久化期望状态失败", zap.Error(err))
 	}
+
+	// 4. 检查所有现有 bridge 网络的 ipv4.nat，确保容器有外网访问能力
+	r.EnsureAllBridgeNAT()
 
 	zap.L().Info("[Reconcile] 状态对齐完成")
 	return nil
@@ -218,12 +215,6 @@ func (r *Reconciler) ensureSystemPersistence() {
 	// 4. 持久化 IP 转发配置
 	EnsureSysctl()
 
-	// 5. 确保 iptables-persistent 已安装
-	if _, err := exec.LookPath("netfilter-persistent"); err != nil {
-		zap.L().Warn("[Reconcile] netfilter-persistent 未找到，iptables 规则重启后可能丢失")
-	} else {
-		zap.L().Debug("[Reconcile] netfilter-persistent 已安装")
-	}
 }
 
 // reconcileVPC 对齐单个 VPC
@@ -278,62 +269,21 @@ func (r *Reconciler) reconcileVPC(vpc VPCConfig, actualMap map[string]incus.Netw
 				zap.L().Info("[Reconcile] bridge 重建成功", zap.String("bridge", vpc.BridgeName))
 			}
 		}
-	}
 
-	// 2.2 检查 SNAT 规则
-	if vpc.SNATEnabled && vpc.EgressV4Primary != "" && vpc.ParentIface != "" {
-		if err := r.reconcileSNAT(vpc); err != nil {
-			zap.L().Warn("[Reconcile] SNAT 对齐失败",
+		// 检查并确保 ipv4.nat=true
+		if actual.Config["ipv4.nat"] != "true" {
+			zap.L().Warn("[Reconcile] bridge ipv4.nat 未启用，正在修复",
 				zap.String("bridge", vpc.BridgeName),
-				zap.Error(err))
+				zap.String("current", actual.Config["ipv4.nat"]))
+			if err := r.ic.UpdateBridgeNetwork(vpc.BridgeName, map[string]string{"ipv4.nat": "true"}); err != nil {
+				zap.L().Error("[Reconcile] 更新 ipv4.nat 失败", zap.Error(err))
+			} else {
+				zap.L().Info("[Reconcile] ipv4.nat 已启用", zap.String("bridge", vpc.BridgeName))
+			}
 		}
 	}
 
 	return nil
-}
-
-// reconcileSNAT 对齐 SNAT 规则
-func (r *Reconciler) reconcileSNAT(vpc VPCConfig) error {
-	bridgeName := vpc.BridgeName
-	cidr := vpc.IPv4CIDR
-	egressIP := vpc.EgressV4Primary
-	parentIface := vpc.ParentIface
-
-	// 检查 iptables 规则是否存在
-	mark := getBridgeMark(bridgeName)
-	chain := "TSUKIYO-SNAT-" + bridgeName
-
-	// 检查 MASQUERADE 规则
-	ruleExists := r.checkIPTablesRule("nat", "POSTROUTING", "-s", cidr, "-o", parentIface, "-j", "MASQUERADE")
-	if !ruleExists {
-		zap.L().Warn("[Reconcile] SNAT MASQUERADE 规则缺失，正在重建",
-			zap.String("bridge", bridgeName))
-		if err := ConfigureSNAT(bridgeName, cidr, egressIP, parentIface); err != nil {
-			return fmt.Errorf("重建 SNAT 失败: %w", err)
-		}
-		zap.L().Info("[Reconcile] SNAT 重建成功", zap.String("bridge", bridgeName))
-	}
-
-	// 检查 connmark 恢复规则
-	restoreExists := r.checkIPTablesRule("mangle", "PREROUTING", "-i", bridgeName, "-j", "CONNMARK", "--restore-mark")
-	if !restoreExists {
-		zap.L().Warn("[Reconcile] connmark 恢复规则缺失",
-			zap.String("bridge", bridgeName))
-	}
-
-	_ = mark
-	_ = chain
-	return nil
-}
-
-// checkIPTablesRule 检查 iptables 规则是否存在（简化匹配）
-func (r *Reconciler) checkIPTablesRule(table, chain string, args ...string) bool {
-	cmdArgs := append([]string{"-t", table, "-C", chain}, args...)
-	cmd := exec.Command("iptables", cmdArgs...)
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
 }
 
 // getGatewayWithPrefix 从 CIDR 和前缀长度构造网关地址
@@ -346,81 +296,6 @@ func getGatewayWithPrefix(cidr, gateway string) string {
 		return gateway + "/" + parts[1]
 	}
 	return gateway
-}
-
-// getBridgeMark 为 bridge 生成一个 mark 值（CRC16 简化）
-func getBridgeMark(bridgeName string) string {
-	var h uint16 = 0xFFFF
-	for _, c := range bridgeName {
-		h ^= uint16(c) << 8
-		for i := 0; i < 8; i++ {
-			if h&0x8000 != 0 {
-				h = (h << 1) ^ 0x1021
-			} else {
-				h <<= 1
-			}
-		}
-	}
-	return fmt.Sprintf("0x%04X", h)
-}
-
-// ConfigureSNAT 配置 SNAT
-func ConfigureSNAT(bridgeName, cidr, egressIP, parentIface string) error {
-	mark := getBridgeMark(bridgeName)
-	chain := "TSUKIYO-SNAT-" + bridgeName
-
-	// 1. 创建自定义链
-	_ = exec.Command("iptables", "-t", "nat", "-N", chain).Run()
-
-	// 2. 自定义链：根据 mark 做 SNAT
-	_ = exec.Command("iptables", "-t", "nat", "-A", chain,
-		"-m", "comment", "--comment", "tsukiyo-vpc-snat",
-		"-j", "SNAT", "--to-source", egressIP,
-	).Run()
-
-	// 3. POSTROUTING 中跳到自定义链
-	_ = exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING",
-		"-s", cidr, "-o", parentIface,
-		"-m", "comment", "--comment", "tsukiyo-vpc-"+bridgeName,
-		"-j", chain,
-	).Run()
-
-	// 4. MASQUERADE fallback（如果 SNAT 失败时的兜底）
-	_ = exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING",
-		"-s", cidr, "-o", parentIface,
-		"-m", "comment", "--comment", "tsukiyo-vpc-masq-"+bridgeName,
-		"-j", "MASQUERADE",
-	).Run()
-
-	// 5. mangle PREROUTING 恢复 connmark
-	_ = exec.Command("iptables", "-t", "mangle", "-A", "PREROUTING",
-		"-i", bridgeName,
-		"-m", "comment", "--comment", "tsukiyo-vpc-restore-"+bridgeName,
-		"-j", "CONNMARK", "--restore-mark", "--mark", mark,
-	).Run()
-
-	// 6. mangle POSTROUTING 保存 connmark
-	_ = exec.Command("iptables", "-t", "mangle", "-A", "POSTROUTING",
-		"-o", bridgeName,
-		"-m", "comment", "--comment", "tsukiyo-vpc-save-"+bridgeName,
-		"-j", "CONNMARK", "--save-mark", "--mark", mark,
-	).Run()
-
-	_ = mark
-	return nil
-}
-
-// RemoveSNAT 移除 SNAT 规则
-func RemoveSNAT(bridgeName, cidr string) error {
-	// 删除所有带 tsukiyo-vpc 注释的 iptables 规则
-	for _, table := range []string{"nat", "mangle"} {
-		for _, chain := range []string{"POSTROUTING", "PREROUTING"} {
-			_ = exec.Command("iptables", "-t", table, "-F", chain).Run()
-		}
-	}
-	// 删除自定义链
-	_ = exec.Command("iptables", "-t", "nat", "-X", "TSUKIYO-SNAT-"+bridgeName).Run()
-	return nil
 }
 
 // EnsureSysctl 持久化 sysctl 网络转发配置
@@ -446,59 +321,30 @@ func EnsureSysctl() {
 	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 }
 
-// SaveIPTablesRules 保存 iptables 规则到宿主机持久化存储
-func SaveIPTablesRules() error {
-	// 优先使用 netfilter-persistent
-	if _, err := exec.LookPath("netfilter-persistent"); err == nil {
-		cmd := exec.Command("netfilter-persistent", "save")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			zap.L().Warn("[Reconcile] netfilter-persistent save 失败", zap.Error(err), zap.String("output", string(out)))
-		} else {
-			zap.L().Info("[Reconcile] iptables 规则已保存到宿主机")
-			return nil
-		}
-	}
-	// fallback: 直接保存到 /etc/iptables/rules.v4
-	if err := os.MkdirAll("/etc/iptables", 0755); err != nil {
-		return fmt.Errorf("创建 /etc/iptables 失败: %w", err)
-	}
-	cmd := exec.Command("iptables-save")
-	out, err := cmd.Output()
+// EnsureAllBridgeNAT 确保所有现有 bridge 网络都启用了 NAT
+func (r *Reconciler) EnsureAllBridgeNAT() {
+	networks, err := r.ic.ListNetworks()
 	if err != nil {
-		return fmt.Errorf("iptables-save 失败: %w", err)
+		zap.L().Warn("[Reconcile] 获取网络列表失败", zap.Error(err))
+		return
 	}
-	if err := os.WriteFile("/etc/iptables/rules.v4", out, 0644); err != nil {
-		return fmt.Errorf("写入 rules.v4 失败: %w", err)
-	}
-	zap.L().Info("[Reconcile] iptables 规则已保存到 /etc/iptables/rules.v4")
-	return nil
-}
 
-// LoadIPTablesRules 从宿主机持久化存储加载 iptables 规则
-func LoadIPTablesRules() error {
-	// 优先使用 netfilter-persistent
-	if _, err := exec.LookPath("netfilter-persistent"); err == nil {
-		cmd := exec.Command("netfilter-persistent", "start")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			zap.L().Warn("[Reconcile] netfilter-persistent start 失败", zap.Error(err), zap.String("output", string(out)))
-		} else {
-			zap.L().Info("[Reconcile] 已通过 netfilter-persistent 加载 iptables 规则")
-			return nil
+	for _, net := range networks {
+		if net.Type != "bridge" {
+			continue
+		}
+		if net.Config["ipv4.nat"] != "true" {
+			zap.L().Warn("[Reconcile] 检测到 bridge 未启用 NAT，正在修复",
+				zap.String("bridge", net.Name),
+				zap.String("current", net.Config["ipv4.nat"]))
+			if err := r.ic.UpdateBridgeNetwork(net.Name, map[string]string{"ipv4.nat": "true"}); err != nil {
+				zap.L().Error("[Reconcile] 更新 bridge NAT 失败",
+					zap.String("bridge", net.Name),
+					zap.Error(err))
+			} else {
+				zap.L().Info("[Reconcile] bridge NAT 已启用",
+					zap.String("bridge", net.Name))
+			}
 		}
 	}
-	// fallback: 从 /etc/iptables/rules.v4 加载
-	if _, err := os.Stat("/etc/iptables/rules.v4"); err != nil {
-		return fmt.Errorf("rules.v4 不存在: %w", err)
-	}
-	data, err := os.ReadFile("/etc/iptables/rules.v4")
-	if err != nil {
-		return fmt.Errorf("读取 rules.v4 失败: %w", err)
-	}
-	cmd := exec.Command("iptables-restore")
-	cmd.Stdin = strings.NewReader(string(data))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables-restore 失败: %w, output: %s", err, string(out))
-	}
-	zap.L().Info("[Reconcile] 已从 /etc/iptables/rules.v4 加载 iptables 规则")
-	return nil
 }

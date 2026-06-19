@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/models"
@@ -143,7 +144,9 @@ func BatchCreate(c *gin.Context) {
 			Status:     models.TaskStatusPending,
 			Payload:    payloadBytes,
 		}
-		db.DB.Create(&task)
+		if err := db.DB.Create(&task).Error; err != nil {
+			zap.L().Error("创建批量实例任务失败", zap.Error(err))
+		}
 
 		created = append(created, gin.H{
 			"id":      instance.ID.String(),

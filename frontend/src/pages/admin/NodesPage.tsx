@@ -45,7 +45,6 @@ interface SystemInfo {
   environment?: {
     systemd_version: string
     lxc_version: string
-    iptables_version: string
     iproute2_version: string
     conntrack_version: string
     libvirt_version: string
@@ -340,7 +339,6 @@ token: "${newToken}"`}
                     <div className="grid grid-cols-2 gap-1 text-gray-600">
                       <div>systemd: {info.environment.systemd_version || '-'}</div>
                       <div>incus: {info.environment.lxc_version || '-'}</div>
-                      <div>iptables: {info.environment.iptables_version || '-'}</div>
                       <div>KVM: {info.environment.has_kvm ? '可用' : '不可用'}</div>
                       <div>IPv4转发: {info.environment.has_ipv4_forward ? '开启' : '关闭'}</div>
                       <div>lxcfs: {info.environment.lxcfs_active ? '运行中' : '未运行'}</div>

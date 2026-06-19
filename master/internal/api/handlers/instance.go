@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"strings"
@@ -41,6 +43,7 @@ type CreateInstanceRequest struct {
 	Name               string            `json:"name" binding:"required"`
 	Type               string            `json:"type" binding:"required,oneof=container vm"`
 	TemplateID         string            `json:"template_id" binding:"required"`
+	ImageKey           string            `json:"image_key,omitempty"`
 	NodeID             string            `json:"node_id" binding:"required"`
 	VPCID              string            `json:"vpc_id,omitempty"`
 	AssignToUserID     uint              `json:"assign_to_user_id" binding:"required"`
@@ -99,10 +102,18 @@ func CreateInstance(c *gin.Context) {
 	}
 
 	// 检查镜像是否已在节点下载（必须先下载才能创建）
+	// image_key 格式: alias|type|arch，优先用 image_key 查询，兼容旧的 template_id
+	imageIDForCheck := req.ImageKey
+	if imageIDForCheck == "" {
+		imageIDForCheck = req.TemplateID
+	}
 	var nodeImage models.NodeImage
-	if err := db.DB.Where("node_id = ? AND image_id = ? AND status = ?", nodeID, req.TemplateID, "downloaded").First(&nodeImage).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "镜像未下载，请先下载镜像"})
-		return
+	if err := db.DB.Where("node_id = ? AND image_id = ? AND status = ?", nodeID, imageIDForCheck, "downloaded").First(&nodeImage).Error; err != nil {
+		// 兼容：如果 image_key 查不到，用 LIKE 匹配 alias 前缀
+		if err2 := db.DB.Where("node_id = ? AND image_id LIKE ? AND status = ?", nodeID, req.TemplateID+"|%", "downloaded").First(&nodeImage).Error; err2 != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像未下载，请先下载镜像"})
+			return
+		}
 	}
 
 	// 检查 VPC 是否存在且属于该节点
@@ -121,8 +132,8 @@ func CreateInstance(c *gin.Context) {
 		}
 		vpc = &vpcNet
 
-		// 从 VPC 内网 CIDR 分配一个可用 IP（排除网关地址）
-		ip, err := allocateIPFromVPC(vpc.ID, vpc.IPv4CIDR, vpc.DefaultGatewayV4)
+		// 从 VPC 内网 CIDR 分配一个可用 IP（排除网关地址），按节点隔离
+		ip, err := allocateIPFromVPC(vpc.ID, nodeID, vpc.IPv4CIDR, vpc.DefaultGatewayV4)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "VPC 内网 IP 分配失败: " + err.Error()})
 			return
@@ -600,7 +611,9 @@ func DeleteInstance(c *gin.Context) {
 		Status:     models.TaskStatusPending,
 		Payload:    payloadBytes,
 	}
-	db.DB.Create(&task)
+	if err := db.DB.Create(&task).Error; err != nil {
+		zap.L().Error("创建删除实例任务失败", zap.Error(err))
+	}
 
 	// 更新实例状态
 	db.DB.Model(&instance).Update("status", models.InstanceStatusDeleting)
@@ -814,8 +827,9 @@ func GetInstanceMetrics(c *gin.Context) {
 
 // allocateIPFromVPC 从 VPC 的内网 CIDR 中分配一个可用 IP
 // 使用数据库级别的并发安全：INSERT IPPoolEntry 行，状态为 allocated
+// nodeID: 节点 ID，用于隔离不同节点的 IP 分配
 // gateway: VPC 的网关地址，必须排除
-func allocateIPFromVPC(vpcID uuid.UUID, cidr string, gateway string) (string, error) {
+func allocateIPFromVPC(vpcID uuid.UUID, nodeID uuid.UUID, cidr string, gateway string) (string, error) {
 	// 解析 CIDR
 	_, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -824,7 +838,7 @@ func allocateIPFromVPC(vpcID uuid.UUID, cidr string, gateway string) (string, er
 
 	// 获取该 VPC 下已分配的所有 IP
 	var allocated []models.IPPoolEntry
-	if err := db.DB.Where("owner_id = ? AND pool_type = ? AND status = ?", vpcID, "vpc_internal", "allocated").
+	if err := db.DB.Where("owner_id = ? AND node_id = ? AND pool_type = ? AND status = ?", vpcID, nodeID, "vpc_internal", "allocated").
 		Select("address").Find(&allocated).Error; err != nil {
 		return "", fmt.Errorf("查询已分配 IP 失败: %w", err)
 	}
@@ -848,6 +862,7 @@ func allocateIPFromVPC(vpcID uuid.UUID, cidr string, gateway string) (string, er
 			entry := models.IPPoolEntry{
 				PoolType:  "vpc_internal",
 				OwnerID:   vpcID,
+				NodeID:    nodeID,
 				Address:   ipStr,
 				PrefixLen: getPrefixLen(ipNet),
 				Status:    "allocated",
@@ -898,12 +913,18 @@ func incrementIP(ip net.IP) {
 	}
 }
 
-// generateRandomPassword 生成随机密码
+// generateRandomPassword 生成随机密码（crypto/rand 真随机，大小写字母+数字）
 func generateRandomPassword(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
 	for i := range b {
-		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			// 回退：用时间戳（极少发生）
+			b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+			continue
+		}
+		b[i] = charset[n.Int64()]
 	}
 	return string(b)
 }

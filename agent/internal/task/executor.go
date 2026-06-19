@@ -1,15 +1,9 @@
 package task
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +14,6 @@ import (
 	"tsukiyo/agent/internal/image"
 	"tsukiyo/agent/internal/incus"
 	"tsukiyo/agent/internal/network"
-	"tsukiyo/agent/internal/reconcile"
 	"tsukiyo/agent/internal/ws"
 )
 
@@ -79,6 +72,8 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 		return e.handleCheckImage(payload)
 	case "delete_image":
 		return e.handleDeleteImage(payload)
+	case "list_remote_images":
+		return e.handleListRemoteImages(payload)
 	case "apply_network":
 		return e.handleApplyNetwork(payload)
 	case "apply_firewall":
@@ -99,6 +94,7 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 
 func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessage, error) {
 	var req struct {
+		TaskID           string                   `json:"task_id"`
 		InstanceID       string                   `json:"instance_id"`
 		Type             string                   `json:"type"`
 		TemplateID       string                   `json:"template_id"`
@@ -142,6 +138,16 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		zap.String("type", req.Type),
 		zap.String("template_id", req.TemplateID))
 
+	// 上报进度：开始创建
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       1,
+		Progress:   0,
+		Message:    "开始创建实例",
+		Status:     "running",
+	})
+
 	// 检查镜像是否存在
 	zap.L().Info("检查镜像是否存在", zap.String("template_id", req.TemplateID))
 	if !e.incusClient.ImageAliasExists(req.TemplateID) {
@@ -165,7 +171,7 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	}
 
 	// 构建 cloud-init user-data
-	userData := buildCloudInitUserData(req.SSHPassword, req.SSHPublicKey, req.LoginMethod)
+	userData := buildCloudInitUserData(req.SSHPassword, req.SSHPublicKey, req.LoginMethod, req.InternalIPv4, req.GatewayV4, req.IPv4CIDR)
 	zap.L().Info("cloud-init user-data 构建完成", zap.Int("len", len(userData)))
 
 	var dataDisks []incus.DataDisk
@@ -207,9 +213,28 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	name, err := e.incusClient.CreateInstance(createReq)
 	if err != nil {
 		zap.L().Error("Incus CreateInstance 失败", zap.String("name", req.InstanceID), zap.Error(err))
+		e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+			InstanceID: req.InstanceID,
+			TaskID:     req.TaskID,
+			Step:       0,
+			Progress:   0,
+			Message:    "创建实例失败",
+			Error:      err.Error(),
+			Status:     "error",
+		})
 		return nil, fmt.Errorf("创建实例失败: %w", err)
 	}
 	zap.L().Info("实例创建成功", zap.String("name", name))
+
+	// 上报进度：服务器接受请求
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       2,
+		Progress:   20,
+		Message:    "服务器已接受请求",
+		Status:     "running",
+	})
 
 	// 设置资源限制（带宽、IO）
 	limits := map[string]string{}
@@ -244,18 +269,47 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	} else {
 		// 等待实例变为 Running 状态
 		waitForRunning(e.incusClient, name, 120)
+		// 等待 sshd 启动（从宿主机检测容器内网 IP 的 22 端口）
+		zap.L().Info("等待 sshd 启动", zap.String("name", name), zap.String("ip", req.InternalIPv4))
+		if req.InternalIPv4 != "" {
+			for i := 0; i < 180; i++ {
+				conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:22", req.InternalIPv4), 2*time.Second)
+				if err == nil {
+					conn.Close()
+					zap.L().Info("sshd 已启动", zap.String("name", name), zap.String("ip", req.InternalIPv4), zap.Int("wait_seconds", i))
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}
 	}
 
-	// 安装并启动 openssh-server（Alpine 等镜像默认不装 ssh）
-	zap.L().Info("检查并安装 SSH 服务", zap.String("name", name))
-	if err := e.incusClient.EnsureSSHInstalled(name); err != nil {
-		zap.L().Warn("安装 SSH 服务失败", zap.String("name", name), zap.Error(err))
-	} else {
-		zap.L().Info("SSH 服务已就绪", zap.String("name", name))
-	}
+	// 上报进度：配置网络
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       3,
+		Progress:   40,
+		Message:    "配置网络",
+		Status:     "running",
+	})
 
-	// 获取实例内部 IP（轮询等待，最多 60 秒）
-	instanceIP := req.IPv4Address
+	// 上报进度：配置 SSH
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       4,
+		Progress:   60,
+		Message:    "配置 SSH",
+		Status:     "running",
+	})
+
+	// 获取实例内部 IP
+	// VPC 模式优先使用 internal_ipv4（master 分配的静态 IP）
+	instanceIP := req.InternalIPv4
+	if instanceIP == "" {
+		instanceIP = req.IPv4Address
+	}
 	if instanceIP == "" {
 		zap.L().Info("开始轮询获取实例内部 IP", zap.String("name", name))
 		for i := 0; i < 60; i++ {
@@ -341,6 +395,26 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		}
 	}
 
+	// 上报进度：配置端口映射
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       5,
+		Progress:   80,
+		Message:    "配置端口映射",
+		Status:     "running",
+	})
+
+	// 上报进度：完成
+	e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
+		InstanceID: req.InstanceID,
+		TaskID:     req.TaskID,
+		Step:       6,
+		Progress:   100,
+		Message:    "完成",
+		Status:     "success",
+	})
+
 	return json.Marshal(map[string]interface{}{
 		"name":           name,
 		"status":         "running",
@@ -349,12 +423,8 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	})
 }
 
-// buildCloudInitUserData 生成 cloud-init user-data YAML，预配置 root 密码和 SSH 公钥
-// 覆盖主流发行版：Debian/Ubuntu（cloud-init）、RHEL/CentOS（cloud-init）、Alpine（tiny-cloud/alpine-conf）
-func buildCloudInitUserData(password, publicKey, loginMethod string) string {
-	if password == "" && publicKey == "" {
-		return ""
-	}
+// buildCloudInitUserData 生成 cloud-init user-data YAML，预配置 root 密码、SSH 公钥和网络
+func buildCloudInitUserData(password, publicKey, loginMethod, internalIPv4, gatewayV4, ipv4CIDR string) string {
 	var lines []string
 	lines = append(lines, "#cloud-config")
 	lines = append(lines, "users:")
@@ -373,33 +443,66 @@ func buildCloudInitUserData(password, publicKey, loginMethod string) string {
 	lines = append(lines, "ssh_pwauth: true")
 	lines = append(lines, "disable_root: false")
 
-	// 确保 SSH 服务运行并允许 root 密码登录
+	// 注入文件（MOTD + SSH 配置）
+	lines = append(lines, "write_files:")
+	// MOTD
+	lines = append(lines, "  - path: /etc/profile.d/tsukiyo-motd.sh")
+	lines = append(lines, "    permissions: '0755'")
+	lines = append(lines, "    content: |")
+	lines = append(lines, "      #!/bin/sh")
+	lines = append(lines, "      case \"$-\" in *i*) ;; *) return 0 ;; esac")
+	lines = append(lines, "      [ -n \"$SSH_CONNECTION\" ] || return 0")
+	lines = append(lines, "      [ -n \"$TSUKIYO_MOTD_SHOWN\" ] && return 0")
+	lines = append(lines, "      export TSUKIYO_MOTD_SHOWN=1")
+	lines = append(lines, "      echo")
+	lines = append(lines, "      printf \"\\033[38;5;196m        ,----,                                                              \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;202m      ,/   .\\`|                                                              \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;208m    ,\\`   .'  :                              ,-.                             \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;214m  ;    ;     /                          ,--/ /|   ,--,                      \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;220m.'___,/    ,'                    ,--, ,--. :/ | ,--.'|              ,---.   \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;226m|    :     |  .--.--.          ,'_ /| :  : ' /  |  |,              '   ,'\\\\  \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;154m;    |.';  ; /  /    '    .--. |  | : |  '  /   \\`--'_        .--, /   /   | \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;118m\\`----'  |  ||  :  /\\`./  ,'_ /| :  . | '  |   \\\\  '  | |  , ' , ' :'   | |: | \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;82m    '   :  ;|  :  ;_    |  ' | |  . . |  |   \\\\  '  : | /___/ \\: |'   | .; : \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;46m    |   |  ' \\\\  \\\\    \\`. |  | : ;  ; | |  | ' \\\\ \\`  : |__.  \\\\  ' ||   :    | \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;47m    '   :  |  \\`----.   \\\\:  | : ;  ; | |  | |. \\\\ |  | '.'|\\\\  ;   : \\\\   \\\\  /  \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;48m    ;   |.'  /  /\\`--'  /'  :  \\`--'   \\`'  : |--' |  |    ; \\\\  \\\\  ;  \\`----'   \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;49m    '---'   '--'.     / :  ,      .-./;  |,'    ;  :    ; \\\\  \\\\  :  \\`----'    \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;50m              \\`--'---'   \\`--\\`----'    '--'      |  ,   /   :  \\\\  \\\\          \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;51m                                                 ---\\`-'     \\\\  ' ;          \\033[0m\\n\"")
+	lines = append(lines, "      printf \"\\033[38;5;87m                                                             \\`--\\`           \\033[0m\\n\"")
+	lines = append(lines, "      echo")
+	lines = append(lines, "      echo \"Tsukiyo Virtualization System By aDokiu\"")
+	lines = append(lines, "      echo \"Github       : https://github.com/adokiu/Tsukiyo\"")
+	lines = append(lines, "      echo")
+	lines = append(lines, "      echo \"Distribution : $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"' || echo 'Linux')\"")
+	lines = append(lines, "      echo \"Kernel       : $(uname -r)\"")
+	lines = append(lines, "      echo")
+	// runcmd：安装 ssh + 配置 sshd + 重启 sshd（同步执行，确保完成）
 	lines = append(lines, "runcmd:")
 	lines = append(lines, "  - |")
-	lines = append(lines, "    # 确保 SSH 服务安装并运行")
-	lines = append(lines, "    if command -v apk >/dev/null 2>&1; then")
-	lines = append(lines, "      apk add --no-cache openssh-server 2>/dev/null || true")
-	lines = append(lines, "      rc-update add sshd boot 2>/dev/null || true")
-	lines = append(lines, "      rc-service sshd start 2>/dev/null || true")
-	lines = append(lines, "    elif command -v apt-get >/dev/null 2>&1; then")
-	lines = append(lines, "      apt-get update -qq && apt-get install -y -qq openssh-server 2>/dev/null || true")
-	lines = append(lines, "      systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true")
-	lines = append(lines, "      systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true")
-	lines = append(lines, "    elif command -v yum >/dev/null 2>&1; then")
-	lines = append(lines, "      yum install -y openssh-server 2>/dev/null || true")
-	lines = append(lines, "      systemctl enable sshd 2>/dev/null || true")
-	lines = append(lines, "      systemctl start sshd 2>/dev/null || true")
+	lines = append(lines, "    if [ -f /etc/debian_version ]; then")
+	lines = append(lines, "        apt-get update && apt-get install -y openssh-server && systemctl enable --now ssh")
+	lines = append(lines, "    elif [ -f /etc/alpine-release ]; then")
+	lines = append(lines, "        apk add openssh && rc-update add sshd default && service sshd start")
+	lines = append(lines, "    elif [ -f /etc/fedora-release ] || [ -f /etc/centos-release ] || [ -f /etc/rocky-release ] || [ -f /etc/almalinux-release ] || [ -f /etc/oracle-release ]; then")
+	lines = append(lines, "        dnf install -y openssh-server && systemctl enable --now sshd")
+	lines = append(lines, "    elif [ -f /etc/arch-release ]; then")
+	lines = append(lines, "        pacman -S --noconfirm openssh && systemctl enable --now sshd")
+	lines = append(lines, "    elif [ -f /etc/SUSE-brand ] || [ -f /etc/SuSE-release ]; then")
+	lines = append(lines, "        zypper install -y openssh && systemctl enable --now sshd")
 	lines = append(lines, "    fi")
-	lines = append(lines, "  - |")
-	lines = append(lines, "    # 允许 root 密码登录")
-	lines = append(lines, "    if [ -f /etc/ssh/sshd_config ]; then")
-	lines = append(lines, "      sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config")
-	lines = append(lines, "      sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config")
-	lines = append(lines, "      sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config")
-	lines = append(lines, "      if command -v sshd >/dev/null 2>&1; then")
-	lines = append(lines, "        sshd -t 2>/dev/null && killall -HUP sshd 2>/dev/null || true")
-	lines = append(lines, "      fi")
-	lines = append(lines, "    fi")
+	// 配置 sshd（仅在密码登录模式下）
+	if loginMethod == "password" || loginMethod == "auto" {
+		lines = append(lines, "    sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config")
+		lines = append(lines, "    sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config")
+		lines = append(lines, "    sed -i '/^UsePAM/d' /etc/ssh/sshd_config")
+		lines = append(lines, "    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config")
+		lines = append(lines, "    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config")
+		lines = append(lines, "    echo 'UsePAM yes' >> /etc/ssh/sshd_config")
+		lines = append(lines, "    systemctl restart sshd || service sshd restart")
+	}
+	lines = append(lines, "")
 
 	return strings.Join(lines, "\n")
 }
@@ -426,11 +529,13 @@ func (e *Executor) handleDeleteInstance(payload json.RawMessage) (json.RawMessag
 		InstanceID string `json:"instance_id"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析删除实例任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleDeleteInstance 开始", zap.String("instance_id", req.InstanceID))
+	zap.L().Info("开始删除实例", zap.String("instance_id", req.InstanceID))
 
 	// 先获取实例信息用于清理网络配置
+	zap.L().Info("获取实例信息", zap.String("instance_id", req.InstanceID))
 	info, err := e.incusClient.GetInstance(req.InstanceID)
 	if err != nil {
 		// 只有"不存在"才是真正的幂等成功，其他错误都要返回失败
@@ -438,25 +543,30 @@ func (e *Executor) handleDeleteInstance(payload json.RawMessage) (json.RawMessag
 			zap.L().Info("实例不存在，幂等删除成功", zap.String("instance_id", req.InstanceID))
 			return json.Marshal(map[string]interface{}{"deleted": true, "not_found": true})
 		}
+		zap.L().Error("获取实例信息失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, fmt.Errorf("获取实例信息失败: %w", err)
 	}
 
 	// 清理网络配置
+	zap.L().Info("清理网络配置", zap.String("instance_id", req.InstanceID))
 	if info.Devices != nil {
 		if devs, ok := info.Devices["eth0"].(map[string]interface{}); ok {
 			if ip, ok := devs["ipv4.address"].(string); ok && ip != "" {
+				zap.L().Info("解绑 IP", zap.String("ip", ip))
 				e.netManager.UnbindIP(ip, "")
 			}
 		}
 	}
 
 	// 删除实例（force=1）
+	zap.L().Info("删除实例", zap.String("instance_id", req.InstanceID))
 	if err := e.incusClient.DeleteInstance(req.InstanceID); err != nil {
 		// "不存在"也算成功
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Not found") {
 			zap.L().Info("删除时实例已不存在，幂等成功", zap.String("instance_id", req.InstanceID))
 			return json.Marshal(map[string]interface{}{"deleted": true, "not_found": true})
 		}
+		zap.L().Error("删除实例失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, fmt.Errorf("删除实例失败: %w", err)
 	}
 	zap.L().Info("实例删除成功", zap.String("instance_id", req.InstanceID))
@@ -468,15 +578,16 @@ func (e *Executor) handleStartInstance(payload json.RawMessage) (json.RawMessage
 		InstanceID string `json:"instance_id"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析启动实例任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleStartInstance 开始", zap.String("instance_id", req.InstanceID))
+	zap.L().Info("开始启动实例", zap.String("instance_id", req.InstanceID))
 	if err := e.incusClient.StartInstance(req.InstanceID); err != nil {
 		zap.L().Error("启动实例失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, err
 	}
 	zap.L().Info("启动实例成功", zap.String("instance_id", req.InstanceID))
-	return json.Marshal(map[string]string{"status": "running"})
+	return json.Marshal(map[string]string{"status": "running", "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleStopInstance(payload json.RawMessage) (json.RawMessage, error) {
@@ -485,13 +596,16 @@ func (e *Executor) handleStopInstance(payload json.RawMessage) (json.RawMessage,
 		Force      bool   `json:"force"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析停止实例任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleStopInstance 开始", zap.String("instance_id", req.InstanceID), zap.Bool("force", req.Force))
+	zap.L().Info("开始停止实例", zap.String("instance_id", req.InstanceID), zap.Bool("force", req.Force))
 	if err := e.incusClient.StopInstance(req.InstanceID, req.Force); err != nil {
+		zap.L().Error("停止实例失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, err
 	}
-	return json.Marshal(map[string]string{"status": "stopped"})
+	zap.L().Info("停止实例成功", zap.String("instance_id", req.InstanceID))
+	return json.Marshal(map[string]string{"status": "stopped", "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleRestartInstance(payload json.RawMessage) (json.RawMessage, error) {
@@ -499,15 +613,16 @@ func (e *Executor) handleRestartInstance(payload json.RawMessage) (json.RawMessa
 		InstanceID string `json:"instance_id"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析重启实例任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleRestartInstance 开始", zap.String("instance_id", req.InstanceID))
+	zap.L().Info("开始重启实例", zap.String("instance_id", req.InstanceID))
 	if err := e.incusClient.RestartInstance(req.InstanceID); err != nil {
 		zap.L().Error("重启实例失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, err
 	}
 	zap.L().Info("重启实例成功", zap.String("instance_id", req.InstanceID))
-	return json.Marshal(map[string]string{"status": "running"})
+	return json.Marshal(map[string]string{"status": "running", "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleReinstallInstance(payload json.RawMessage) (json.RawMessage, error) {
@@ -516,13 +631,16 @@ func (e *Executor) handleReinstallInstance(payload json.RawMessage) (json.RawMes
 		TemplateID string `json:"template_id"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析重装实例任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleReinstallInstance 开始", zap.String("instance_id", req.InstanceID), zap.String("template_id", req.TemplateID))
+	zap.L().Info("开始重装实例", zap.String("instance_id", req.InstanceID), zap.String("template_id", req.TemplateID))
 	if err := e.incusClient.ReinstallInstance(req.InstanceID, req.TemplateID); err != nil {
+		zap.L().Error("重装实例失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, err
 	}
-	return json.Marshal(map[string]string{"status": "reinstalled"})
+	zap.L().Info("重装实例成功", zap.String("instance_id", req.InstanceID))
+	return json.Marshal(map[string]string{"status": "reinstalled", "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleResizeInstance(payload json.RawMessage) (json.RawMessage, error) {
@@ -533,9 +651,10 @@ func (e *Executor) handleResizeInstance(payload json.RawMessage) (json.RawMessag
 		DiskGB     int     `json:"disk_gb"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析调整配置任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleResizeInstance 开始", zap.String("instance_id", req.InstanceID), zap.Float64("vcpu", req.VCPU), zap.Int("memory_mb", req.MemoryMB), zap.Int("disk_gb", req.DiskGB))
+	zap.L().Info("开始调整实例配置", zap.String("instance_id", req.InstanceID), zap.Float64("vcpu", req.VCPU), zap.Int("memory_mb", req.MemoryMB), zap.Int("disk_gb", req.DiskGB))
 
 	config := map[string]string{}
 	if req.VCPU > 0 {
@@ -547,6 +666,7 @@ func (e *Executor) handleResizeInstance(payload json.RawMessage) (json.RawMessag
 
 	// 磁盘 resize
 	if req.DiskGB > 0 {
+		zap.L().Info("调整磁盘大小", zap.String("instance_id", req.InstanceID), zap.Int("disk_gb", req.DiskGB))
 		devices := map[string]map[string]string{
 			"root": {
 				"path": "/",
@@ -556,15 +676,19 @@ func (e *Executor) handleResizeInstance(payload json.RawMessage) (json.RawMessag
 			},
 		}
 		if err := e.incusClient.SetInstanceConfig(req.InstanceID, config, devices); err != nil {
+			zap.L().Error("调整磁盘大小失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 			return nil, err
 		}
 	} else {
+		zap.L().Info("调整 CPU 和内存", zap.String("instance_id", req.InstanceID))
 		if err := e.incusClient.UpdateInstanceConfig(req.InstanceID, config); err != nil {
+			zap.L().Error("调整 CPU 和内存失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 			return nil, err
 		}
 	}
 
-	return json.Marshal(map[string]string{"status": "resized"})
+	zap.L().Info("调整实例配置成功", zap.String("instance_id", req.InstanceID))
+	return json.Marshal(map[string]string{"status": "resized", "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleResetPassword(payload json.RawMessage) (json.RawMessage, error) {
@@ -573,15 +697,16 @@ func (e *Executor) handleResetPassword(payload json.RawMessage) (json.RawMessage
 		Password   string `json:"password"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析重置密码任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleResetPassword 开始", zap.String("instance_id", req.InstanceID))
+	zap.L().Info("开始重置实例密码", zap.String("instance_id", req.InstanceID))
 	if err := e.incusClient.SetInstancePassword(req.InstanceID, req.Password); err != nil {
 		zap.L().Error("重置密码失败", zap.String("instance_id", req.InstanceID), zap.Error(err))
 		return nil, err
 	}
 	zap.L().Info("重置密码成功", zap.String("instance_id", req.InstanceID))
-	return json.Marshal(map[string]bool{"success": true})
+	return json.Marshal(map[string]interface{}{"success": true, "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleCreateSnapshot(payload json.RawMessage) (json.RawMessage, error) {
@@ -591,12 +716,16 @@ func (e *Executor) handleCreateSnapshot(payload json.RawMessage) (json.RawMessag
 		Stateful   bool   `json:"stateful"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析创建快照任务参数失败", zap.Error(err))
 		return nil, err
 	}
+	zap.L().Info("开始创建快照", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name), zap.Bool("stateful", req.Stateful))
 	if err := e.incusClient.CreateSnapshot(req.InstanceID, req.Name, req.Stateful); err != nil {
+		zap.L().Error("创建快照失败", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name), zap.Error(err))
 		return nil, err
 	}
-	return json.Marshal(map[string]string{"snapshot": req.Name})
+	zap.L().Info("创建快照成功", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
+	return json.Marshal(map[string]string{"snapshot": req.Name, "instance_id": req.InstanceID})
 }
 
 func (e *Executor) handleRestoreSnapshot(payload json.RawMessage) (json.RawMessage, error) {
@@ -605,15 +734,16 @@ func (e *Executor) handleRestoreSnapshot(payload json.RawMessage) (json.RawMessa
 		Name       string `json:"name"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析恢复快照任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleRestoreSnapshot 开始", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
+	zap.L().Info("开始恢复快照", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
 	if err := e.incusClient.RestoreSnapshot(req.InstanceID, req.Name); err != nil {
 		zap.L().Error("恢复快照失败", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name), zap.Error(err))
 		return nil, err
 	}
 	zap.L().Info("恢复快照成功", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
-	return json.Marshal(map[string]string{"status": "restored"})
+	return json.Marshal(map[string]string{"status": "restored", "instance_id": req.InstanceID, "name": req.Name})
 }
 
 func (e *Executor) handleDeleteSnapshot(payload json.RawMessage) (json.RawMessage, error) {
@@ -622,449 +752,16 @@ func (e *Executor) handleDeleteSnapshot(payload json.RawMessage) (json.RawMessag
 		Name       string `json:"name"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("解析删除快照任务参数失败", zap.Error(err))
 		return nil, err
 	}
-	zap.L().Info("handleDeleteSnapshot 开始", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
+	zap.L().Info("开始删除快照", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
 	if err := e.incusClient.DeleteSnapshot(req.InstanceID, req.Name); err != nil {
 		zap.L().Error("删除快照失败", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name), zap.Error(err))
 		return nil, err
 	}
 	zap.L().Info("删除快照成功", zap.String("instance_id", req.InstanceID), zap.String("name", req.Name))
-	return json.Marshal(map[string]bool{"deleted": true})
-}
-
-func (e *Executor) handleDownloadImage(payload json.RawMessage) (json.RawMessage, error) {
-	var req struct {
-		ImageID   string `json:"image_id"`
-		ImageType string `json:"image_type"` // container / vm
-		Source    string `json:"source"`     // container: "images:ubuntu/24.04/cloud", vm: URL
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return nil, fmt.Errorf("解析下载参数失败: %w", err)
-	}
-
-	zap.L().Info("开始下载镜像",
-		zap.String("image_id", req.ImageID),
-		zap.String("type", req.ImageType),
-		zap.String("source", req.Source))
-
-	switch req.ImageType {
-	case "container":
-		return e.downloadContainerImage(req.ImageID, req.Source)
-	case "vm":
-		return e.downloadVMImage(req.ImageID, req.Source)
-	default:
-		return nil, fmt.Errorf("未知镜像类型: %s", req.ImageType)
-	}
-}
-
-// downloadContainerImage 使用 incus image copy 下载容器镜像，解析 stderr 实时进度
-func (e *Executor) downloadContainerImage(imageID, source string) (json.RawMessage, error) {
-	// 已存在则跳过
-	if e.incusClient.ImageAliasExists(imageID) {
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID:  imageID,
-			Stage:    "done",
-			Progress: 100,
-		})
-		return json.Marshal(map[string]string{"status": "already_exists"})
-	}
-
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "downloading",
-		Progress: 0,
-	})
-
-	args := []string{"image", "copy", source, "local:", "--alias", imageID, "--auto-update"}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "incus", args...)
-	zap.L().Info("执行 incus image copy", zap.String("cmd", strings.Join(cmd.Args, " ")))
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("创建 stderr pipe 失败: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 incus image copy 失败: %w", err)
-	}
-
-	// incus 用 \r 覆盖同一行输出进度，bufio.Scanner 按 \n 切分会阻塞到命令结束。
-	// 改用逐字节读取，按 \r 或 \n 切分，实现实时进度捕获。
-	var lastSpeed int64
-	go func() {
-		buf := make([]byte, 4096)
-		var lineBuf []byte
-		for {
-			n, readErr := stderr.Read(buf)
-			if n > 0 {
-				for i := 0; i < n; i++ {
-					ch := buf[i]
-					if ch == '\r' || ch == '\n' {
-						if len(lineBuf) > 0 {
-							line := string(lineBuf)
-							lineBuf = lineBuf[:0]
-							pct, speed := parseIncusImageCopyProgress(line)
-							if pct >= 0 {
-								lastSpeed = speed
-								e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-									ImageID:  imageID,
-									Stage:    "downloading",
-									Progress: pct,
-									SpeedBps: speed,
-								})
-							}
-						}
-					} else {
-						lineBuf = append(lineBuf, ch)
-					}
-				}
-			}
-			if readErr != nil {
-				if len(lineBuf) > 0 {
-					line := string(lineBuf)
-					pct, speed := parseIncusImageCopyProgress(line)
-					if pct >= 0 {
-						lastSpeed = speed
-					}
-				}
-				return
-			}
-		}
-	}()
-
-	waitErr := cmd.Wait()
-	if waitErr != nil {
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID: imageID,
-			Stage:   "error",
-			Error:   waitErr.Error(),
-		})
-		return nil, fmt.Errorf("incus image copy 失败: %w", waitErr)
-	}
-
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "done",
-		Progress: 100,
-		SpeedBps: lastSpeed,
-	})
-	// 下载完成后立即上报本地镜像列表，确保 Master 状态同步
-	go func() {
-		aliases, err := e.incusClient.ListImages()
-		if err == nil {
-			e.wsClient.SendLocalImages(aliases)
-		}
-	}()
-	return json.Marshal(map[string]string{"status": "completed"})
-}
-
-// parseIncusImageCopyProgress 解析 incus image copy 的 stderr 进度输出
-// 格式示例: "Copying the image: 100% (45.23MB/s)"
-func parseIncusImageCopyProgress(line string) (percent int, speedBps int64) {
-	// 匹配百分比
-	pctRe := regexp.MustCompile(`(\d+)%`)
-	pctMatch := pctRe.FindStringSubmatch(line)
-	if len(pctMatch) >= 2 {
-		pct, _ := strconv.Atoi(pctMatch[1])
-		percent = pct
-	} else {
-		percent = -1 // 未匹配到百分比
-	}
-
-	// 匹配速度，如 45.23MB/s、1.2GB/s、500KB/s
-	speedRe := regexp.MustCompile(`\(([\d.]+)\s*(B|KB|MB|GB|TB)/s\)`)
-	speedMatch := speedRe.FindStringSubmatch(line)
-	if len(speedMatch) >= 3 {
-		val, _ := strconv.ParseFloat(speedMatch[1], 64)
-		unit := speedMatch[2]
-		switch unit {
-		case "B":
-			speedBps = int64(val)
-		case "KB":
-			speedBps = int64(val * 1024)
-		case "MB":
-			speedBps = int64(val * 1024 * 1024)
-		case "GB":
-			speedBps = int64(val * 1024 * 1024 * 1024)
-		case "TB":
-			speedBps = int64(val * 1024 * 1024 * 1024 * 1024)
-		}
-	}
-	return
-}
-
-// downloadVMImage 下载 VM 镜像：固定 .qcow2 路径，HTTP 下载，qemu-img convert 转换，再导入 Incus
-func (e *Executor) downloadVMImage(imageID, url string) (json.RawMessage, error) {
-	if url == "" {
-		return nil, fmt.Errorf("VM 镜像 %s 无下载地址（需手动上传）", imageID)
-	}
-
-	cacheDir := "/var/cache/tsukiyo/images"
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		return nil, fmt.Errorf("创建缓存目录失败: %w", err)
-	}
-
-	target := filepath.Join(cacheDir, imageID+".qcow2")
-	tmp := target + ".tmp"
-
-	// 检查是否已存在
-	if _, err := os.Stat(target); err == nil {
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID:  imageID,
-			Stage:    "done",
-			Progress: 100,
-		})
-		return json.Marshal(map[string]string{"status": "already_exists"})
-	}
-
-	// 立即发送 downloading 初始状态
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "downloading",
-		Progress: 0,
-	})
-
-	// 直接 HTTP 下载（照抄 CLICD）
-	_ = os.Remove(tmp)
-	if err := downloadFileWithProgress(url, tmp, imageID, e.wsClient); err != nil {
-		_ = os.Remove(tmp)
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID: imageID,
-			Stage:   "error",
-			Error:   "下载失败: " + err.Error(),
-		})
-		return nil, fmt.Errorf("下载 VM 镜像失败: %w", err)
-	}
-
-	// 转换为 qcow2（照抄 CLICD normalizeQCOW2）
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "converting",
-		Progress: 100,
-	})
-	if err := normalizeQCOW2(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		_ = os.Remove(target)
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID: imageID,
-			Stage:   "error",
-			Error:   "转换失败: " + err.Error(),
-		})
-		return nil, fmt.Errorf("转换 qcow2 失败: %w", err)
-	}
-	_ = os.Remove(tmp)
-
-	// 导入 Incus
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "importing",
-		Progress: 100,
-	})
-	if err := e.incusClient.ImportImageFromFile(imageID, target); err != nil {
-		_ = os.Remove(target)
-		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-			ImageID: imageID,
-			Stage:   "error",
-			Error:   "导入失败: " + err.Error(),
-		})
-		return nil, fmt.Errorf("导入 Incus 失败: %w", err)
-	}
-	zap.L().Info("VM 镜像导入成功", zap.String("image_id", imageID))
-
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID:  imageID,
-		Stage:    "done",
-		Progress: 100,
-	})
-
-	// 导入完成后立即上报本地镜像列表
-	go func() {
-		aliases, err := e.incusClient.ListImages()
-		if err == nil {
-			e.wsClient.SendLocalImages(aliases)
-		}
-	}()
-
-	return json.Marshal(map[string]string{"status": "completed"})
-}
-
-// downloadFileWithProgress 直接 HTTP 下载文件并推送进度（照抄 CLICD）
-func downloadFileWithProgress(url, target, imageID string, wsClient *ws.Client) error {
-	client := http.Client{
-		Timeout: 30 * time.Minute,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			if ua := via[0].Header.Get("User-Agent"); ua != "" {
-				req.Header.Set("User-Agent", ua)
-			}
-			return nil
-		},
-	}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	out, err := os.Create(target)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	total := resp.ContentLength
-	if total < 0 {
-		total = 0
-	}
-
-	buf := make([]byte, 256*1024)
-	var downloaded int64
-	var lastReport time.Time
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			written, writeErr := out.Write(buf[:n])
-			downloaded += int64(written)
-			if writeErr != nil {
-				return writeErr
-			}
-			if written != n {
-				return io.ErrShortWrite
-			}
-			now := time.Now()
-			if lastReport.IsZero() || now.Sub(lastReport) >= 1*time.Second {
-				lastReport = now
-				pct := 0
-				if total > 0 {
-					pct = int(downloaded * 100 / total)
-					if pct > 99 {
-						pct = 99
-					}
-				}
-				wsClient.SendImageProgress(ws.ImageProgressPayload{
-					ImageID:         imageID,
-					Stage:           "downloading",
-					Progress:        pct,
-					DownloadedBytes: downloaded,
-					TotalBytes:      total,
-				})
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-	return out.Sync()
-}
-
-// normalizeQCOW2 使用 qemu-img convert 转换镜像为标准 qcow2（照抄 CLICD）
-func normalizeQCOW2(src, target string) error {
-	cmd := exec.Command("qemu-img", "convert", "-O", "qcow2", src, target)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("qemu-img convert 失败: %v, output: %s", err, string(output))
-	}
-	return nil
-}
-
-// handleCancelImageDownload 取消镜像下载
-func (e *Executor) handleCancelImageDownload(payload json.RawMessage) (json.RawMessage, error) {
-	var req struct {
-		ImageID string `json:"image_id"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return nil, err
-	}
-
-	if task := e.downloadManager.GetTask(req.ImageID); task != nil {
-		task.Cancel()
-		e.downloadManager.RemoveTask(req.ImageID)
-	}
-
-	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
-		ImageID: req.ImageID,
-		Stage:   "canceled",
-	})
-
-	return json.Marshal(map[string]string{"status": "canceled"})
-}
-
-// handleCheckImage 检查镜像是否已下载
-func (e *Executor) handleCheckImage(payload json.RawMessage) (json.RawMessage, error) {
-	var req struct {
-		ImageID   string `json:"image_id"`
-		ImageType string `json:"image_type"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return nil, err
-	}
-
-	exists := false
-	switch req.ImageType {
-	case "container":
-		exists = e.incusClient.ImageAliasExists(req.ImageID)
-	case "vm":
-		// 优先检查 Incus 中是否存在该别名（下载完成后已导入）
-		if e.incusClient.ImageAliasExists(req.ImageID) {
-			exists = true
-		} else {
-			// 备选：检查下载任务是否完成（导入前状态）
-			task := e.downloadManager.GetTask(req.ImageID)
-			if task != nil && task.GetStatus() == image.StatusCompleted {
-				exists = true
-			}
-		}
-	}
-
-	return json.Marshal(map[string]interface{}{
-		"image_id":   req.ImageID,
-		"downloaded": exists,
-	})
-}
-
-// handleDeleteImage 删除已下载的镜像
-func (e *Executor) handleDeleteImage(payload json.RawMessage) (json.RawMessage, error) {
-	var req struct {
-		ImageID   string `json:"image_id"`
-		ImageType string `json:"image_type"`
-	}
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return nil, err
-	}
-
-	switch req.ImageType {
-	case "container":
-		// 通过 incus image delete 删除
-		cmd := exec.Command("incus", "image", "delete", req.ImageID)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("删除容器镜像失败: %v: %s", err, string(output))
-		}
-	case "vm":
-		// 先通过 incus image delete 删除镜像
-		cmd := exec.Command("incus", "image", "delete", req.ImageID)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			zap.L().Warn("删除 VM 镜像失败", zap.String("image_id", req.ImageID), zap.Error(err), zap.String("output", string(output)))
-		}
-		e.downloadManager.RemoveTask(req.ImageID)
-	}
-
-	return json.Marshal(map[string]string{"status": "deleted"})
+	return json.Marshal(map[string]interface{}{"deleted": true, "instance_id": req.InstanceID, "name": req.Name})
 }
 
 func (e *Executor) handleApplyNetwork(payload json.RawMessage) (json.RawMessage, error) {
@@ -1078,11 +775,11 @@ func (e *Executor) handleApplyNetwork(payload json.RawMessage) (json.RawMessage,
 		HostIP        string `json:"host_ip"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
-		zap.L().Error("handleApplyNetwork 解析 payload 失败", zap.Error(err))
+		zap.L().Error("解析网络应用任务参数失败", zap.Error(err))
 		return nil, err
 	}
 
-	zap.L().Info("handleApplyNetwork 开始",
+	zap.L().Info("开始应用网络配置",
 		zap.String("action", req.Action),
 		zap.String("instance_id", req.InstanceID),
 		zap.Int("host_port", req.HostPort),
@@ -1272,37 +969,11 @@ func (e *Executor) handleVPCNetwork(payload json.RawMessage) (json.RawMessage, e
 		}
 		zap.L().Info("bridge 网络创建成功", zap.String("bridge", req.BridgeName))
 
-		// 配置 SNAT（如果启用且指定了出口 IP）
-		if req.SNATEnabled && req.EgressV4Primary != "" && req.ParentIface != "" {
-			if err := reconcile.ConfigureSNAT(req.BridgeName, req.IPv4CIDR, req.EgressV4Primary, req.ParentIface); err != nil {
-				zap.L().Warn("配置 SNAT 失败", zap.Error(err))
-			} else {
-				zap.L().Info("SNAT 配置成功", zap.String("egress", req.EgressV4Primary))
-			}
-		}
-
 	case "update":
-		// 更新：重新配置 SNAT 等
-		if req.EgressV4Primary != "" && req.ParentIface != "" {
-			if req.SNATEnabled {
-				if err := reconcile.ConfigureSNAT(req.BridgeName, req.IPv4CIDR, req.EgressV4Primary, req.ParentIface); err != nil {
-					zap.L().Warn("更新 SNAT 失败", zap.Error(err))
-				}
-			} else {
-				if err := reconcile.RemoveSNAT(req.BridgeName, req.IPv4CIDR); err != nil {
-					zap.L().Warn("移除 SNAT 失败", zap.Error(err))
-				}
-			}
-		}
+		// 更新：Incus 原生 NAT 已启用，无需额外配置
 		zap.L().Info("VPC 更新完成", zap.String("bridge", req.BridgeName))
 
 	case "delete":
-		// 先移除 SNAT 规则
-		if req.IPv4CIDR != "" {
-			if err := reconcile.RemoveSNAT(req.BridgeName, req.IPv4CIDR); err != nil {
-				zap.L().Warn("移除 SNAT 失败", zap.Error(err))
-			}
-		}
 		if err := e.incusClient.DeleteBridgeNetwork(req.BridgeName); err != nil {
 			zap.L().Error("删除 bridge 网络失败", zap.String("bridge", req.BridgeName), zap.Error(err))
 			return nil, fmt.Errorf("删除 bridge 网络失败: %w", err)

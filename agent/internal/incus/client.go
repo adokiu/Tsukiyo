@@ -189,25 +189,24 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	nicDevice := map[string]string{
 		"name":    "eth0",
 		"nictype": "bridged",
-		"parent":  "incusbr0",
 		"type":    "nic",
 	}
-	// VPC 网络配置优先
+
+	// VPC 网络配置：使用 Incus managed network（NAT + IP 分配由 Incus 处理）
 	if req.BridgeName != "" {
-		nicDevice["parent"] = req.BridgeName
+		delete(nicDevice, "nictype")
+		nicDevice["network"] = req.BridgeName
+		// 通过 Incus 设备属性分配静态 IP
+		if req.InternalIPv4 != "" {
+			nicDevice["ipv4.address"] = req.InternalIPv4
+		}
 	} else if req.NetworkBridge != "" {
 		nicDevice["parent"] = req.NetworkBridge
+	} else {
+		nicDevice["parent"] = "incusbr0"
 	}
-	if req.InternalIPv4 != "" {
-		nicDevice["ipv4.address"] = req.InternalIPv4
-		// Incus bridge 禁用 DHCP 时，静态 IP 必须同时开启 ipv4_filtering
-		nicDevice["security.ipv4_filtering"] = "true"
-	} else if req.IPv4Address != "" {
-		nicDevice["ipv4.address"] = req.IPv4Address
-	}
-	if req.IPv6Address != "" {
-		nicDevice["ipv6.address"] = req.IPv6Address
-	}
+
+	// 安全过滤
 	if req.IPv4Filter {
 		nicDevice["security.ipv4_filtering"] = "true"
 	}
@@ -225,34 +224,23 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	if req.UserData != "" {
 		configMap["user.user-data"] = req.UserData
 	}
-	// VPC 静态内网 IP：通过 cloud-init network-config 配置容器内部 eth0
-	if req.InternalIPv4 != "" && req.GatewayV4 != "" {
-		prefixLen := 24
-		if req.IPv4CIDR != "" {
-			_, ipNet, err := net.ParseCIDR(req.IPv4CIDR)
-			if err == nil {
-				ones, _ := ipNet.Mask.Size()
-				prefixLen = ones
-			}
-		}
-		networkConfig := fmt.Sprintf("version: 1\nconfig:\n  - type: physical\n    name: eth0\n    subnets:\n      - type: static\n        control: auto\n        address: %s/%d\n        gateway: %s\n",
-			req.InternalIPv4, prefixLen, req.GatewayV4)
-		configMap["cloud-init.network-config"] = networkConfig
-		zap.L().Info("已生成 cloud-init network-config", zap.String("address", req.InternalIPv4), zap.Int("prefix", prefixLen), zap.String("gateway", req.GatewayV4))
-	}
 
 	body := map[string]interface{}{
 		"name":    req.Name,
 		"source":  map[string]string{"type": "image", "alias": req.TemplateID},
 		"config":  configMap,
 		"devices": devices,
-		"type":    req.Type,
+	}
+	if req.BridgeName != "" {
+		body["profiles"] = []string{}
+		zap.L().Info("VPC 模式排除默认 profile", zap.String("name", req.Name))
 	}
 	if req.Type == "" {
 		body["type"] = "container"
 	}
 
-	zap.L().Info("CreateInstance 发送 POST /instances", zap.String("name", req.Name))
+	bodyJSON, _ := json.Marshal(body)
+	zap.L().Info("CreateInstance 发送 POST /instances", zap.String("name", req.Name), zap.String("body", string(bodyJSON)))
 	resp, err := c.doRequest("POST", "/instances", body)
 	if err != nil {
 		zap.L().Error("CreateInstance POST 请求失败", zap.String("name", req.Name), zap.Error(err))
@@ -678,7 +666,7 @@ func (c *Client) GetInstanceNetworkInfo(name string) ([]string, error) {
 }
 
 // ExecCommand 在实例内执行命令
-func (c *Client) ExecCommand(instanceName string, cmd []string, env map[string]string, user string, group string) (*ExecResult, error) {
+func (c *Client) ExecCommand(instanceName string, cmd []string, env map[string]string, user string, group uint32) (*ExecResult, error) {
 	body := map[string]interface{}{
 		"command":            cmd,
 		"wait-for-websocket": false,
@@ -695,7 +683,7 @@ func (c *Client) ExecCommand(instanceName string, cmd []string, env map[string]s
 	if user != "" {
 		body["user"] = user
 	}
-	if group != "" {
+	if group != 0 {
 		body["group"] = group
 	}
 
@@ -723,48 +711,7 @@ func (c *Client) ExecCommand(instanceName string, cmd []string, env map[string]s
 func (c *Client) SetInstancePassword(name string, password string) error {
 	// 尝试使用 incus exec 设置密码
 	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("echo 'root:%s' | chpasswd", password)}
-	_, err := c.ExecCommand(name, cmd, nil, "", "")
-	return err
-}
-
-// EnsureSSHInstalled 在容器内安装并启动 openssh-server（支持 apt/apk/dnf/yum）
-func (c *Client) EnsureSSHInstalled(name string) error {
-	script := `set -e
-if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
-  # 已有 sshd，尝试启动服务
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service sshd start 2>/dev/null || true
-  elif command -v service >/dev/null 2>&1; then
-    service ssh start 2>/dev/null || service sshd start 2>/dev/null || true
-  fi
-  exit 0
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-if command -v apt-get >/dev/null 2>&1; then
-  apt-get update -qq >/dev/null 2>&1 || true
-  apt-get install -y -qq openssh-server >/dev/null 2>&1 || true
-elif command -v apk >/dev/null 2>&1; then
-  apk add --no-cache openssh >/dev/null 2>&1 || true
-elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y openssh-server >/dev/null 2>&1 || true
-elif command -v yum >/dev/null 2>&1; then
-  yum install -y openssh-server >/dev/null 2>&1 || true
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
-  systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
-elif command -v rc-service >/dev/null 2>&1; then
-  rc-update add sshd default 2>/dev/null || true
-  rc-service sshd start 2>/dev/null || true
-elif command -v service >/dev/null 2>&1; then
-  service ssh start 2>/dev/null || service sshd start 2>/dev/null || true
-fi
-`
-	_, err := c.ExecCommand(name, []string{"/bin/sh", "-c", script}, nil, "", "")
+	_, err := c.ExecCommand(name, cmd, nil, "", 0)
 	return err
 }
 
@@ -781,6 +728,91 @@ func (c *Client) ImageAliasExists(alias string) bool {
 		return false
 	}
 	return result.Name == alias
+}
+
+// RemoteImage 远程镜像信息
+// ImageKey 格式: alias|type|arch，作为全局唯一标识
+// 例如: debian/forky/cloud|container|x86_64
+type RemoteImage struct {
+	ImageKey     string `json:"image_key"`
+	Alias        string `json:"alias"`
+	Architecture string `json:"architecture"`
+	Description  string `json:"description"`
+	OS           string `json:"os"`
+	Release      string `json:"release"`
+	Type         string `json:"type"` // container / virtual-machine
+}
+
+// BuildImageKey 构建镜像复合键
+func BuildImageKey(alias, imageType, arch string) string {
+	return alias + "|" + imageType + "|" + arch
+}
+
+// ParseImageKey 解析镜像复合键，返回 alias, type, arch
+func ParseImageKey(key string) (alias, imageType, arch string) {
+	parts := strings.SplitN(key, "|", 3)
+	if len(parts) == 3 {
+		return parts[0], parts[1], parts[2]
+	}
+	// 兼容旧格式：直接返回原始值
+	return key, "container", "x86_64"
+}
+
+// ListRemoteImages 获取远程镜像列表（所有架构的 cloud 镜像）
+func (c *Client) ListRemoteImages(remote string) ([]RemoteImage, error) {
+	cmd := exec.Command("incus", "image", "list", remote, "--format", "json")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		zap.L().Error("incus image list 失败", zap.String("output", string(output)), zap.Error(err))
+		return nil, fmt.Errorf("incus image list 失败: %w, output: %s", err, string(output))
+	}
+
+	var rawImages []struct {
+		Type         string `json:"type"`
+		Architecture string `json:"architecture"`
+		Properties   struct {
+			Description string `json:"description"`
+			OS          string `json:"os"`
+			Release     string `json:"release"`
+			Variant     string `json:"variant"`
+		} `json:"properties"`
+		Aliases []struct {
+			Name string `json:"name"`
+		} `json:"aliases"`
+	}
+
+	if err := json.Unmarshal(output, &rawImages); err != nil {
+		zap.L().Error("解析镜像列表失败", zap.Error(err))
+		return nil, fmt.Errorf("解析镜像列表失败: %w", err)
+	}
+
+	zap.L().Info("解析后的镜像总数", zap.Int("count", len(rawImages)))
+
+	result := make([]RemoteImage, 0, len(rawImages))
+	for _, img := range rawImages {
+		if img.Properties.Variant != "cloud" {
+			continue
+		}
+		if len(img.Aliases) == 0 {
+			continue
+		}
+
+		alias := img.Aliases[0].Name
+		imageKey := BuildImageKey(alias, img.Type, img.Architecture)
+
+		result = append(result, RemoteImage{
+			ImageKey:     imageKey,
+			Alias:        alias,
+			Architecture: img.Architecture,
+			Description:  img.Properties.Description,
+			OS:           img.Properties.OS,
+			Release:      img.Properties.Release,
+			Type:         img.Type,
+		})
+	}
+
+	zap.L().Info("过滤后的 cloud 镜像数量", zap.Int("count", len(result)))
+	return result, nil
 }
 
 // ImportImageFromFile 从 qcow2 文件导入镜像到 Incus
@@ -944,14 +976,15 @@ type ImageAlias struct {
 
 // ImageInfo 镜像信息
 type ImageInfo struct {
-	Fingerprint string       `json:"fingerprint"`
-	Aliases     []ImageAlias `json:"aliases"`
-	Type        string       `json:"type"`
-	Public      bool         `json:"public"`
-	Size        int64        `json:"size"`
+	Fingerprint  string       `json:"fingerprint"`
+	Aliases      []ImageAlias `json:"aliases"`
+	Type         string       `json:"type"`
+	Architecture string       `json:"architecture"`
+	Public       bool         `json:"public"`
+	Size         int64        `json:"size"`
 }
 
-// ListImages 列出所有本地镜像，返回别名列表
+// ListImages 列出所有本地镜像，返回 image_key 列表 (alias|type|arch)
 func (c *Client) ListImages() ([]string, error) {
 	resp, err := c.doRequest("GET", "/images?recursion=1", nil)
 	if err != nil {
@@ -961,15 +994,15 @@ func (c *Client) ListImages() ([]string, error) {
 	if _, err := parseResponse(resp, &images); err != nil {
 		return nil, err
 	}
-	var aliases []string
+	var keys []string
 	for _, img := range images {
 		for _, alias := range img.Aliases {
 			if alias.Name != "" {
-				aliases = append(aliases, alias.Name)
+				keys = append(keys, BuildImageKey(alias.Name, img.Type, img.Architecture))
 			}
 		}
 	}
-	return aliases, nil
+	return keys, nil
 }
 
 // StoragePoolExists 检查存储池是否存在
@@ -1137,8 +1170,8 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 
 	config := map[string]string{
 		"ipv4.address": ipv4Addr,
-		"ipv4.nat":     "false",
-		"ipv4.dhcp":    "false",
+		"ipv4.nat":     "true",
+		"ipv4.dhcp":    "true",
 	}
 	if ipv6ULA != "" {
 		config["ipv6.address"] = ipv6ULA
@@ -1181,6 +1214,31 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 		zap.L().Info("等待 bridge 创建操作完成", zap.String("name", name), zap.String("operation", pureOpID))
 		if err := c.waitOperation(pureOpID); err != nil {
 			return fmt.Errorf("等待 bridge 创建操作失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// UpdateBridgeNetwork 更新 bridge 网络配置
+func (c *Client) UpdateBridgeNetwork(name string, config map[string]string) error {
+	body := map[string]interface{}{
+		"config": config,
+	}
+	resp, err := c.doRequest("PUT", "/networks/"+name, body)
+	if err != nil {
+		return fmt.Errorf("更新 bridge 网络请求失败: %w", err)
+	}
+	opID, err := parseResponse(resp, nil)
+	if err != nil {
+		return fmt.Errorf("更新 bridge 网络响应解析失败: %w", err)
+	}
+	if opID != "" {
+		pureOpID := opID
+		if idx := strings.LastIndex(opID, "/"); idx >= 0 {
+			pureOpID = opID[idx+1:]
+		}
+		if err := c.waitOperation(pureOpID); err != nil {
+			return fmt.Errorf("等待 bridge 更新操作失败: %w", err)
 		}
 	}
 	return nil

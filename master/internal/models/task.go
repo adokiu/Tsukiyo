@@ -22,23 +22,25 @@ const (
 type TaskType string
 
 const (
-	TaskTypeCreateInstance    TaskType = "create_instance"
-	TaskTypeDeleteInstance    TaskType = "delete_instance"
-	TaskTypeStartInstance     TaskType = "start_instance"
-	TaskTypeStopInstance      TaskType = "stop_instance"
-	TaskTypeRestartInstance   TaskType = "restart_instance"
-	TaskTypeReinstallInstance TaskType = "reinstall_instance"
-	TaskTypeResizeInstance    TaskType = "resize_instance"
-	TaskTypeCreateSnapshot    TaskType = "create_snapshot"
-	TaskTypeRestoreSnapshot   TaskType = "restore_snapshot"
-	TaskTypeDeleteSnapshot    TaskType = "delete_snapshot"
-	TaskTypeDownloadImage     TaskType = "download_image"
-	TaskTypeApplyNetwork      TaskType = "apply_network"
-	TaskTypeApplyFirewall     TaskType = "apply_firewall"
-	TaskTypeFormatDisk        TaskType = "format_disk"
-	TaskTypeInitStorage       TaskType = "init_storage"
-	TaskTypeMigrateInstance   TaskType = "migrate_instance"
-	TaskTypeVPCNetwork        TaskType = "vpc_network"
+	TaskTypeCreateInstance      TaskType = "create_instance"
+	TaskTypeDeleteInstance      TaskType = "delete_instance"
+	TaskTypeStartInstance       TaskType = "start_instance"
+	TaskTypeStopInstance        TaskType = "stop_instance"
+	TaskTypeRestartInstance     TaskType = "restart_instance"
+	TaskTypeReinstallInstance   TaskType = "reinstall_instance"
+	TaskTypeResizeInstance      TaskType = "resize_instance"
+	TaskTypeCreateSnapshot      TaskType = "create_snapshot"
+	TaskTypeRestoreSnapshot     TaskType = "restore_snapshot"
+	TaskTypeDeleteSnapshot      TaskType = "delete_snapshot"
+	TaskTypeDownloadImage       TaskType = "download_image"
+	TaskTypeDeleteImage         TaskType = "delete_image"
+	TaskTypeCancelImageDownload TaskType = "cancel_image_download"
+	TaskTypeApplyNetwork        TaskType = "apply_network"
+	TaskTypeApplyFirewall       TaskType = "apply_firewall"
+	TaskTypeFormatDisk          TaskType = "format_disk"
+	TaskTypeInitStorage         TaskType = "init_storage"
+	TaskTypeMigrateInstance     TaskType = "migrate_instance"
+	TaskTypeVPCNetwork          TaskType = "vpc_network"
 )
 
 // Task 任务队列表
@@ -77,4 +79,20 @@ func (t *Task) IsPending() bool {
 // CanRetry 检查任务是否可以重试
 func (t *Task) CanRetry() bool {
 	return t.RetryCount < t.MaxRetries
+}
+
+// TaskLog 任务日志
+type TaskLog struct {
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	TaskID    uuid.UUID `gorm:"type:uuid;not null;index" json:"task_id"`
+	Level     string    `gorm:"type:varchar(16);not null" json:"level"` // info, error, warn
+	Message   string    `gorm:"type:text;not null" json:"message"`
+	CreatedAt time.Time `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
+
+	// 关联
+	Task Task `gorm:"foreignKey:TaskID" json:"task,omitempty"`
+}
+
+func (TaskLog) TableName() string {
+	return "task_logs"
 }

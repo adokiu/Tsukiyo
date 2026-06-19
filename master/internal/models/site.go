@@ -14,6 +14,7 @@ type SiteConfig struct {
 	SiteDescription string    `gorm:"type:text" json:"site_description,omitempty"`
 	SiteURL         string    `gorm:"type:varchar(255)" json:"site_url,omitempty"`
 	ContactEmail    string    `gorm:"type:varchar(255)" json:"contact_email,omitempty"`
+	IncusRemoteURL  string    `gorm:"type:varchar(512);default:'images:'" json:"incus_remote_url,omitempty"`
 	IsInitialized   bool      `gorm:"type:boolean;not null;default:false" json:"is_initialized"`
 	CreatedAt       time.Time `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
 	UpdatedAt       time.Time `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`

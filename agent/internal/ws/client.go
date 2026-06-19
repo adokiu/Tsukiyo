@@ -19,13 +19,14 @@ import (
 type MessageType string
 
 const (
-	MsgTypeRegister       MessageType = "register"
-	MsgTypeHeartbeat      MessageType = "heartbeat"
-	MsgTypeInstanceStatus MessageType = "instance_status"
-	MsgTypeMetrics        MessageType = "metrics"
-	MsgTypeTaskResult     MessageType = "task_result"
-	MsgTypeResponse       MessageType = "response"
-	MsgTypeImageProgress  MessageType = "image_progress"
+	MsgTypeRegister         MessageType = "register"
+	MsgTypeHeartbeat        MessageType = "heartbeat"
+	MsgTypeInstanceStatus   MessageType = "instance_status"
+	MsgTypeMetrics          MessageType = "metrics"
+	MsgTypeTaskResult       MessageType = "task_result"
+	MsgTypeResponse         MessageType = "response"
+	MsgTypeImageProgress    MessageType = "image_progress"
+	MsgTypeInstanceProgress MessageType = "instance_progress"
 )
 
 // TaskHandler 任务处理回调
@@ -311,6 +312,32 @@ func (c *Client) SendLocalImages(imageAliases []string) error {
 	return c.sendMessage(MsgTypeImageProgress, payload)
 }
 
+// InstanceProgressPayload 实例创建进度
+type InstanceProgressPayload struct {
+	InstanceID string `json:"instance_id"`
+	TaskID     string `json:"task_id"`
+	Step       int    `json:"step"`     // 1=started 2=accepted 3=network 4=ssh 5=port_mapping 6=completed
+	Progress   int    `json:"progress"` // 0-100
+	Message    string `json:"message"`  // 中文描述
+	Error      string `json:"error,omitempty"`
+	Status     string `json:"status"` // running / success / error
+}
+
+// SendInstanceProgress 发送实例创建进度
+func (c *Client) SendInstanceProgress(p InstanceProgressPayload) error {
+	payload := map[string]interface{}{
+		"token":       c.cfg.Token,
+		"instance_id": p.InstanceID,
+		"task_id":     p.TaskID,
+		"step":        p.Step,
+		"progress":    p.Progress,
+		"message":     p.Message,
+		"error":       p.Error,
+		"status":      p.Status,
+	}
+	return c.sendMessage(MsgTypeInstanceProgress, payload)
+}
+
 // readLoop 读取消息循环
 func (c *Client) readLoop() {
 	defer func() {
@@ -461,12 +488,19 @@ func (c *Client) handleTask(payload json.RawMessage) {
 
 	result, err := c.taskHandler(task.TaskID, task.Type, task.Payload)
 	if err != nil {
+		zap.L().Error("任务执行失败",
+			zap.String("task_id", task.TaskID),
+			zap.String("type", task.Type),
+			zap.Error(err))
 		if serr := c.SendTaskResult(task.TaskID, false, nil, err.Error()); serr != nil {
 			zap.L().Error("发送任务失败结果失败", zap.Error(serr))
 		}
 		return
 	}
 
+	zap.L().Info("任务执行成功",
+		zap.String("task_id", task.TaskID),
+		zap.String("type", task.Type))
 	if serr := c.SendTaskResult(task.TaskID, true, result, ""); serr != nil {
 		zap.L().Error("发送任务成功结果失败", zap.Error(serr))
 	}

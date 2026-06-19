@@ -100,6 +100,7 @@
     "nodes": "节点管理",
     "instances": "实例管理",
     "images": "镜像管理",
+    "tasks": "任务队列",
     "network": "网络管理",
     "ipPools": "IP 池",
     "portMappings": "端口映射",
@@ -110,10 +111,10 @@
     "security": "安全",
     "securityManagement": "安全管理",
     "alerts": "告警",
-    "tasks": "任务队列",
     "system": "系统",
     "siteConfig": "站点配置",
-    "console": "控制台"
+    "console": "控制台",
+    "settings": "设置"
   },
   "dashboard": {
     "title": "仪表盘",
@@ -184,5 +185,8 @@
     "network": "网络",
     "traffic": "流量",
     "firewallRules": "防火墙规则"
+  },
+  "settings": {
+    "title": "设置"
   }
 }

@@ -149,6 +149,18 @@ type InstanceStatusPayload struct {
 	NetOut     int64   `json:"net_out,omitempty"`
 }
 
+// InstanceProgressPayload 实例创建进度上报
+type InstanceProgressPayload struct {
+	Token      string `json:"token"`
+	InstanceID string `json:"instance_id"`
+	TaskID     string `json:"task_id"`
+	Step       int    `json:"step"`     // 1=started 2=accepted 3=network 4=ssh 5=port_mapping 6=completed
+	Progress   int    `json:"progress"` // 0-100
+	Message    string `json:"message"`  // 中文描述
+	Error      string `json:"error,omitempty"`
+	Status     string `json:"status"` // running / success / error
+}
+
 // MetricsPayload 监控指标上报
 type MetricsPayload struct {
 	Token     string           `json:"token"`
@@ -208,13 +220,41 @@ func (m *Manager) BroadcastImageProgress(nodeID uuid.UUID, payload ImageProgress
 	m.frontendConns = alive
 }
 
+// BroadcastInstanceProgress 向前端广播实例创建进度
+func (m *Manager) BroadcastInstanceProgress(nodeID uuid.UUID, payload InstanceProgressPayload) {
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    "instance_progress",
+		"node_id": nodeID.String(),
+		"payload": payload,
+	})
+	if err != nil {
+		return
+	}
+
+	m.frontendMu.Lock()
+	defer m.frontendMu.Unlock()
+	zap.L().Info("广播实例进度", zap.String("node_id", nodeID.String()), zap.String("instance_id", payload.InstanceID), zap.Int("前端连接数", len(m.frontendConns)))
+	alive := make([]*FrontendConn, 0, len(m.frontendConns))
+	for _, fc := range m.frontendConns {
+		select {
+		case fc.SendCh <- data:
+			alive = append(alive, fc)
+		default:
+			zap.L().Warn("发送缓冲区满，丢弃连接")
+		}
+	}
+	m.frontendConns = alive
+}
+
 // HandleFrontendWebSocket 处理前端 WebSocket 连接
 func (m *Manager) HandleFrontendWebSocket(c *gin.Context) {
+	zap.L().Info("前端 WebSocket 连接请求", zap.String("path", c.Request.URL.Path))
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		zap.L().Error("前端 WebSocket 升级失败", zap.Error(err))
 		return
 	}
+	zap.L().Info("前端 WebSocket 连接成功", zap.String("path", c.Request.URL.Path))
 
 	fc := &FrontendConn{
 		Conn:   conn,
@@ -580,6 +620,8 @@ func (c *Connection) readPump(m *Manager) {
 			m.handleResponse(msg.ID, msg.Payload)
 		case "image_progress":
 			m.handleImageProgress(c.NodeID, msg.Payload)
+		case "instance_progress":
+			m.handleInstanceProgress(c.NodeID, msg.Payload)
 		default:
 			zap.L().Debug("收到未处理的 Agent 消息", zap.String("type", msg.Type), zap.String("node_id", c.NodeID.String()))
 		}
@@ -839,12 +881,45 @@ func (m *Manager) handleTaskResult(nodeID uuid.UUID, payload json.RawMessage) {
 		Error   string          `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(payload, &result); err != nil {
+		zap.L().Error("解析任务结果失败", zap.Error(err))
 		return
 	}
 
 	taskID, err := uuid.Parse(result.TaskID)
 	if err != nil {
+		zap.L().Error("解析任务 ID 失败", zap.Error(err))
 		return
+	}
+
+	zap.L().Info("收到任务结果",
+		zap.String("task_id", result.TaskID),
+		zap.String("node_id", nodeID.String()),
+		zap.Bool("success", result.Success))
+
+	// 查询任务信息
+	var task models.Task
+	if err := db.DB.Where("id = ? AND node_id = ?", taskID, nodeID).First(&task).Error; err != nil {
+		zap.L().Error("查询任务失败", zap.String("task_id", result.TaskID), zap.Error(err))
+		return
+	}
+
+	// 记录任务日志
+	logLevel := "info"
+	if !result.Success {
+		logLevel = "error"
+	}
+	logMessage := fmt.Sprintf("任务执行%s", map[bool]string{true: "成功", false: "失败"}[result.Success])
+	if !result.Success && result.Error != "" {
+		logMessage += fmt.Sprintf(": %s", result.Error)
+	}
+
+	taskLog := models.TaskLog{
+		TaskID:  taskID,
+		Level:   logLevel,
+		Message: logMessage,
+	}
+	if err := db.DB.Create(&taskLog).Error; err != nil {
+		zap.L().Error("创建任务日志失败", zap.Error(err))
 	}
 
 	// 如果有外部回调，优先交给外部处理 (task scheduler)
@@ -868,7 +943,36 @@ func (m *Manager) handleTaskResult(nodeID uuid.UUID, payload json.RawMessage) {
 		updates["error"] = result.Error
 	}
 
-	db.DB.Model(&models.Task{}).Where("id = ? AND node_id = ?", taskID, nodeID).Updates(updates)
+	if err := db.DB.Model(&models.Task{}).Where("id = ? AND node_id = ?", taskID, nodeID).Updates(updates).Error; err != nil {
+		zap.L().Error("更新任务状态失败", zap.String("task_id", result.TaskID), zap.Error(err))
+		return
+	}
+
+	// WebSocket 推送任务状态更新
+	m.broadcastTaskStatus(taskID, task.Type, nodeID, updates["status"].(models.TaskStatus), result.Error)
+}
+
+// broadcastTaskStatus 向前端广播任务状态更新
+func (m *Manager) broadcastTaskStatus(taskID uuid.UUID, taskType models.TaskType, nodeID uuid.UUID, status models.TaskStatus, errMsg string) {
+	m.frontendMu.RLock()
+	defer m.frontendMu.RUnlock()
+
+	payload := map[string]interface{}{
+		"type":      "task_status",
+		"task_id":   taskID.String(),
+		"task_type": string(taskType),
+		"node_id":   nodeID.String(),
+		"status":    string(status),
+		"error":     errMsg,
+		"timestamp": time.Now().Unix(),
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	for _, conn := range m.frontendConns {
+		if conn != nil && conn.Conn != nil {
+			conn.Conn.WriteMessage(websocket.TextMessage, payloadBytes)
+		}
+	}
 }
 
 // SendTask 发送任务给指定 Agent (接受 TaskMessage)
@@ -879,6 +983,31 @@ func (m *Manager) SendTask(msg TaskMessage) error {
 
 	if !exists {
 		return fmt.Errorf("节点 %s 未连接", msg.NodeID)
+	}
+
+	// 记录任务开始日志
+	taskLog := models.TaskLog{
+		TaskID:  msg.TaskID,
+		Level:   "info",
+		Message: fmt.Sprintf("任务已下发到节点 %s", msg.NodeID.String()),
+	}
+	if err := db.DB.Create(&taskLog).Error; err != nil {
+		zap.L().Error("创建任务日志失败", zap.Error(err))
+	}
+
+	// 更新任务状态为 running
+	now := time.Now()
+	if err := db.DB.Model(&models.Task{}).Where("id = ?", msg.TaskID).Updates(map[string]interface{}{
+		"status":     models.TaskStatusRunning,
+		"started_at": now,
+	}).Error; err != nil {
+		zap.L().Error("更新任务状态失败", zap.String("task_id", msg.TaskID.String()), zap.Error(err))
+	} else {
+		// WebSocket 推送任务状态更新
+		var task models.Task
+		if err := db.DB.Where("id = ?", msg.TaskID).First(&task).Error; err == nil {
+			m.broadcastTaskStatus(msg.TaskID, task.Type, msg.NodeID, models.TaskStatusRunning, "")
+		}
 	}
 
 	// Agent readLoop 期望外层格式为 {type: "task", payload: <TaskMessage>}
@@ -988,10 +1117,10 @@ func (m *Manager) handleImageProgress(nodeID uuid.UUID, payload json.RawMessage)
 	}
 	m.imageMu.Unlock()
 
-	// 限制广播频率：每秒最多一次（或状态变化时立即广播）
+	// 限制广播频率：每 0.5 秒最多一次（或状态变化时立即广播）
 	shouldBroadcast := true
 	if existed && oldStatus.Stage == p.Stage && p.Stage == "downloading" {
-		if now.Sub(oldStatus.UpdatedAt) < time.Second {
+		if now.Sub(oldStatus.UpdatedAt) < 500*time.Millisecond {
 			shouldBroadcast = false
 		}
 	}
@@ -1033,59 +1162,64 @@ func (m *Manager) handleImageProgress(nodeID uuid.UUID, payload json.RawMessage)
 	}
 }
 
+// handleInstanceProgress 处理 Agent 上报的实例创建进度
+func (m *Manager) handleInstanceProgress(nodeID uuid.UUID, payload json.RawMessage) {
+	var p InstanceProgressPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		zap.L().Warn("解析实例进度失败", zap.String("node_id", nodeID.String()), zap.Error(err))
+		return
+	}
+
+	// 直接广播给前端
+	m.BroadcastInstanceProgress(nodeID, p)
+}
+
 // handleImageListSync 处理 Agent 全量镜像列表上报，执行增量同步 + 清理已删除
-func (m *Manager) handleImageListSync(nodeID uuid.UUID, aliases []string) {
+// agent 上报的是 image_key 列表 (alias|type|arch)，与 DB 中格式一致，直接精确匹配
+func (m *Manager) handleImageListSync(nodeID uuid.UUID, imageKeys []string) {
 	now := time.Now()
 	nodeStr := nodeID.String()
 
-	zap.L().Info("Agent 上报镜像列表", zap.String("node_id", nodeStr), zap.Int("count", len(aliases)))
-	for _, alias := range aliases {
-		zap.L().Info("上报镜像", zap.String("image_id", alias))
-	}
+	zap.L().Info("Agent 上报镜像列表", zap.String("node_id", nodeStr), zap.Int("count", len(imageKeys)))
 
 	// 构建上报集合
-	reported := make(map[string]struct{}, len(aliases))
-	for _, alias := range aliases {
-		reported[alias] = struct{}{}
+	reported := make(map[string]struct{}, len(imageKeys))
+	for _, key := range imageKeys {
+		reported[key] = struct{}{}
 	}
 
 	// Upsert 上报的镜像
-	for _, alias := range aliases {
+	for _, key := range imageKeys {
 		var ni models.NodeImage
-		if err := db.DB.Where("node_id = ? AND image_id = ?", nodeStr, alias).First(&ni).Error; err != nil {
-			db.DB.Create(&models.NodeImage{
-				NodeID:  nodeStr,
-				ImageID: alias,
-				Status:  "downloaded",
-			})
+		if err := db.DB.Where("node_id = ? AND image_id = ?", nodeStr, key).First(&ni).Error; err != nil {
+			db.DB.Create(&models.NodeImage{NodeID: nodeStr, ImageID: key, Status: "downloaded"})
 		} else if ni.Status != "downloaded" {
 			db.DB.Model(&ni).Updates(map[string]interface{}{"status": "downloaded", "updated_at": now})
-		} else {
-			db.DB.Model(&ni).Update("updated_at", now)
 		}
 	}
 
-	// 清理节点上已不存在的镜像记录
+	// 清理 DB 中该节点已不存在的镜像
 	var existing []models.NodeImage
 	db.DB.Where("node_id = ?", nodeStr).Find(&existing)
 	for _, ni := range existing {
 		if _, ok := reported[ni.ImageID]; !ok {
-			db.DB.Delete(&ni)
+			zap.L().Info("删除节点镜像记录", zap.String("node_id", nodeStr), zap.String("image_id", ni.ImageID))
+			db.DB.Where("node_id = ? AND image_id = ?", nodeStr, ni.ImageID).Delete(&models.NodeImage{})
+			m.BroadcastImageProgress(nodeID, ImageProgressPayload{
+				ImageID: ni.ImageID, Stage: "deleted", Progress: 0,
+			})
 		}
 	}
 
-	// 同步更新内存缓存：全量替换该节点的镜像状态
+	// 同步更新内存缓存
 	m.imageMu.Lock()
-	nodeMap := make(map[string]*NodeImageStatus, len(aliases))
-	for _, alias := range aliases {
-		nodeMap[alias] = &NodeImageStatus{
-			ImageID:   alias,
-			Stage:     "done",
-			Progress:  100,
-			UpdatedAt: now,
+	nodeMap := make(map[string]*NodeImageStatus, len(imageKeys))
+	for _, key := range imageKeys {
+		nodeMap[key] = &NodeImageStatus{
+			ImageID: key, Stage: "done", Progress: 100, UpdatedAt: now,
 		}
 	}
-	// 保留正在下载中的条目（不覆盖）
+	// 保留正在下载中的条目
 	if oldMap, ok := m.imageProgress[nodeID]; ok {
 		for k, v := range oldMap {
 			if v.Stage == "downloading" {
@@ -1098,8 +1232,15 @@ func (m *Manager) handleImageListSync(nodeID uuid.UUID, aliases []string) {
 
 	zap.L().Info("节点镜像列表已同步",
 		zap.String("node_id", nodeStr),
-		zap.Int("reported", len(aliases)),
-		zap.Int("cleaned", len(existing)-len(aliases)))
+		zap.Int("reported", len(imageKeys)),
+		zap.Int("cleaned", len(existing)-len(imageKeys)))
+
+	// 广播镜像列表更新给前端
+	m.BroadcastImageProgress(nodeID, ImageProgressPayload{
+		ImageID:  "",
+		Stage:    "sync",
+		Progress: 100,
+	})
 }
 
 // GetImageProgress 获取指定节点的所有镜像下载状态

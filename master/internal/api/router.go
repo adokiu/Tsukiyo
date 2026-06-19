@@ -31,6 +31,8 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	r.GET("/ws/agent", agentMgr.HandleWebSocket)
 	// 前端 WebSocket 推送端点（镜像进度等实时数据）
 	r.GET("/ws/images", agentMgr.HandleFrontendWebSocket)
+	// 前端 WebSocket 推送端点（任务状态等实时数据）
+	r.GET("/ws/tasks", agentMgr.HandleFrontendWebSocket)
 
 	// 设置 Agent 管理器引用
 	handlers.SetAgentManager(agentMgr)
@@ -99,10 +101,11 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 
 		// 镜像管理（预制模板，不支持手动创建）
 		authGroup.GET("/images", handlers.ListImages)
-		authGroup.POST("/images/:id/toggle", handlers.ToggleImage)
-		authGroup.POST("/images/:id/download", handlers.DownloadImage)
-		authGroup.GET("/images/:id/progress", handlers.GetImageProgress)
-		authGroup.POST("/images/:id/cancel", handlers.CancelImageDownload)
+		authGroup.POST("/images/remote/list", handlers.ListRemoteImages)
+		authGroup.POST("/images/download", handlers.DownloadImage)
+		authGroup.GET("/images/progress", handlers.GetImageProgress)
+		authGroup.POST("/images/cancel", handlers.CancelImageDownload)
+		authGroup.DELETE("/images", handlers.DeleteImage)
 
 		// VPC 网络管理
 		authGroup.GET("/network/vpcs", handlers.ListVPCs)
@@ -139,12 +142,17 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		// 审计日志
 		authGroup.GET("/audit-logs", handlers.ListAuditLogs)
 
+		// 任务队列
+		authGroup.GET("/tasks", handlers.ListTasks)
+		authGroup.GET("/tasks/:id", handlers.GetTask)
+		authGroup.GET("/tasks/:id/logs", handlers.GetTaskLogs)
+
 		// 仪表盘
 		authGroup.GET("/dashboard", handlers.GetDashboard)
 
-		// 任务
-		authGroup.GET("/tasks", handlers.ListTasks)
-		authGroup.GET("/tasks/:id", handlers.GetTask)
+		// 站点配置
+		authGroup.GET("/settings/site", handlers.GetSiteConfig)
+		authGroup.PUT("/settings/site", handlers.UpdateSiteConfig)
 
 		// 控制台
 		authGroup.GET("/console/ssh", console.HandleWebSSH(agentMgr))

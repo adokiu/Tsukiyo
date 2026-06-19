@@ -1,5 +1,5 @@
-import { useEffect, useState, useRef } from 'react'
-import { HardDrive, Download, Square, CheckCircle, AlertCircle, Server } from 'lucide-react'
+import { useEffect, useState, useRef, useMemo } from 'react'
+import { HardDrive, Download, Square, CheckCircle, AlertCircle, Server, Trash2 } from 'lucide-react'
 import apiClient from '@/api/client'
 import { DataTable, type Column } from '@/components/DataTable/DataTable'
 import { Button } from '@/components/Button/Button'
@@ -15,13 +15,13 @@ interface Node {
 }
 
 interface Image {
-  id: string
+  id: string        // image_key: alias|type|arch
+  alias: string     // debian/forky/cloud
   name: string
-  type: string
+  type: string      // container / virtual-machine
   distro: string
   release: string
-  arch: string
-  enabled: boolean
+  arch: string      // x86_64 / aarch64
   stage?: string
   progress?: number
   downloaded_bytes?: number
@@ -43,28 +43,41 @@ function formatBytes(bytes: number): string {
   return `${bytes} B`
 }
 
+function formatArch(arch: string): string {
+  switch (arch) {
+    case 'x86_64': return 'amd64'
+    case 'aarch64': return 'arm64'
+    default: return arch
+  }
+}
+
+function formatType(type: string): string {
+  return type === 'container' ? '容器' : '虚拟机'
+}
+
 export default function ImagesPage() {
   const toast = useToastStore()
   const [images, setImages] = useState<Image[]>([])
   const [nodes, setNodes] = useState<Node[]>([])
   const [selectedNode, setSelectedNode] = useState('')
   const [loading, setLoading] = useState(true)
+  const [filterType, setFilterType] = useState<string>('all')
+  const [filterArch, setFilterArch] = useState<string>('all')
+  const [filterDistro, setFilterDistro] = useState<string>('all')
   const wsRef = useRef<WebSocket | null>(null)
 
-  // 局部更新单个镜像字段，不触发整页刷新
-  const patchImage = (imageId: string, patch: Partial<Image>) => {
+  // 局部更新单个镜像，按 image_key (id) 匹配
+  const patchImage = (imageKey: string, patch: Partial<Image>) => {
     setImages((prev) =>
-      prev.map((img) => (img.id === imageId ? { ...img, ...patch } : img))
+      prev.map((img) => (img.id === imageKey ? { ...img, ...patch } : img))
     )
   }
 
-  // 获取节点列表
   const fetchNodes = async () => {
     try {
       const res = await apiClient.get('/nodes')
       const list = res.data.data || []
       setNodes(list)
-      // 默认选择第一个在线且已初始化的节点
       const current = selectedNode
       if (!current) {
         const online = list.find((n: Node) => n.is_online && n.initialized)
@@ -79,39 +92,36 @@ export default function ImagesPage() {
     }
   }
 
-  // 获取镜像列表（按节点）
-  const fetchImages = async (nodeId?: string) => {
+  const fetchImages = async (nodeId?: string, fType?: string, fArch?: string, fDistro?: string) => {
     setLoading(true)
     try {
       const id = nodeId ?? selectedNode
-      const params = id ? { params: { node_id: id } } : undefined
-      const res = await apiClient.get('/images', params)
-      const list = res.data.data || []
-      setImages(list)
+      if (!id) { setImages([]); return }
+      const p: Record<string, string> = { node_id: id }
+      const t = fType ?? filterType
+      const a = fArch ?? filterArch
+      const d = fDistro ?? filterDistro
+      if (t && t !== 'all') p.type = t
+      if (a && a !== 'all') p.arch = a
+      if (d && d !== 'all') p.distro = d
+      const res = await apiClient.get('/images', { params: p })
+      setImages(res.data.data || [])
     } finally {
       setLoading(false)
     }
   }
 
-  // WebSocket 连接：接收实时镜像进度推送
   const connectWebSocket = () => {
-    if (wsRef.current) {
-      wsRef.current.close()
-    }
+    if (wsRef.current) wsRef.current.close()
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${proto}//${window.location.host}/ws/images`
-    const ws = new WebSocket(wsUrl)
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws/images`)
     wsRef.current = ws
 
-    ws.onopen = () => {
-      console.log('镜像进度 WebSocket 已连接')
-    }
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
         if (msg.type === 'image_progress') {
           const p = msg.payload
-          // 只更新对应镜像，不触发整页刷新
           patchImage(p.image_id, {
             stage: p.stage,
             progress: p.progress,
@@ -121,17 +131,11 @@ export default function ImagesPage() {
             download_error: p.error,
           })
         }
-      } catch {
-        // ignore
-      }
+      } catch { /* ignore */ }
     }
     ws.onclose = () => {
-      console.log('镜像进度 WebSocket 已断开，3秒后重连')
       wsRef.current = null
       setTimeout(connectWebSocket, 3000)
-    }
-    ws.onerror = (err) => {
-      console.error('镜像进度 WebSocket 错误', err)
     }
   }
 
@@ -142,42 +146,35 @@ export default function ImagesPage() {
     }
     init()
     connectWebSocket()
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close()
-        wsRef.current = null
-      }
-    }
+    return () => { wsRef.current?.close(); wsRef.current = null }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    if (selectedNode) {
-      fetchImages(selectedNode)
-    }
+    if (selectedNode) fetchImages(selectedNode)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNode])
 
-  const handleToggle = async (id: string) => {
-    await apiClient.post(`/images/${id}/toggle`)
-    toast.success('状态已更新')
-    fetchImages()
-  }
+  useEffect(() => {
+    if (selectedNode) fetchImages(selectedNode, filterType, filterArch, filterDistro)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterType, filterArch, filterDistro])
+
+  // 从已加载数据中提取可选发行版/架构（用于下拉框选项）
+  const distros = useMemo(() => [...new Set(images.map(i => i.distro))].filter(Boolean).sort(), [images])
+  const archs = useMemo(() => [...new Set(images.map(i => i.arch))].filter(Boolean).sort(), [images])
 
   const handleDownload = async (image: Image) => {
     const nodeId = selectedNode
-    if (!nodeId) {
-      toast.error('请先选择节点')
-      return
-    }
-    // 立即本地显示下载中状态，不等待后端响应
+    if (!nodeId) { toast.error('请先选择节点'); return }
     patchImage(image.id, { stage: 'downloading', progress: 0 })
     try {
-      await apiClient.post(`/images/${image.id}/download`, { node_id: nodeId })
+      await apiClient.post('/images/download', {
+        node_id: nodeId,
+        image_key: image.id,
+      })
       toast.success('下载任务已下发')
-      fetchImages(nodeId)
     } catch (err: any) {
-      // 失败后恢复状态并提示
       patchImage(image.id, { stage: undefined, progress: undefined })
       toast.error(err.response?.data?.error || '下发失败')
     }
@@ -187,27 +184,59 @@ export default function ImagesPage() {
     const nodeId = selectedNode
     if (!nodeId) return
     try {
-      await apiClient.post(`/images/${image.id}/cancel`, { node_id: nodeId })
+      await apiClient.post('/images/cancel', { node_id: nodeId, image_key: image.id })
       toast.success('取消任务已下发')
     } catch (err: any) {
       toast.error(err.response?.data?.error || '取消失败')
     }
   }
 
+  const handleDelete = async (image: Image) => {
+    const nodeId = selectedNode
+    if (!nodeId) { toast.error('请先选择节点'); return }
+    if (!confirm(`确认删除镜像 ${image.alias} (${formatType(image.type)}, ${formatArch(image.arch)})？`)) return
+    try {
+      await apiClient.delete('/images', { data: { node_id: nodeId, image_key: image.id } })
+      toast.success('删除任务已下发')
+      fetchImages(nodeId)
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || '删除失败')
+    }
+  }
+
   const columns: Column<Image>[] = [
-    { key: 'name', title: '镜像名称' },
+    {
+      key: 'alias',
+      title: '镜像别名',
+      render: (row: Image) => (
+        <div>
+          <div className="font-medium text-gray-900 text-sm">{row.alias}</div>
+          <div className="text-xs text-gray-400 truncate max-w-[300px]">{row.name}</div>
+        </div>
+      ),
+    },
     {
       key: 'type',
       title: '类型',
+      width: 80,
       render: (row: Image) => (
-        <span className="text-xs px-2 py-0.5 rounded bg-gray-100 text-gray-600">
-          {row.type === 'container' ? '容器' : '虚拟机'}
+        <span className={`text-xs px-2 py-0.5 rounded ${row.type === 'container' ? 'bg-blue-50 text-blue-600' : 'bg-purple-50 text-purple-600'}`}>
+          {formatType(row.type)}
         </span>
       ),
     },
-    { key: 'distro', title: '发行版' },
-    { key: 'release', title: '版本' },
-    { key: 'arch', title: '架构' },
+    { key: 'distro', title: '发行版', width: 100 },
+    { key: 'release', title: '版本', width: 100 },
+    {
+      key: 'arch',
+      title: '架构',
+      width: 80,
+      render: (row: Image) => (
+        <span className="text-xs px-2 py-0.5 rounded bg-gray-100 text-gray-600">
+          {formatArch(row.arch)}
+        </span>
+      ),
+    },
     {
       key: 'download_status',
       title: '节点状态',
@@ -216,58 +245,37 @@ export default function ImagesPage() {
         if (!selectedNode) return <span className="text-gray-400 text-sm">选择节点查看</span>
         if (row.stage === 'downloading') {
           const totalBytes = row.total_bytes || 0
-          const hasRealProgress = totalBytes > 0
+          const hasReal = totalBytes > 0
           return (
             <div className="w-full space-y-1">
               <div className="flex justify-between text-xs text-gray-600">
-                <span>{hasRealProgress ? `下载中 ${row.progress || 0}%` : '下载中...'}</span>
+                <span>{hasReal ? `下载中 ${row.progress || 0}%` : '下载中...'}</span>
                 {row.speed_bps ? <span>{formatSpeed(row.speed_bps)}</span> : null}
               </div>
-              {hasRealProgress ? (
+              {hasReal ? (
                 <div className="w-full bg-gray-200 rounded-full h-1.5">
-                  <div
-                    className="bg-black h-1.5 rounded-full transition-all"
-                    style={{ width: `${row.progress || 0}%` }}
-                  />
+                  <div className="bg-black h-1.5 rounded-full transition-all" style={{ width: `${row.progress || 0}%` }} />
                 </div>
               ) : (
                 <div className="w-full bg-gray-200 rounded-full h-1.5 animate-pulse" />
               )}
-              {hasRealProgress ? (
-                <div className="text-xs text-gray-500">
-                  {formatBytes(row.downloaded_bytes || 0)} / {formatBytes(totalBytes)}
-                </div>
-              ) : null}
+              {hasReal ? <div className="text-xs text-gray-500">{formatBytes(row.downloaded_bytes || 0)} / {formatBytes(totalBytes)}</div> : null}
             </div>
           )
         }
         if (row.stage === 'done') {
-          return (
-            <span className="flex items-center gap-1 text-sm text-green-600">
-              <CheckCircle size={14} />
-              已下载
-            </span>
-          )
+          return <span className="flex items-center gap-1 text-sm text-green-600"><CheckCircle size={14} />已下载</span>
         }
         if (row.stage === 'error') {
-          const errorDetail = row.download_error || '未知错误'
+          const err = row.download_error || '未知错误'
           return (
             <div className="flex flex-col gap-0.5">
-              <span className="flex items-center gap-1 text-sm text-red-600">
-                <AlertCircle size={14} />
-                下载失败
-              </span>
-              <span className="text-xs text-red-500 max-w-[200px] truncate" title={errorDetail}>
-                {errorDetail}
-              </span>
+              <span className="flex items-center gap-1 text-sm text-red-600"><AlertCircle size={14} />下载失败</span>
+              <span className="text-xs text-red-500 max-w-[200px] truncate" title={err}>{err}</span>
             </div>
           )
         }
-        return (
-          <span className="text-sm text-gray-400">
-            未下载
-          </span>
-        )
+        return <span className="text-sm text-gray-400">未下载</span>
       },
     },
     {
@@ -276,40 +284,14 @@ export default function ImagesPage() {
       width: 120,
       render: (row: Image) => {
         if (!selectedNode) return null
-        const isDownloading = row.stage === 'downloading'
-        if (isDownloading) {
-          return (
-            <Button size="sm" variant="ghost" onClick={() => handleCancel(row)}>
-              <Square size={14} className="mr-1" />
-              取消
-            </Button>
-          )
+        if (row.stage === 'downloading') {
+          return <Button size="sm" variant="ghost" onClick={() => handleCancel(row)}><Square size={14} className="mr-1" />取消</Button>
         }
         if (row.stage === 'done') {
-          return (
-            <span className="text-xs text-gray-400">已完成</span>
-          )
+          return <Button size="sm" variant="ghost" onClick={() => handleDelete(row)}><Trash2 size={14} className="mr-1" />删除</Button>
         }
-        return (
-          <Button size="sm" variant="ghost" onClick={() => handleDownload(row)}>
-            <Download size={14} className="mr-1" />
-            下载
-          </Button>
-        )
+        return <Button size="sm" variant="ghost" onClick={() => handleDownload(row)}><Download size={14} className="mr-1" />下载</Button>
       },
-    },
-    {
-      key: 'enabled',
-      title: '启用',
-      width: 80,
-      render: (row: Image) => (
-        <button
-          className={`text-xs px-2 py-1 rounded ${row.enabled ? 'bg-black text-white' : 'bg-gray-100 text-gray-500'}`}
-          onClick={() => handleToggle(row.id)}
-        >
-          {row.enabled ? '启用' : '禁用'}
-        </button>
-      ),
     },
   ]
 
@@ -338,9 +320,34 @@ export default function ImagesPage() {
             </option>
           ))}
         </select>
-        {!selectedNode && (
-          <span className="text-xs text-gray-400">选择节点后可查看各节点已下载的镜像并执行下载</span>
-        )}
+        {!selectedNode && <span className="text-xs text-gray-400">选择节点后可查看各节点已下载的镜像并执行下载</span>}
+      </div>
+
+      {/* 筛选栏 */}
+      <div className="flex items-center gap-4 text-sm">
+        <div className="flex items-center gap-2">
+          <label className="text-gray-500">类型:</label>
+          <select className="border border-gray-200 rounded px-2 py-1 text-sm" value={filterType} onChange={e => setFilterType(e.target.value)}>
+            <option value="all">全部</option>
+            <option value="container">容器</option>
+            <option value="virtual-machine">虚拟机</option>
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-gray-500">架构:</label>
+          <select className="border border-gray-200 rounded px-2 py-1 text-sm" value={filterArch} onChange={e => setFilterArch(e.target.value)}>
+            <option value="all">全部</option>
+            {archs.map(a => <option key={a} value={a}>{formatArch(a)}</option>)}
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-gray-500">发行版:</label>
+          <select className="border border-gray-200 rounded px-2 py-1 text-sm" value={filterDistro} onChange={e => setFilterDistro(e.target.value)}>
+            <option value="all">全部</option>
+            {distros.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </div>
+        <span className="text-gray-400 text-xs ml-2">共 {images.length} 个镜像</span>
       </div>
 
       <DataTable columns={columns} data={images} rowKey={(r) => r.id} loading={loading} />

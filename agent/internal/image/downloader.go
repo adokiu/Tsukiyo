@@ -55,6 +55,7 @@ type DownloadTask struct {
 	cancelFunc context.CancelFunc
 	partStates []*PartState
 	progressCb ProgressCallback
+	lastReport time.Time
 }
 
 // PartState 分片状态
@@ -225,12 +226,22 @@ func (t *DownloadTask) Cancel() error {
 
 // fetchFileInfo 获取文件信息
 func (t *DownloadTask) fetchFileInfo(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", t.Remote, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", t.Remote, nil)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// 允许最多 10 次重定向
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("获取文件信息失败: %w", err)
@@ -238,7 +249,7 @@ func (t *DownloadTask) fetchFileInfo(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HEAD 请求失败: %d", resp.StatusCode)
+		return fmt.Errorf("获取文件信息失败: %d", resp.StatusCode)
 	}
 
 	// 获取文件大小
@@ -249,14 +260,9 @@ func (t *DownloadTask) fetchFileInfo(ctx context.Context) error {
 		}
 	}
 
-	// 检查是否支持 Range
-	if resp.Header.Get("Accept-Ranges") == "bytes" {
-		// 支持断点续传
-	} else {
-		zap.L().Warn("服务器不支持 Range 请求，将使用单线程下载",
-			zap.String("url", t.Remote))
-		t.Concurrency = 1
-	}
+	// 暂时禁用分片下载，改为单线程下载避免文件损坏
+	zap.L().Info("使用单线程下载", zap.String("url", t.Remote))
+	t.Concurrency = 1
 
 	// 获取 ETag
 	if etag := resp.Header.Get("ETag"); etag != "" {
@@ -279,48 +285,17 @@ func (t *DownloadTask) fetchFileInfo(ctx context.Context) error {
 
 // createParts 创建分片
 func (t *DownloadTask) createParts() {
-	if t.TotalSize <= 0 {
-		// 未知大小，使用单线程
-		t.Concurrency = 1
-		t.partStates = []*PartState{
-			{Index: 0, Start: 0, End: -1, Downloaded: 0, Completed: false},
-		}
-		return
-	}
-
-	partSize := int64(DefaultPartSize)
-	if t.TotalSize < partSize {
-		partSize = t.TotalSize
-	}
-
-	partCount := int((t.TotalSize + partSize - 1) / partSize)
-	if partCount > t.Concurrency {
-		// 确保每个线程至少有一个分片
-	} else if partCount < t.Concurrency {
-		t.Concurrency = partCount
-	}
-
-	t.partStates = make([]*PartState, partCount)
-	for i := 0; i < partCount; i++ {
-		start := int64(i) * partSize
-		end := start + partSize - 1
-		if end >= t.TotalSize {
-			end = t.TotalSize - 1
-		}
-		t.partStates[i] = &PartState{
-			Index:      i,
-			Start:      start,
-			End:        end,
-			Downloaded: 0,
-			Completed:  false,
-		}
+	// 强制使用单线程下载，只创建一个分片
+	t.Concurrency = 1
+	t.partStates = []*PartState{
+		{Index: 0, Start: 0, End: t.TotalSize - 1, Downloaded: 0, Completed: false},
 	}
 
 	zap.L().Info("创建分片",
 		zap.String("task_id", t.ID),
-		zap.Int("parts", partCount),
+		zap.Int("parts", 1),
 		zap.Int64("size", t.TotalSize),
-		zap.Int("concurrency", t.Concurrency))
+		zap.Int("concurrency", 1))
 }
 
 // downloadParts 并发下载分片
@@ -422,6 +397,13 @@ func (t *DownloadTask) downloadPartOnce(ctx context.Context, file *os.File, part
 
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// 允许最多 10 次重定向
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		},
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,
@@ -435,13 +417,15 @@ func (t *DownloadTask) downloadPartOnce(ctx context.Context, file *os.File, part
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	// 简单单线程下载，不使用 Range
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP 错误: %d", resp.StatusCode)
 	}
 
-	// 写入文件
-	buffer := make([]byte, 64*1024) // 64KB buffer
+	// 直接写入文件，从 0 开始
+	buffer := make([]byte, 32*1024)
 	written := int64(0)
+	lastProgressTime := time.Now()
 
 	for {
 		select {
@@ -452,17 +436,20 @@ func (t *DownloadTask) downloadPartOnce(ctx context.Context, file *os.File, part
 
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
-			// 写入文件指定位置
-			offset := part.Start + part.Downloaded + written
-			if _, werr := file.WriteAt(buffer[:n], offset); werr != nil {
+			if _, werr := file.WriteAt(buffer[:n], written); werr != nil {
 				return fmt.Errorf("写入文件失败: %w", werr)
 			}
 			written += int64(n)
 
-			// 更新进度
-			atomic.AddInt64(&t.Downloaded, int64(n))
-			part.Downloaded += int64(n)
-			t.reportProgress()
+			t.mu.Lock()
+			t.Downloaded = written
+			t.mu.Unlock()
+
+			// 每 0.5 秒推送一次进度
+			if time.Since(lastProgressTime) >= 500*time.Millisecond {
+				t.reportProgress()
+				lastProgressTime = time.Now()
+			}
 		}
 
 		if err == io.EOF {
@@ -473,16 +460,8 @@ func (t *DownloadTask) downloadPartOnce(ctx context.Context, file *os.File, part
 		}
 	}
 
-	// 检查是否下载完整
-	if t.TotalSize > 0 {
-		expected := part.End - part.Start + 1
-		if part.Downloaded != expected {
-			return fmt.Errorf("分片大小不匹配: 期望 %d, 实际 %d", expected, part.Downloaded)
-		}
-	}
-
 	part.Completed = true
-	t.saveState()
+	part.Downloaded = written
 	return nil
 }
 
@@ -519,7 +498,7 @@ func (t *DownloadTask) verifyChecksum() error {
 	return nil
 }
 
-// reportProgress 报告进度
+// reportProgress 报告进度 (每 0.5 秒最多一次)
 func (t *DownloadTask) reportProgress() {
 	t.mu.RLock()
 	cb := t.progressCb
@@ -645,6 +624,13 @@ func NewDownloadManager(workDir string) *DownloadManager {
 		workDir: workDir,
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// 允许最多 10 次重定向
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				return nil
+			},
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 20,
@@ -655,7 +641,7 @@ func NewDownloadManager(workDir string) *DownloadManager {
 }
 
 // DownloadImage 下载镜像 (支持多线程、断点续传、重试)
-func (dm *DownloadManager) DownloadImage(ctx context.Context, alias, remote string) (*DownloadTask, error) {
+func (dm *DownloadManager) DownloadImage(ctx context.Context, alias, remote string, progressCb ...ProgressCallback) (*DownloadTask, error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
@@ -666,12 +652,13 @@ func (dm *DownloadManager) DownloadImage(ctx context.Context, alias, remote stri
 			return task, fmt.Errorf("镜像 %s 已在下载中", alias)
 		}
 		if status == StatusCompleted {
+			// 已下载完成，返回任务对象让调用方继续执行导入逻辑
 			return task, nil
 		}
 	}
 
-	// 根据 URL 推断文件扩展名，VM 镜像可能是 .img/.qcow2，容器镜像默认 .tar.xz
-	ext := ".tar.xz"
+	// 根据 URL 推断文件扩展名，VM 镜像可能是 .img/.qcow2，容器镜像默认 .tar.gz
+	ext := ".tar.gz"
 	if remote != "" {
 		base := filepath.Base(remote)
 		if idx := strings.LastIndex(base, "."); idx != -1 && idx < len(base)-1 {
@@ -684,12 +671,16 @@ func (dm *DownloadManager) DownloadImage(ctx context.Context, alias, remote stri
 		}
 	}
 	if remote == "" {
-		remote = fmt.Sprintf("https://images.linuxcontainers.org/images/%s/amd64/default/", alias)
+		// 从 GitHub Release 下载镜像
+		remote = fmt.Sprintf("https://github.com/adokiu/Tsukiyo-images/releases/download/images/%s_amd64.tar.gz", alias)
 	}
 
 	targetPath := filepath.Join(dm.workDir, alias+ext)
 	task := NewDownloadTask(alias, remote, targetPath)
 	task.Remote = remote
+	if len(progressCb) > 0 && progressCb[0] != nil {
+		task.progressCb = progressCb[0]
+	}
 	dm.tasks[alias] = task
 
 	go func() {

@@ -67,7 +67,6 @@ type NetworkInfo struct {
 type EnvInfo struct {
 	SystemdVersion   string `json:"systemd_version"`
 	LXCVersion       string `json:"lxc_version"`
-	IPTablesVersion  string `json:"iptables_version"`
 	IPRoute2Version  string `json:"iproute2_version"`
 	ConntrackVersion string `json:"conntrack_version"`
 	LibvirtVersion   string `json:"libvirt_version"`
@@ -366,11 +365,6 @@ func probeEnvironment() EnvInfo {
 				break
 			}
 		}
-	}
-
-	// iptables
-	if out, err := exec.Command("iptables", "--version").Output(); err == nil {
-		e.IPTablesVersion = strings.TrimSpace(string(out))
 	}
 
 	// iproute2

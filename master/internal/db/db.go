@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -11,7 +10,6 @@ import (
 	"gorm.io/gorm/logger"
 
 	"tsukiyo/master/internal/config"
-	"tsukiyo/master/internal/image"
 	"tsukiyo/master/internal/models"
 )
 
@@ -88,10 +86,10 @@ func AutoMigrate() error {
 		&models.PublicIPPool{},
 		&models.PortMapping{},
 		&models.FirewallRule{},
-		&models.ImageTemplate{},
 		&models.NodeImage{},
 		&models.AuditLog{},
 		&models.Task{},
+		&models.TaskLog{},
 		&models.Snapshot{},
 		&models.DataDisk{},
 		&models.NATConfig{},
@@ -122,9 +120,9 @@ func AutoMigrate() error {
 		return fmt.Errorf("初始化用户组失败: %w", err)
 	}
 
-	// 初始化预制镜像模板
-	if err := seedImageTemplates(); err != nil {
-		return fmt.Errorf("初始化镜像模板失败: %w", err)
+	// 初始化站点配置
+	if err := initDefaultSiteConfig(); err != nil {
+		return fmt.Errorf("初始化站点配置失败: %w", err)
 	}
 
 	zap.L().Info("数据库迁移完成")
@@ -316,44 +314,33 @@ func initDefaultGroups() error {
 	return nil
 }
 
-// seedImageTemplates 初始化预制镜像模板（幂等：新增不存在的，更新已有的名称/URL 等，保留用户设置的 enabled 状态）
-func seedImageTemplates() error {
-	templates := image.GetAllTemplates()
-	for _, t := range templates {
-		var existing models.ImageTemplate
-		if err := DB.Where("id = ?", t.ID).First(&existing).Error; err != nil {
-			// 不存在，插入
-			if err := DB.Create(&t).Error; err != nil {
-				return fmt.Errorf("插入镜像模板 %s 失败: %w", t.ID, err)
+// initDefaultSiteConfig 初始化默认站点配置
+func initDefaultSiteConfig() error {
+	var count int64
+	if err := DB.Model(&models.SiteConfig{}).Count(&count).Error; err != nil {
+		return err
+	}
+
+	if count == 0 {
+		defaultConfig := models.SiteConfig{
+			SiteName:       "Tsukiyo",
+			IncusRemoteURL: "images:",
+		}
+		if err := DB.Create(&defaultConfig).Error; err != nil {
+			return err
+		}
+	} else {
+		// 更新现有记录的 IncusRemoteURL（如果为空）
+		var site models.SiteConfig
+		if err := DB.First(&site).Error; err != nil {
+			return err
+		}
+		if site.IncusRemoteURL == "" {
+			site.IncusRemoteURL = "images:"
+			if err := DB.Save(&site).Error; err != nil {
+				return err
 			}
-			continue
 		}
-		// 已存在，更新元数据（保留用户的 enabled 设置）
-		updates := map[string]interface{}{
-			"name":        t.Name,
-			"type":        t.Type,
-			"distro":      t.Distro,
-			"release":     t.Release,
-			"arch":        t.Arch,
-			"url":         t.URL,
-			"description": t.Description,
-			"desktop":     t.Desktop,
-		}
-		// 自动从 URL 推导容器镜像的 Incus 别名
-		if t.Alias != "" {
-			updates["alias"] = t.Alias
-		} else if strings.HasPrefix(t.URL, "images:") {
-			updates["alias"] = strings.TrimPrefix(t.URL, "images:")
-		}
-		DB.Model(&existing).Updates(updates)
 	}
-
-	// 删除代码中已移除的旧模板
-	validIDs := make([]string, 0, len(templates))
-	for _, t := range templates {
-		validIDs = append(validIDs, t.ID)
-	}
-	DB.Where("id NOT IN ?", validIDs).Delete(&models.ImageTemplate{})
-
 	return nil
 }

@@ -6,6 +6,7 @@ import {
   Server,
   Boxes,
   HardDrive,
+  List,
   Network,
   Shield,
   Users,
@@ -16,6 +17,7 @@ import {
   Monitor,
   ChevronLeft,
   ChevronRight,
+  Settings,
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
@@ -32,6 +34,7 @@ const navGroups = [
       { path: '/admin/nodes', label: 'nav.nodes', icon: Server },
       { path: '/admin/instances', label: 'nav.instances', icon: Boxes },
       { path: '/admin/images', label: 'nav.images', icon: HardDrive },
+      { path: '/admin/tasks', label: 'nav.tasks', icon: List },
     ],
   },
   {
@@ -44,6 +47,7 @@ const navGroups = [
     items: [
       { path: '/admin/users', label: 'nav.users', icon: Users },
       { path: '/admin/audit-logs', label: 'nav.auditLogs', icon: ClipboardList },
+      { path: '/admin/settings', label: 'nav.settings', icon: Settings },
     ],
   },
 ]

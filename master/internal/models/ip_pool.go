@@ -138,7 +138,8 @@ func incrementIP(ip net.IP) {
 type IPPoolEntry struct {
 	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
 	PoolType  string    `gorm:"type:varchar(16);not null" json:"pool_type"` // vpc_internal / public_v4 / public_v6
-	OwnerID   uuid.UUID `gorm:"type:uuid;index" json:"owner_id"`            // VPC ID 或 Node ID
+	OwnerID   uuid.UUID `gorm:"type:uuid;index" json:"owner_id"`            // VPC ID
+	NodeID    uuid.UUID `gorm:"type:uuid;index" json:"node_id"`             // 节点 ID，用于隔离不同节点的 IP 分配
 	Address   string    `gorm:"type:inet;not null;index" json:"address"`
 	Gateway   string    `gorm:"type:varchar(32)" json:"gateway,omitempty"`
 	PrefixLen int       `gorm:"type:int;not null" json:"prefix_len"`

@@ -209,6 +209,24 @@ func main() {
 				return nil, err
 			}
 			return json.Marshal(images)
+		case "list_remote_images":
+			var req struct {
+				Remote string `json:"remote"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析请求参数失败: %w", err)
+			}
+			if req.Remote == "" {
+				req.Remote = "images:"
+			}
+			images, err := ic.ListRemoteImages(req.Remote)
+			if err != nil {
+				return nil, fmt.Errorf("获取远程镜像列表失败: %w", err)
+			}
+			return json.Marshal(map[string]interface{}{
+				"images": images,
+				"total":  len(images),
+			})
 		default:
 			return nil, fmt.Errorf("未知请求类型: %s", reqType)
 		}
@@ -234,6 +252,13 @@ func main() {
 	go func() {
 		time.Sleep(3 * time.Second)
 		syncLocalImages(ic, wsClient)
+	}()
+
+	// ========== 确保所有 bridge 网络启用 NAT ==========
+	go func() {
+		time.Sleep(2 * time.Second)
+		r := reconcile.NewReconciler(ic)
+		r.EnsureAllBridgeNAT()
 	}()
 
 	// ========== 健康检查 HTTP ==========

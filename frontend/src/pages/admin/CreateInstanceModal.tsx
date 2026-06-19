@@ -5,7 +5,7 @@ import { useToastStore } from '@/stores/toast'
 
 interface Node { id: string; name: string; status: string }
 interface StoragePool { name: string; driver: string; size: number; used: number }
-interface ImageTemplate { id: string; name: string; type: string; distro: string; release: string; arch: string; enabled: boolean; downloaded: boolean }
+interface ImageTemplate { id: string; alias: string; name: string; type: string; distro: string; release: string; arch: string; downloaded: boolean; stage?: string }
 interface User { id: number; username: string }
 interface VPC { id: string; name: string; node_id: string; ipv4_cidr: string; default_gateway_v4: string; bridge_name: string }
 
@@ -72,10 +72,18 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
       setTemplates([])
       return
     }
-    apiClient.get('/images', { params: { node_id: nodeId } }).then((r) => {
+    // type: container -> container, vm -> vm (后端兼容)
+    const imageType = type === 'vm' ? 'vm' : 'container'
+    const params = { node_id: nodeId, type: imageType, downloaded_only: 'true' }
+    console.log('[CreateInstanceModal] 请求镜像列表', params)
+    apiClient.get('/images', { params }).then((r) => {
+      console.log('[CreateInstanceModal] 镜像列表返回', r.data)
       setTemplates(r.data.data || [])
-    }).catch(() => setTemplates([]))
-  }, [open, nodeId])
+    }).catch((err) => {
+      console.error('[CreateInstanceModal] 镜像列表请求失败', err)
+      setTemplates([])
+    })
+  }, [open, nodeId, type])
 
   useEffect(() => {
     if (!nodeId) { setStorages([]); setVpcs([]); setVpcId(''); return }
@@ -122,59 +130,8 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
     setDataDisks([])
   }
 
-  const filteredTemplates = templates.filter((t) => {
-    if (t.type !== type) return false
-    if (!t.enabled) return false
-    if (!t.downloaded) return false
-    return true
-  })
-
-  // waitForImageDownloadViaWS 通过 WebSocket 实时等待镜像下载完成
-  const waitForImageDownloadViaWS = (imageId: string, _nodeId: string, maxWaitMs: number = 600000): Promise<boolean> => {
-    return new Promise((resolve) => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${proto}//${window.location.host}/ws/images`
-      const ws = new WebSocket(wsUrl)
-      const timer = setTimeout(() => {
-        ws.close()
-        toast.error('镜像下载等待超时')
-        resolve(false)
-      }, maxWaitMs)
-
-      ws.onopen = () => {
-        console.log('创建实例: 镜像进度 WebSocket 已连接')
-      }
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data)
-          if (msg.type === 'image_progress' && msg.payload.image_id === imageId) {
-            const p = msg.payload
-            if (p.stage === 'done') {
-              clearTimeout(timer)
-              ws.close()
-              resolve(true)
-            } else if (p.stage === 'error') {
-              clearTimeout(timer)
-              ws.close()
-              toast.error(`镜像下载失败: ${p.error || '未知错误'}`)
-              resolve(false)
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-      ws.onerror = () => {
-        clearTimeout(timer)
-        ws.close()
-        toast.error('镜像下载 WebSocket 连接失败')
-        resolve(false)
-      }
-      ws.onclose = () => {
-        clearTimeout(timer)
-      }
-    })
-  }
+  // 后端已按 type + downloaded_only 过滤，直接使用
+  const filteredTemplates = templates
 
   const handleSubmit = async () => {
     if (!name || !nodeId || !templateId || assignToUserId === '') {
@@ -184,21 +141,14 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
     setLoading(true)
     try {
       // 检查模板是否已下载，未下载则自动触发并等待
+      // 后端已过滤仅已下载镜像，无需检查下载状态
       const selectedTemplate = templates.find((t) => t.id === templateId)
-      if (selectedTemplate && nodeId && !selectedTemplate.downloaded) {
-        toast.success('模板未下载，开始自动下载...')
-        await apiClient.post(`/images/${templateId}/download`, { node_id: nodeId })
-        const ok = await waitForImageDownloadViaWS(templateId, nodeId)
-        if (!ok) {
-          setLoading(false)
-          return
-        }
-      }
 
       const payload: Record<string, unknown> = {
         name,
         type,
-        template_id: templateId,
+        template_id: selectedTemplate?.alias || templateId,
+        image_key: templateId,
         node_id: nodeId,
         assign_to_user_id: assignToUserId,
         vpc_id: vpcId || undefined,
@@ -298,7 +248,7 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
                   <option value="">选择模板</option>
                   {filteredTemplates.map((t) => (
                     <option key={t.id} value={t.id}>
-                      {t.name} ({t.distro} {t.release} / {t.arch})
+                      {t.alias} ({t.distro} {t.release} / {t.arch})
                     </option>
                   ))}
                 </select>
