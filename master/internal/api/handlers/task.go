@@ -6,12 +6,17 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
-	"gorm.io/gorm"
 
-	"tsukiyo/master/internal/db"
-	"tsukiyo/master/internal/models"
+	"tsukiyo/master/internal/service"
+	"tsukiyo/master/internal/service/instance"
 )
+
+var taskService *instance.TaskService
+
+// InitTaskService 初始化任务服务
+func InitTaskService(svc *instance.TaskService) {
+	taskService = svc
+}
 
 // ListTasks 获取任务列表
 func ListTasks(c *gin.Context) {
@@ -29,29 +34,21 @@ func ListTasks(c *gin.Context) {
 	}
 
 	status := c.Query("status")
-	nodeID := c.Query("node_id")
-
-	query := db.DB.Model(&models.Task{})
-	if status != "" {
-		query = query.Where("status = ?", status)
-	}
-	if nodeID != "" {
-		if parsed, err := uuid.Parse(nodeID); err == nil {
-			query = query.Where("node_id = ?", parsed)
+	nodeIDStr := c.Query("node_id")
+	var nodeID uuid.UUID
+	if nodeIDStr != "" {
+		if parsed, err := uuid.Parse(nodeIDStr); err == nil {
+			nodeID = parsed
 		}
 	}
 
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		zap.L().Error("查询任务总数失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	var tasks []models.Task
-	offset := (page - 1) * perPage
-	if err := query.Preload("Node").Preload("Instance").Order("created_at DESC").Limit(perPage).Offset(offset).Find(&tasks).Error; err != nil {
-		zap.L().Error("查询任务列表失败", zap.Error(err))
+	tasks, total, err := taskService.ListTasks(instance.ListTasksRequest{
+		Page:    page,
+		PerPage: perPage,
+		Status:  status,
+		NodeID:  nodeID,
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
@@ -100,9 +97,9 @@ func GetTask(c *gin.Context) {
 		return
 	}
 
-	var task models.Task
-	if err := db.DB.Where("id = ?", taskID).First(&task).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+	task, err := taskService.GetTask(taskID)
+	if err != nil {
+		if serviceErr, ok := err.(*service.ServiceError); ok && serviceErr.Message == "任务不存在" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
 			return
 		}
@@ -136,9 +133,8 @@ func GetTaskLogs(c *gin.Context) {
 		return
 	}
 
-	var logs []models.TaskLog
-	if err := db.DB.Where("task_id = ?", taskID).Order("created_at ASC").Find(&logs).Error; err != nil {
-		zap.L().Error("查询任务日志失败", zap.Error(err))
+	logs, err := taskService.GetTaskLogs(taskID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}

@@ -10,6 +10,10 @@ import (
 	"tsukiyo/master/internal/api/handlers"
 	"tsukiyo/master/internal/api/middleware"
 	"tsukiyo/master/internal/console"
+	infra "tsukiyo/master/internal/service/infrastructure"
+	inst "tsukiyo/master/internal/service/instance"
+	sys "tsukiyo/master/internal/service/system"
+	usr "tsukiyo/master/internal/service/user"
 )
 
 // SetupRouter 配置路由
@@ -34,8 +38,27 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	// 前端 WebSocket 推送端点（任务状态等实时数据）
 	r.GET("/ws/tasks", agentMgr.HandleFrontendWebSocket)
 
-	// 设置 Agent 管理器引用
-	handlers.SetAgentManager(agentMgr)
+	// 初始化服务层
+	imageService := infra.NewImageService(agentMgr)
+	handlers.InitImageService(imageService)
+	nodeService := infra.NewNodeService(agentMgr)
+	handlers.InitNodeService(nodeService)
+	userService := usr.NewUserService()
+	handlers.InitUserService(userService)
+	networkService := infra.NewNetworkService(agentMgr)
+	handlers.InitNetworkService(networkService)
+	instanceService := inst.NewInstanceService()
+	handlers.InitInstanceService(instanceService)
+	snapshotService := inst.NewSnapshotService()
+	handlers.InitSnapshotService(snapshotService)
+	taskService := inst.NewTaskService()
+	handlers.InitTaskService(taskService)
+	storageService := infra.NewStorageService(agentMgr)
+	handlers.InitStorageService(storageService)
+	authService := usr.NewAuthService()
+	handlers.InitAuthService(authService)
+	auditService := sys.NewAuditService()
+	handlers.InitAuditService(auditService)
 
 	// API v1
 	v1 := r.Group("/api/v1")

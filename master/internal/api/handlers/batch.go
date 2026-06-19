@@ -10,6 +10,7 @@ import (
 
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/models"
+	"tsukiyo/master/internal/service/instance"
 )
 
 // BatchCreateRequest 批量创建请求
@@ -71,7 +72,7 @@ func BatchCreate(c *gin.Context) {
 		incusName := "tsukiyo-" + instanceID.String()[:8]
 		name := req.NamePrefix + "-" + incusName[8:]
 
-		instance := models.Instance{
+		newInstance := models.Instance{
 			ID:               instanceID,
 			Name:             name,
 			UserID:           req.AssignToUserID,
@@ -93,10 +94,10 @@ func BatchCreate(c *gin.Context) {
 			SnapshotLimit:    req.SnapshotLimit,
 		}
 		if req.LoginMethod == "auto" {
-			instance.SSHPassword = generateRandomPassword(16)
+			newInstance.SSHPassword = instance.GenerateRandomPassword(16)
 		}
 
-		if err := db.DB.Create(&instance).Error; err != nil {
+		if err := db.DB.Create(&newInstance).Error; err != nil {
 			failed = append(failed, gin.H{"index": i, "error": err.Error()})
 			continue
 		}
@@ -114,24 +115,24 @@ func BatchCreate(c *gin.Context) {
 		}
 
 		payload := map[string]interface{}{
-			"instance_id":        instance.IncusName,
-			"type":               instance.Type,
-			"template_id":        instance.TemplateID,
-			"vcpu":               instance.VCPU,
-			"memory_mb":          instance.MemoryMB,
-			"disk_gb":            instance.DiskGB,
-			"storage_pool":       instance.StoragePool,
-			"login_method":       instance.LoginMethod,
-			"ssh_password":       instance.SSHPassword,
-			"network_down":       instance.NetworkDownMbps,
-			"network_up":         instance.NetworkUpMbps,
-			"io_read":            instance.IOReadMBps,
-			"io_write":           instance.IOWriteMBps,
+			"instance_id":        newInstance.IncusName,
+			"type":               newInstance.Type,
+			"template_id":        newInstance.TemplateID,
+			"vcpu":               newInstance.VCPU,
+			"memory_mb":          newInstance.MemoryMB,
+			"disk_gb":            newInstance.DiskGB,
+			"storage_pool":       newInstance.StoragePool,
+			"login_method":       newInstance.LoginMethod,
+			"ssh_password":       newInstance.SSHPassword,
+			"network_down":       newInstance.NetworkDownMbps,
+			"network_up":         newInstance.NetworkUpMbps,
+			"io_read":            newInstance.IOReadMBps,
+			"io_write":           newInstance.IOWriteMBps,
 			"assign_nat":         wantsNAT,
 			"port_mapping_count": portMappingCount,
-			"traffic_mode":       instance.TrafficMode,
-			"monthly_traffic":    instance.MonthlyTrafficGB,
-			"snapshot_limit":     instance.SnapshotLimit,
+			"traffic_mode":       newInstance.TrafficMode,
+			"monthly_traffic":    newInstance.MonthlyTrafficGB,
+			"snapshot_limit":     newInstance.SnapshotLimit,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 
@@ -139,7 +140,7 @@ func BatchCreate(c *gin.Context) {
 			ID:         uuid.New(),
 			Type:       models.TaskTypeCreateInstance,
 			NodeID:     nodeID,
-			InstanceID: &instance.ID,
+			InstanceID: &newInstance.ID,
 			UserID:     req.AssignToUserID,
 			Status:     models.TaskStatusPending,
 			Payload:    payloadBytes,
@@ -149,8 +150,8 @@ func BatchCreate(c *gin.Context) {
 		}
 
 		created = append(created, gin.H{
-			"id":      instance.ID.String(),
-			"name":    instance.Name,
+			"id":      newInstance.ID.String(),
+			"name":    newInstance.Name,
 			"task_id": task.ID.String(),
 		})
 	}

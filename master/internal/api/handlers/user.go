@@ -2,30 +2,30 @@ package handlers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
-	"gorm.io/gorm"
 
-	"tsukiyo/master/internal/db"
-	"tsukiyo/master/internal/models"
+	"tsukiyo/master/internal/service"
+	"tsukiyo/master/internal/service/user"
 )
+
+var userService *user.UserService
+
+// InitUserService 初始化用户服务
+func InitUserService(svc *user.UserService) {
+	userService = svc
+}
 
 // ListUsers 获取用户列表
 func ListUsers(c *gin.Context) {
-	var users []models.User
 	page := 1
 	pageSize := 20
 
-	if err := db.DB.Order("created_at DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&users).Error; err != nil {
-		zap.L().Error("查询用户列表失败", zap.Error(err))
+	users, total, err := userService.ListUsers(page, pageSize)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
-
-	var total int64
-	db.DB.Model(&models.User{}).Count(&total)
 
 	result := make([]gin.H, 0, len(users))
 	for _, user := range users {
@@ -48,29 +48,21 @@ func ListUsers(c *gin.Context) {
 
 // GetUser 获取用户详情
 func GetUser(c *gin.Context) {
-	userID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	userID, err := user.ParseUserID(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户 ID"})
 		return
 	}
 
-	var user models.User
-	if err := db.DB.Where("id = ?", uint(userID)).First(&user).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+	user, groups, err := userService.GetUser(userID)
+	if err != nil {
+		if err == service.ErrUserNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
-
-	// 加载用户组
-	var groups []models.UserGroup
-	db.DB.Raw(`
-		SELECT g.* FROM user_groups g
-		INNER JOIN user_group_members m ON m.group_id = g.id
-		WHERE m.user_id = ?
-	`, user.ID).Scan(&groups)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":         user.ID,
@@ -91,7 +83,7 @@ type UpdateUserRequest struct {
 
 // UpdateUser 更新用户
 func UpdateUser(c *gin.Context) {
-	userID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	userID, err := user.ParseUserID(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户 ID"})
 		return
@@ -103,20 +95,11 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 
-	updates := make(map[string]interface{})
-	if req.Email != "" {
-		updates["email"] = req.Email
-	}
-	if req.Status != "" {
-		updates["status"] = req.Status
-	}
-
-	if len(updates) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无有效更新字段"})
-		return
-	}
-
-	if err := db.DB.Model(&models.User{}).Where("id = ?", uint(userID)).Updates(updates).Error; err != nil {
+	if err := userService.UpdateUser(userID, req.Email, req.Status); err != nil {
+		if err == service.ErrNoValidUpdateFields {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无有效更新字段"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新失败"})
 		return
 	}
@@ -126,13 +109,13 @@ func UpdateUser(c *gin.Context) {
 
 // DeleteUser 删除用户
 func DeleteUser(c *gin.Context) {
-	userID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	userID, err := user.ParseUserID(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的用户 ID"})
 		return
 	}
 
-	if err := db.DB.Where("id = ?", uint(userID)).Delete(&models.User{}).Error; err != nil {
+	if err := userService.DeleteUser(userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
 		return
 	}
