@@ -499,6 +499,7 @@ func ListPortMappings(c *gin.Context) {
 type addPortMappingRequest struct {
 	InstanceID    string `json:"instance_id" binding:"required"`
 	ContainerPort int    `json:"container_port" binding:"required,min=1,max=65535"`
+	HostPort      int    `json:"host_port"`
 	Protocol      string `json:"protocol" binding:"required,oneof=tcp udp"`
 	IPVersion     string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
 	Description   string `json:"description"`
@@ -515,7 +516,14 @@ func AddPortMapping(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的实例 ID"})
 		return
 	}
-	pm, err := networkService.AddPortMapping(instanceID, req.ContainerPort, req.Protocol, req.IPVersion, req.Description)
+	hostPort := req.HostPort
+	if hostPort > 0 {
+		if hostPort < 1 || hostPort > 65535 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "外部端口范围 1-65535"})
+			return
+		}
+	}
+	pm, err := networkService.AddPortMapping(instanceID, req.ContainerPort, hostPort, req.Protocol, req.IPVersion, req.Description)
 	if err != nil {
 		if err == service.ErrInstanceNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})

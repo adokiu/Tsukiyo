@@ -254,6 +254,7 @@ export default function InstanceDetailPage() {
         instance_id: id,
         container_port: containerPort,
         protocol,
+        ip_version: 'ipv4',
         description,
       }
       if (hostPort) body.host_port = hostPort

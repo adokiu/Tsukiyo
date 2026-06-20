@@ -303,10 +303,10 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 		"type":    "nic",
 	}
 
-	// Bridge 网络配置：使用 Incus managed network（NAT + IP 分配由 Incus 处理）
+	// Bridge 网络配置：使用 nictype=bridged + parent 方式（和 Old 项目一致，确保 limits 生效）
 	if req.BridgeName != "" {
-		delete(nicDevice, "nictype")
-		nicDevice["network"] = req.BridgeName
+		nicDevice["nictype"] = "bridged"
+		nicDevice["parent"] = req.BridgeName
 		// 通过 Incus 设备属性分配静态 IP
 		if req.InternalIPv4 != "" {
 			nicDevice["ipv4.address"] = req.InternalIPv4
@@ -323,6 +323,13 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	}
 	if req.MACFilter {
 		nicDevice["security.mac_filtering"] = "true"
+	}
+	// 网络限速（下行=ingress，上行=egress）
+	if req.NetworkDown > 0 {
+		nicDevice["limits.ingress"] = fmt.Sprintf("%dMbit", req.NetworkDown)
+	}
+	if req.NetworkUp > 0 {
+		nicDevice["limits.egress"] = fmt.Sprintf("%dMbit", req.NetworkUp)
 	}
 	devices["eth0"] = nicDevice
 
@@ -782,6 +789,7 @@ func (c *Client) AddProxyDevice(instanceName, deviceName, listenAddr, connectAdd
 				"listen":  listenAddr,
 				"connect": connectAddr,
 				"bind":    "host",
+				"nat":     "true",
 			},
 		},
 	}
@@ -800,14 +808,14 @@ func (c *Client) AddProxyDevice(instanceName, deviceName, listenAddr, connectAdd
 // addProxyDeviceCLI 使用 incus CLI 添加 proxy 设备
 func (c *Client) addProxyDeviceCLI(instanceName, deviceName, listenAddr, connectAddr string) error {
 	cmd := exec.Command("incus", "config", "device", "add", instanceName, deviceName, "proxy",
-		"bind=host", "listen="+listenAddr, "connect="+connectAddr)
+		"bind=host", "listen="+listenAddr, "connect="+connectAddr, "nat=true")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// 设备已存在，先删再加
 		if strings.Contains(string(output), "already exists") {
 			_ = exec.Command("incus", "config", "device", "remove", instanceName, deviceName).Run()
 			cmd = exec.Command("incus", "config", "device", "add", instanceName, deviceName, "proxy",
-				"bind=host", "listen="+listenAddr, "connect="+connectAddr)
+				"bind=host", "listen="+listenAddr, "connect="+connectAddr, "nat=true")
 			output, err = cmd.CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("incus CLI 添加 proxy 设备 %s 失败(重试): %w, output: %s", deviceName, err, string(output))
@@ -1749,6 +1757,8 @@ type CreateInstanceRequest struct {
 	IPv4CIDR     string // IPv4 CIDR，用于生成 network-config
 	IPv4Filter   bool   // security.ipv4_filter
 	MACFilter    bool   // security.mac_filter
+	NetworkDown  int    // 下行限速 Mbit
+	NetworkUp    int    // 上行限速 Mbit
 }
 
 // InstanceInfo 实例信息

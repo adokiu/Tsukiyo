@@ -124,6 +124,8 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		IPv4CIDR:      req.IPv4CIDR,
 		IPv4Filter:    req.IPv4Filter,
 		MACFilter:     req.MACFilter,
+		NetworkDown:   req.NetworkDown,
+		NetworkUp:     req.NetworkUp,
 	}
 
 	name := req.InstanceID
@@ -167,12 +169,6 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	}
 	if req.MemoryMB > 0 {
 		limits["limits.memory"] = fmt.Sprintf("%dMB", req.MemoryMB)
-	}
-	if req.NetworkDown > 0 {
-		limits["limits.network.egress"] = fmt.Sprintf("%dMbit", req.NetworkDown)
-	}
-	if req.NetworkUp > 0 {
-		limits["limits.network.ingress"] = fmt.Sprintf("%dMbit", req.NetworkUp)
 	}
 	if req.IORead > 0 {
 		limits["limits.disk.read"] = fmt.Sprintf("%dMB", req.IORead)

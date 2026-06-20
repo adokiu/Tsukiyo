@@ -952,14 +952,14 @@ func (s *NetworkService) AssignEIPToInstance(allocationID uuid.UUID, instanceID 
 		if alloc.IPVersion == "ipv6" {
 			internalIP = instance.InternalIPv6
 		}
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"instance_name": instance.IncusName,
 			"instance_ip":   internalIP,
 			"eip_cidr":      alloc.CIDR,
 			"interface":     pool.Interface,
 			"ip_version":    alloc.IPVersion,
 			"bridge_name":   bridge.BridgeName,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(instance.NodeID, "assign_eip", payload, 30*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 分配 EIP 失败", zap.Error(err))
@@ -994,14 +994,14 @@ func (s *NetworkService) ReleaseInstanceEIP(allocationID uuid.UUID) error {
 			if alloc.IPVersion == "ipv6" {
 				internalIP = instance.InternalIPv6
 			}
-			payload, _ := json.Marshal(map[string]interface{}{
+			payload := map[string]interface{}{
 				"instance_name": instance.IncusName,
 				"instance_ip":   internalIP,
 				"eip_cidr":      alloc.CIDR,
 				"interface":     pool.Interface,
 				"ip_version":    alloc.IPVersion,
 				"bridge_name":   bridge.BridgeName,
-			})
+			}
 			_, err := s.agentMgr.SendRequest(instance.NodeID, "release_eip", payload, 30*time.Second)
 			if err != nil {
 				zap.L().Warn("Agent 释放 EIP 失败", zap.Error(err))
@@ -1113,7 +1113,7 @@ func (s *NetworkService) findAvailablePort(bridgeID uuid.UUID, start, end int, p
 	return 0, service.ErrNoAvailablePorts
 }
 
-func (s *NetworkService) AddPortMapping(instanceID uuid.UUID, containerPort int, protocol string, ipVersion string, description string) (*models.PortMapping, error) {
+func (s *NetworkService) AddPortMapping(instanceID uuid.UUID, containerPort int, hostPort int, protocol string, ipVersion string, description string) (*models.PortMapping, error) {
 	var instance models.Instance
 	if err := db.DB.Where("id = ?", instanceID).First(&instance).Error; err != nil {
 		return nil, service.ErrInstanceNotFound
@@ -1142,9 +1142,20 @@ func (s *NetworkService) AddPortMapping(instanceID uuid.UUID, containerPort int,
 		return nil, service.ErrNoBridgeEgressIP
 	}
 
-	hostPort, err := s.findAvailablePort(bridge.ID, bridge.PortRangeStart, bridge.PortRangeEnd, protocol)
-	if err != nil {
-		return nil, err
+	if hostPort > 0 {
+		// 用户指定了外部端口，检查是否被占用
+		var count int64
+		db.DB.Model(&models.PortMapping{}).Where("bridge_id = ? AND host_port = ? AND protocol = ?", bridge.ID, hostPort, protocol).Count(&count)
+		if count > 0 {
+			return nil, fmt.Errorf("端口 %d 已被占用", hostPort)
+		}
+	} else {
+		// 自动分配端口
+		var err error
+		hostPort, err = s.findAvailablePort(bridge.ID, bridge.PortRangeStart, bridge.PortRangeEnd, protocol)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	pm := models.PortMapping{
@@ -1171,14 +1182,14 @@ func (s *NetworkService) AddPortMapping(instanceID uuid.UUID, containerPort int,
 		if ipVersion == "ipv6" {
 			internalIP = instance.InternalIPv6
 		}
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"instance_id":    instance.IncusName,
 			"host_port":      hostPort,
 			"container_port": containerPort,
 			"protocol":       protocol,
 			"host_ip":        egressAlloc.GetIP(),
 			"internal_ip":    internalIP,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(instance.NodeID, "add_port_mapping", payload, 15*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 添加端口映射失败", zap.Error(err))
@@ -1201,11 +1212,11 @@ func (s *NetworkService) DeletePortMapping(pmID uuid.UUID) error {
 	db.DB.Where("id = ?", pm.InstanceID).First(&instance)
 
 	if s.agentMgr != nil && s.agentMgr.IsNodeConnected(instance.NodeID) {
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"instance_id": instance.IncusName,
 			"host_port":   pm.HostPort,
 			"protocol":    pm.Protocol,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(instance.NodeID, "del_port_mapping", payload, 15*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 删除端口映射失败", zap.Error(err))
@@ -1255,13 +1266,13 @@ func (s *NetworkService) AddFirewallRule(instanceID uuid.UUID, network, directio
 	}
 
 	if s.agentMgr != nil && s.agentMgr.IsNodeConnected(instance.NodeID) {
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"direction": direction,
 			"protocol":  protocol,
 			"source":    sourceIP,
 			"port":      port,
 			"action":    action,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(instance.NodeID, "add_firewall_rule", payload, 15*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 添加防火墙规则失败?", zap.Error(err))
@@ -1284,12 +1295,12 @@ func (s *NetworkService) DeleteFirewallRule(ruleID uuid.UUID) error {
 	db.DB.Where("id = ?", rule.InstanceID).First(&instance)
 
 	if s.agentMgr != nil && s.agentMgr.IsNodeConnected(instance.NodeID) {
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"direction": rule.Direction,
 			"protocol":  rule.Protocol,
 			"source":    rule.SourceIP,
 			"port":      rule.Port,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(instance.NodeID, "del_firewall_rule", payload, 15*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 删除防火墙规则失败", zap.Error(err))
