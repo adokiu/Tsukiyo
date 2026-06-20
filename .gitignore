@@ -47,4 +47,7 @@ temp/
 *.tmp
 
 # Examples (large reference projects, not part of main codebase)
-#examples/
+examples/
+ 
+# scripts
+*.py
