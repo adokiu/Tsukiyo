@@ -762,7 +762,7 @@ func (c *Client) DeviceExists(instanceName, deviceName string) (bool, error) {
 	}
 	var result struct {
 		Metadata struct {
-			Devices map[string]map[string]string `json:"devices"`
+			Devices map[string]interface{} `json:"devices"`
 		} `json:"metadata"`
 	}
 	if _, err := parseResponse(resp, &result); err != nil {
@@ -1804,7 +1804,7 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 
 	config := map[string]string{
 		"ipv4.address": ipv4Addr,
-		"ipv4.nat":     "true",
+		"ipv4.nat":     "false",
 		"ipv4.dhcp":    "true",
 	}
 	if ipv6ULA != "" {

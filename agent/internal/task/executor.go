@@ -92,8 +92,10 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 		zap.L().Info("执行 Bridge 网络任务", zap.String("type", taskType))
 		return e.handleBridgeNetwork(payload)
 	case "bind_bridge_egress":
+		zap.L().Info("执行 Bridge 出口 EIP 绑定任务")
 		return e.handleBindBridgeEgress(payload)
 	case "unbind_bridge_egress":
+		zap.L().Info("执行 Bridge 出口 EIP 解绑任务")
 		return e.handleUnbindBridgeEgress(payload)
 	default:
 		return nil, fmt.Errorf("未知任务类型: %s", taskType)

@@ -215,11 +215,13 @@ func (e *Executor) handleBindBridgeEgress(payload json.RawMessage) (json.RawMess
 		Interface  string `json:"interface"`
 		IPVersion  string `json:"ip_version"`
 	}
+	zap.L().Info("[BindEgress] 收到 payload", zap.String("payload", string(payload)))
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("[BindEgress] 解析参数失败", zap.Error(err), zap.String("payload", string(payload)))
 		return nil, fmt.Errorf("解析参数失败: %w", err)
 	}
 
-	zap.L().Info("绑定 Bridge 出口 EIP",
+	zap.L().Info("[BindEgress] 绑定 Bridge 出口 EIP",
 		zap.String("bridge", req.BridgeName),
 		zap.String("egress_cidr", req.EgressCIDR),
 		zap.String("ip_version", req.IPVersion))
@@ -230,7 +232,19 @@ func (e *Executor) handleBindBridgeEgress(payload json.RawMessage) (json.RawMess
 		egressIP = egressIP[:idx]
 	}
 
-	// 通过 Incus 更新 bridge 网络的 NAT 出口地址
+	// 先关闭 NAT 清除旧规则
+	clearConfig := map[string]string{}
+	if req.IPVersion == "ipv6" {
+		clearConfig["ipv6.nat"] = "false"
+	} else {
+		clearConfig["ipv4.nat"] = "false"
+	}
+	zap.L().Info("[BindEgress] 步骤1: 关闭 NAT 清除旧规则", zap.String("bridge", req.BridgeName))
+	if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, clearConfig); err != nil {
+		zap.L().Warn("[BindEgress] 关闭 NAT 失败", zap.Error(err))
+	}
+
+	// 再开启 NAT 并设置新的出口地址
 	config := map[string]string{}
 	if req.IPVersion == "ipv6" {
 		config["ipv6.nat"] = "true"
@@ -239,9 +253,9 @@ func (e *Executor) handleBindBridgeEgress(payload json.RawMessage) (json.RawMess
 		config["ipv4.nat"] = "true"
 		config["ipv4.nat.address"] = egressIP
 	}
-
+	zap.L().Info("[BindEgress] 步骤2: 设置新 NAT 出口", zap.String("bridge", req.BridgeName), zap.String("egress_ip", egressIP))
 	if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, config); err != nil {
-		zap.L().Error("绑定 Bridge 出口 EIP 失败", zap.Error(err))
+		zap.L().Error("[BindEgress] 绑定 Bridge 出口 EIP 失败", zap.Error(err))
 		return nil, fmt.Errorf("绑定出口 EIP 失败: %w", err)
 	}
 
@@ -260,19 +274,23 @@ func (e *Executor) handleUnbindBridgeEgress(payload json.RawMessage) (json.RawMe
 		Interface  string `json:"interface"`
 		IPVersion  string `json:"ip_version"`
 	}
+	zap.L().Info("[UnbindEgress] 收到 payload", zap.String("payload", string(payload)))
 	if err := json.Unmarshal(payload, &req); err != nil {
+		zap.L().Error("[UnbindEgress] 解析参数失败", zap.Error(err), zap.String("payload", string(payload)))
 		return nil, fmt.Errorf("解析参数失败: %w", err)
 	}
 
-	zap.L().Info("解绑 Bridge 出口 EIP",
+	zap.L().Info("[UnbindEgress] 解绑 Bridge 出口 EIP",
 		zap.String("bridge", req.BridgeName),
 		zap.String("ip_version", req.IPVersion))
 
-	// 通过 Incus 清除 bridge 网络的 NAT 出口地址
+	// 通过 Incus 清除 bridge 网络的 NAT 出口地址并关闭 NAT
 	config := map[string]string{}
 	if req.IPVersion == "ipv6" {
+		config["ipv6.nat"] = "false"
 		config["ipv6.nat.address"] = ""
 	} else {
+		config["ipv4.nat"] = "false"
 		config["ipv4.nat.address"] = ""
 	}
 

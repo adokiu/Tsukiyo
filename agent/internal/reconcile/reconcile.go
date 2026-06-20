@@ -139,9 +139,6 @@ func (r *Reconciler) Reconcile(desired []BridgeConfig) error {
 		zap.L().Warn("[Reconcile] 持久化期望状态失败", zap.Error(err))
 	}
 
-	// 4. 检查所有现有 bridge 网络的 ipv4.nat
-	r.EnsureAllBridgeNAT()
-
 	zap.L().Info("[Reconcile] 状态对齐完成")
 	return nil
 }
@@ -309,14 +306,22 @@ func (r *Reconciler) reconcileBridge(bridge BridgeConfig, actualMap map[string]i
 			}
 		}
 
-		// 确保 ipv4.nat=true
-		if bridge.IPv4Enabled && actual.Config["ipv4.nat"] != "true" {
-			zap.L().Warn("[Reconcile] bridge ipv4.nat 未启用，修复",
-				zap.String("bridge", bridge.BridgeName))
-			if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, map[string]string{"ipv4.nat": "true"}); err != nil {
-				zap.L().Error("[Reconcile] 更新 ipv4.nat 失败", zap.Error(err))
-			} else {
-				zap.L().Info("[Reconcile] ipv4.nat 已启用", zap.String("bridge", bridge.BridgeName))
+		// 根据 egress IP 绑定状态设置 ipv4.nat
+		if bridge.IPv4Enabled {
+			expectedNAT := "false"
+			if bridge.NATEgressIPv4 != "" {
+				expectedNAT = "true"
+			}
+			if actual.Config["ipv4.nat"] != expectedNAT {
+				zap.L().Warn("[Reconcile] bridge ipv4.nat 不匹配期望，修复",
+					zap.String("bridge", bridge.BridgeName),
+					zap.String("expected", expectedNAT),
+					zap.String("actual", actual.Config["ipv4.nat"]))
+				if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, map[string]string{"ipv4.nat": expectedNAT}); err != nil {
+					zap.L().Error("[Reconcile] 更新 ipv4.nat 失败", zap.Error(err))
+				} else {
+					zap.L().Info("[Reconcile] ipv4.nat 已修复", zap.String("bridge", bridge.BridgeName), zap.String("nat", expectedNAT))
+				}
 			}
 		}
 
@@ -384,6 +389,7 @@ func (r *Reconciler) reconcileBridge(bridge BridgeConfig, actualMap map[string]i
 				zap.L().Error("[Reconcile] 清除 ipv6.nat.address 失败", zap.Error(err))
 			}
 		}
+
 	}
 
 	return nil

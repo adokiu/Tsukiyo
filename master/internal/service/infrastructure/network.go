@@ -422,12 +422,12 @@ func (s *NetworkService) allocateBridgeEgressFromPool(poolID uuid.UUID, bridgeID
 	db.DB.Where("id = ?", bridgeID).First(&bridge)
 
 	if s.agentMgr != nil && s.agentMgr.IsNodeConnected(bridge.NodeID) {
-		payload, _ := json.Marshal(map[string]interface{}{
+		payload := map[string]interface{}{
 			"bridge_name": bridge.BridgeName,
 			"egress_cidr": alloc.CIDR,
 			"interface":   pool.Interface,
 			"ip_version":  ipVersion,
-		})
+		}
 		_, err := s.agentMgr.SendRequest(bridge.NodeID, "bind_bridge_egress", payload, 15*time.Second)
 		if err != nil {
 			zap.L().Warn("Agent 绑定网桥出口 IP 失败", zap.Error(err))
@@ -513,12 +513,12 @@ func (s *NetworkService) UnbindBridgeEgress(bridgeID uuid.UUID, ipVersion string
 
 		// 通知 Agent 解绑出口 IP
 		if s.agentMgr != nil && s.agentMgr.IsNodeConnected(bridge.NodeID) {
-			payload, _ := json.Marshal(map[string]interface{}{
+			payload := map[string]interface{}{
 				"bridge_name": bridge.BridgeName,
 				"egress_cidr": alloc.CIDR,
 				"interface":   pool.Interface,
 				"ip_version":  ipVersion,
-			})
+			}
 			_, err := s.agentMgr.SendRequest(bridge.NodeID, "unbind_bridge_egress", payload, 15*time.Second)
 			if err != nil {
 				zap.L().Warn("Agent 解绑网桥出口 IP 失败", zap.Error(err))

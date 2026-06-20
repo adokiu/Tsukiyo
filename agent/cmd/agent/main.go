@@ -81,11 +81,22 @@ func main() {
 	configReady := make(chan struct{})
 	var initOnce sync.Once
 
+	// 保存首次收到的配置数据，供 Incus 初始化后 reconcile
+	var firstConfigData map[string]interface{}
+	var firstConfigMu sync.Mutex
+
 	// 设置配置处理器
 	wsClient.SetConfigHandler(func(data map[string]interface{}) {
 		initOnce.Do(func() {
 			close(configReady)
 		})
+
+		// 首次收到配置时保存
+		firstConfigMu.Lock()
+		if firstConfigData == nil {
+			firstConfigData = data
+		}
+		firstConfigMu.Unlock()
 
 		moduleMu.Lock()
 		ic := incusClient
@@ -113,20 +124,6 @@ func main() {
 					zap.L().Info("使用本地持久化 Bridge 状态进行恢复", zap.Int("count", len(bridges)))
 					r := reconcile.NewReconciler(ic)
 					_ = r.Reconcile(bridges)
-				}
-			}
-
-			// 解析端口映射配置并恢复 proxy 设备
-			if pmsRaw, ok := data["port_mappings"]; ok {
-				var pms []reconcile.PortMappingConfig
-				if rawJSON, err := json.Marshal(pmsRaw); err == nil {
-					if err := json.Unmarshal(rawJSON, &pms); err == nil {
-						zap.L().Info("收到端口映射配置，执行恢复", zap.Int("count", len(pms)))
-						r := reconcile.NewReconciler(ic)
-						_ = r.ReconcilePortMappings(pms)
-					} else {
-						zap.L().Warn("解析端口映射配置失败", zap.Error(err))
-					}
 				}
 			}
 
@@ -169,6 +166,35 @@ func main() {
 
 	// 首次应用配置
 	applyConfig(config.AppConfig, ic)
+
+	// Incus 初始化后用首次收到的配置执行 reconcile
+	firstConfigMu.Lock()
+	cfgData := firstConfigData
+	firstConfigMu.Unlock()
+	if cfgData != nil {
+		r := reconcile.NewReconciler(ic)
+
+		// reconcile bridge 配置
+		if bridgesRaw, ok := cfgData["bridges"]; ok {
+			var bridges []reconcile.BridgeConfig
+			if rawJSON, err := json.Marshal(bridgesRaw); err == nil {
+				if err := json.Unmarshal(rawJSON, &bridges); err == nil {
+					zap.L().Info("启动时执行 Bridge 状态对齐", zap.Int("count", len(bridges)))
+					if err := r.Reconcile(bridges); err != nil {
+						zap.L().Error("Bridge 状态对齐失败", zap.Error(err))
+					}
+				}
+			}
+		}
+
+	} else {
+		// 没有收到配置，尝试用本地持久化状态
+		if bridges, err := reconcile.LoadDesiredState(); err == nil && len(bridges) > 0 {
+			zap.L().Info("使用本地持久化 Bridge 状态进行恢复", zap.Int("count", len(bridges)))
+			r := reconcile.NewReconciler(ic)
+			_ = r.Reconcile(bridges)
+		}
+	}
 
 	// 上报本地已有镜像列表
 	if aliases, err := ic.ListImages(); err == nil && len(aliases) > 0 {
@@ -427,16 +453,6 @@ func main() {
 			return
 		}
 		syncLocalImages(ic, wsClient)
-	}()
-
-	// 确保所有 bridge 网络启用 NAT
-	go func() {
-		time.Sleep(2 * time.Second)
-		if !ic.IsAvailable() {
-			return
-		}
-		r := reconcile.NewReconciler(ic)
-		r.EnsureAllBridgeNAT()
 	}()
 
 	var wg sync.WaitGroup
