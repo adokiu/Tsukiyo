@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/creack/pty"
 	"go.uber.org/zap"
 
 	"tsukiyo/agent/internal/image"
@@ -21,9 +23,11 @@ import (
 // image_key 格式: alias|type|arch
 func (e *Executor) handleDownloadImage(payload json.RawMessage) (json.RawMessage, error) {
 	var req struct {
-		ImageKey  string `json:"image_key"`
-		ImageType string `json:"image_type"` // container / vm
-		Source    string `json:"source"`     // incus remote source, e.g. "images:debian/forky/cloud"
+		ImageKey   string `json:"image_key"`
+		ImageType  string `json:"image_type"`  // container / vm
+		Source     string `json:"source"`      // incus remote source, e.g. "spiritlhl:debian/12/cloud"
+		RemoteName string `json:"remote_name"` // remote 名称, e.g. spiritlhl
+		RemoteURL  string `json:"remote_url"`  // remote 服务器 URL, e.g. https://incusimages.spiritlhl.net
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, fmt.Errorf("解析下载参数失败: %w", err)
@@ -42,7 +46,16 @@ func (e *Executor) handleDownloadImage(payload json.RawMessage) (json.RawMessage
 		zap.String("alias", alias),
 		zap.String("type", imageType),
 		zap.String("arch", arch),
-		zap.String("source", req.Source))
+		zap.String("source", req.Source),
+		zap.String("remote_name", req.RemoteName),
+		zap.String("remote_url", req.RemoteURL))
+
+	// 确保 remote 已注册到 Incus
+	if req.RemoteName != "" && req.RemoteURL != "" {
+		if err := e.incusClient.SyncRemote(req.RemoteName, req.RemoteURL); err != nil {
+			zap.L().Warn("确保 remote 注册失败，继续尝试下载", zap.String("remote", req.RemoteName), zap.Error(err))
+		}
+	}
 
 	// Incus 远程镜像：使用 incus image copy
 	if strings.HasPrefix(req.Source, "images:") || strings.Contains(req.Source, ":") {
@@ -70,24 +83,94 @@ func (e *Executor) downloadIncusImage(imageKey, alias, source, imageType string)
 
 	// incus image copy <source> local: --alias <alias>
 	// 如果是虚拟机类型需要 --vm
-	args := []string{"image", "copy", source, "local:", "--alias", alias}
+	args := []string{"image", "copy", source, "local:", "--alias", alias, "--verbose"}
 	if imageType == "vm" || imageType == "virtual-machine" {
 		args = append(args, "--vm")
 	}
 
 	zap.L().Info("执行 incus image copy", zap.Strings("args", args))
 
+	// 先删除可能已存在的 alias，避免冲突
+	exec.Command("incus", "image", "alias", "delete", alias).Run()
+
 	cmd := exec.Command("incus", args...)
-	output, err := cmd.CombinedOutput()
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	// 使用 pty 模拟终端，使 Incus CLI 输出进度
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		errMsg := strings.TrimSpace(string(output))
-		zap.L().Error("incus image copy 失败", zap.String("output", errMsg), zap.Error(err))
+		errMsg := err.Error()
+		zap.L().Error("incus image copy pty 启动失败", zap.Error(err))
+		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
+			ImageID: imageKey,
+			Stage:   "error",
+			Error:   "incus image copy 启动失败: " + errMsg,
+		})
+		return nil, fmt.Errorf("incus image copy pty 启动失败: %w", err)
+	}
+	defer ptmx.Close()
+
+	// 设置 pty 窗口大小，使 CLI 进度条正常输出
+	pty.Setsize(ptmx, &pty.Winsize{
+		Rows: 24,
+		Cols: 80,
+	})
+
+	// 实时读取 pty 输出并解析进度
+	// Incus CLI 进度格式: "Copying the image: rootfs: 28% (42.93MB/s)"
+	// 进度用 \r 回车覆盖同一行
+	progressDone := make(chan struct{})
+	var outputBuf strings.Builder
+	lastSendTime := time.Time{}
+	go func() {
+		defer close(progressDone)
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := ptmx.Read(buf)
+			if n > 0 {
+				chunk := string(buf[:n])
+				outputBuf.WriteString(chunk)
+				// 按 \r 和 \n 分割，逐行解析
+				for _, line := range strings.FieldsFunc(chunk, func(r rune) bool { return r == '\r' || r == '\n' }) {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+
+					// 解析进度百分比
+					if pct, speed, _, _, ok := parseIncusProgress(line); ok {
+						// 限制上报频率，最少间隔 0.5 秒
+						now := time.Now()
+						if now.Sub(lastSendTime) >= 500*time.Millisecond || pct >= 100 {
+							lastSendTime = now
+							e.wsClient.SendImageProgress(ws.ImageProgressPayload{
+								ImageID:  imageKey,
+								Stage:    "downloading",
+								Progress: pct,
+								SpeedBps: speed,
+							})
+						}
+					}
+				}
+			}
+			if readErr != nil {
+				break
+			}
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	<-progressDone
+
+	if waitErr != nil {
+		errMsg := strings.TrimSpace(outputBuf.String())
+		zap.L().Error("incus image copy 失败", zap.String("image_key", imageKey), zap.String("output", errMsg), zap.Error(waitErr))
 		e.wsClient.SendImageProgress(ws.ImageProgressPayload{
 			ImageID: imageKey,
 			Stage:   "error",
 			Error:   "incus image copy 失败: " + errMsg,
 		})
-		return nil, fmt.Errorf("incus image copy 失败: %w, output: %s", err, errMsg)
+		return nil, fmt.Errorf("incus image copy 失败: %w, output: %s", waitErr, errMsg)
 	}
 
 	zap.L().Info("incus image copy 成功", zap.String("image_key", imageKey), zap.String("alias", alias))
@@ -103,6 +186,93 @@ func (e *Executor) downloadIncusImage(imageKey, alias, source, imageType string)
 		"alias":     alias,
 		"status":    "success",
 	})
+}
+
+// parseIncusProgress 解析 Incus CLI 进度输出行
+// 格式: "Transfer: 45% (10.5MB/s)" 或 "Transfer: 45% (100MB/200MB) 10.5MB/s"
+// 返回: 百分比, 速度(bytes/s), 已下载(bytes), 总大小(bytes), 是否解析成功
+func parseIncusProgress(line string) (progress int, speedBps int64, downloadedBytes int64, totalBytes int64, ok bool) {
+	// 查找 "Transfer:" 或 "Image export:" 等进度前缀
+	if !strings.Contains(line, "%") {
+		return 0, 0, 0, 0, false
+	}
+
+	// 提取百分比
+	pctIdx := strings.Index(line, "%")
+	if pctIdx < 0 {
+		return 0, 0, 0, 0, false
+	}
+	// 向前找数字
+	numStart := pctIdx - 1
+	for numStart >= 0 && (line[numStart] >= '0' && line[numStart] <= '9') {
+		numStart--
+	}
+	numStart++
+	if numStart >= pctIdx {
+		return 0, 0, 0, 0, false
+	}
+	pctStr := line[numStart:pctIdx]
+	pct, err := strconv.Atoi(pctStr)
+	if err != nil || pct < 0 || pct > 100 {
+		return 0, 0, 0, 0, false
+	}
+	progress = pct
+	ok = true
+
+	// 提取速度 (括号内)
+	if parenIdx := strings.Index(line, "("); parenIdx >= 0 {
+		parenEnd := strings.Index(line[parenIdx:], ")")
+		if parenEnd > 0 {
+			inner := line[parenIdx+1 : parenIdx+parenEnd]
+			// 格式: "12.68MB/s" 或 "100MB/200MB 12.68MB/s"
+			parts := strings.Fields(inner)
+			if len(parts) >= 2 {
+				// 格式: "100MB/200MB 12.68MB/s"
+				if sz, err := parseSizeToBytes(strings.Split(parts[0], "/")[0]); err == nil {
+					downloadedBytes = sz
+				}
+				if sz, err := parseSizeToBytes(parts[len(parts)-1]); err == nil {
+					speedBps = sz
+				}
+			} else if len(parts) == 1 {
+				// 格式: "12.68MB/s"
+				if sz, err := parseSizeToBytes(parts[0]); err == nil {
+					speedBps = sz
+				}
+			}
+		}
+	}
+
+	return
+}
+
+// parseSizeToBytes 将 "10.5MB/s"、"100MB"、"1.2GB" 等转换为字节
+func parseSizeToBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	// 去掉 /s 后缀
+	s = strings.TrimSuffix(s, "/s")
+	s = strings.TrimSuffix(s, "/s")
+
+	var multiplier float64 = 1
+	if strings.HasSuffix(s, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
+	} else if strings.HasSuffix(s, "MB") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "MB")
+	} else if strings.HasSuffix(s, "KB") {
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "KB")
+	} else if strings.HasSuffix(s, "B") {
+		multiplier = 1
+		s = strings.TrimSuffix(s, "B")
+	}
+
+	val, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, err
+	}
+	return int64(val * multiplier), nil
 }
 
 // downloadContainerImage 使用 downloader 模块下载容器镜像（自定义 URL）
