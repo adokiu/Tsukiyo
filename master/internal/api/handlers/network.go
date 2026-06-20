@@ -1,14 +1,11 @@
 package handlers
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"tsukiyo/master/internal/db"
-	"tsukiyo/master/internal/models"
 	"tsukiyo/master/internal/service"
 	"tsukiyo/master/internal/service/infrastructure"
 )
@@ -20,545 +17,615 @@ func InitNetworkService(svc *infrastructure.NetworkService) {
 	networkService = svc
 }
 
-// IPPoolInfo IP 池信息
-type IPPoolInfo = infrastructure.IPPoolInfo
+// =====================================================================
+// Bridge CRUD
+// =====================================================================
 
-// ListIPPools 获取 IP 池列表
-func ListIPPools(c *gin.Context) {
+func ListBridges(c *gin.Context) {
 	nodeID := c.Query("node_id")
-	status := c.Query("status")
-
-	result, err := networkService.ListIPPools(nodeID, status)
+	bridges, err := networkService.ListBridges(nodeID)
 	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询网桥失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": bridges})
+}
+
+func GetBridge(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
+		return
+	}
+	bridge, err := networkService.GetBridge(id)
+	if err != nil {
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "网桥不存在"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
-	})
+	c.JSON(http.StatusOK, bridge)
 }
 
-// AddIPPoolRequest 添加 IP 请求
-type AddIPPoolRequest struct {
-	NodeID    string `json:"node_id" binding:"required,uuid"`
-	Address   string `json:"address" binding:"required,ip"`
-	Gateway   string `json:"gateway,omitempty"`
-	PrefixLen int    `json:"prefix_len,omitempty"`
-	Interface string `json:"interface,omitempty"`
+type createBridgeRequest struct {
+	NodeID            string   `json:"node_id" binding:"required"`
+	Name              string   `json:"name" binding:"required"`
+	IPv4Enabled       bool     `json:"ipv4_enabled"`
+	IPv4CIDR          string   `json:"ipv4_cidr"`
+	IPv4Gateway       string   `json:"ipv4_gateway"`
+	IPv6Enabled       bool     `json:"ipv6_enabled"`
+	IPv6CIDR          string   `json:"ipv6_cidr"`
+	IPv6Gateway       string   `json:"ipv6_gateway"`
+	DNSServers        []string `json:"dns_servers"`
+	PortRangeStart    int      `json:"port_range_start"`
+	PortRangeEnd      int      `json:"port_range_end"`
+	NATEgressV4PoolID string   `json:"nat_egress_v4_pool_id"`
+	NATEgressV6PoolID string   `json:"nat_egress_v6_pool_id"`
 }
 
-// AddIPPool 添加 IP 到池
-func AddIPPool(c *gin.Context) {
-	var req AddIPPoolRequest
+func CreateBridge(c *gin.Context) {
+	var req createBridgeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
 		return
 	}
-
-	nodeID, _ := uuid.Parse(req.NodeID)
-
-	ip, err := networkService.AddIPPool(nodeID, req.Address, req.Gateway, req.PrefixLen, req.Interface)
+	nodeID, err := uuid.Parse(req.NodeID)
 	if err != nil {
-		if err == service.ErrIPAlreadyExists {
-			c.JSON(http.StatusConflict, gin.H{"error": "该 IP 已在池中"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "添加 IP 失败"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
 		return
 	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"id":      ip.ID.String(),
-		"address": ip.Address,
-		"node_id": ip.NodeID.String(),
-		"status":  ip.Status,
-	})
-}
-
-// DeleteIPPool 从池中删除 IP
-func DeleteIPPool(c *gin.Context) {
-	ipID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 IP ID"})
-		return
-	}
-
-	if err := networkService.DeleteIPPool(ipID); err != nil {
-		if err == service.ErrIPNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "IP 不存在"})
-			return
-		}
-		if err == service.ErrIPAssigned {
-			c.JSON(http.StatusConflict, gin.H{"error": "该 IP 已被分配，无法删除"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
-}
-
-// ListIPv6Prefixes 获取 IPv6 前缀列表
-func ListIPv6Prefixes(c *gin.Context) {
-	nodeID := c.Query("node_id")
-
-	prefixes, err := networkService.ListIPv6Prefixes(nodeID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	result := make([]gin.H, 0, len(prefixes))
-	for _, p := range prefixes {
-		result = append(result, gin.H{
-			"id":         p.ID.String(),
-			"node_id":    p.NodeID.String(),
-			"prefix":     p.Prefix,
-			"prefix_len": p.PrefixLen,
-			"interface":  p.Interface,
-			"gateway":    p.Gateway,
-			"status":     p.Status,
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
-	})
-}
-
-// PortMappingInfo 端口映射信息
-type PortMappingInfo = infrastructure.PortMappingInfo
-
-// ListPortMappings 获取端口映射列表
-func ListPortMappings(c *gin.Context) {
-	instanceID := c.Query("instance_id")
-	nodeID := c.Query("node_id")
-
-	result, err := networkService.ListPortMappings(instanceID, nodeID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
-	})
-}
-
-// AddPortMappingRequest 添加端口映射请求
-type AddPortMappingRequest struct {
-	InstanceID    string `json:"instance_id" binding:"required,uuid"`
-	ContainerPort int    `json:"container_port" binding:"required,min=1,max=65535"`
-	HostPort      int    `json:"host_port,omitempty"`
-	Protocol      string `json:"protocol,omitempty"`
-	HostIP        string `json:"host_ip,omitempty"`
-	Description   string `json:"description,omitempty"`
-}
-
-// AddPortMapping 添加端口映射
-func AddPortMapping(c *gin.Context) {
-	var req AddPortMappingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
-		return
-	}
-
-	instanceID, _ := uuid.Parse(req.InstanceID)
 	userID, _ := c.Get("user_id")
 
-	results, tasks, err := networkService.AddPortMapping(instanceID, req.ContainerPort, req.HostPort, req.Protocol, req.HostIP, req.Description, userID.(uint))
-	if err != nil {
-		if err == service.ErrInstanceNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+	var natEgressV4PoolID *uuid.UUID
+	if req.NATEgressV4PoolID != "" {
+		pid, err := uuid.Parse(req.NATEgressV4PoolID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 IPv4 NAT 出口 EIP 池 ID"})
 			return
 		}
-		if err == service.ErrPortMappingLimitReached {
-			c.JSON(http.StatusForbidden, gin.H{"error": "端口映射数量已达上限"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建端口映射失败: " + err.Error()})
-		return
+		natEgressV4PoolID = &pid
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
-		"ids":       results[0].ID.String(),
-		"host_port": results[0].HostPort,
-		"task_ids":  tasks[0].ID.String(),
+	var natEgressV6PoolID *uuid.UUID
+	if req.NATEgressV6PoolID != "" {
+		pid, err := uuid.Parse(req.NATEgressV6PoolID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 IPv6 NAT 出口 EIP 池 ID"})
+			return
+		}
+		natEgressV6PoolID = &pid
+	}
+
+	bridge, task, err := networkService.CreateBridge(infrastructure.CreateBridgeRequest{
+		NodeID:            nodeID,
+		Name:              req.Name,
+		IPv4Enabled:       req.IPv4Enabled,
+		IPv4CIDR:          req.IPv4CIDR,
+		IPv4Gateway:       req.IPv4Gateway,
+		IPv6Enabled:       req.IPv6Enabled,
+		IPv6CIDR:          req.IPv6CIDR,
+		IPv6Gateway:       req.IPv6Gateway,
+		DNSServers:        req.DNSServers,
+		PortRangeStart:    req.PortRangeStart,
+		PortRangeEnd:      req.PortRangeEnd,
+		NATEgressV4PoolID: natEgressV4PoolID,
+		NATEgressV6PoolID: natEgressV6PoolID,
+		UserID:            userID.(uint),
 	})
-}
-
-// DeletePortMapping 删除端口映射
-func DeletePortMapping(c *gin.Context) {
-	pmID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的端口映射 ID"})
-		return
-	}
-
-	userID, _ := c.Get("user_id")
-	task, err := networkService.DeletePortMapping(pmID, userID.(uint))
-	if err != nil {
-		if err == service.ErrPortMappingNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "端口映射不存在"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "删除成功", "task_id": task.ID.String()})
-}
-
-// FirewallRuleInfo 防火墙规则信息
-type FirewallRuleInfo = infrastructure.FirewallRuleInfo
-
-// ListFirewallRules 获取防火墙规则列表
-func ListFirewallRules(c *gin.Context) {
-	instanceID := c.Query("instance_id")
-
-	result, err := networkService.ListFirewallRules(instanceID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
-	})
-}
-
-// AddFirewallRuleRequest 添加防火墙规则请求
-type AddFirewallRuleRequest struct {
-	InstanceID  string `json:"instance_id" binding:"required,uuid"`
-	Network     string `json:"network,omitempty"`
-	Direction   string `json:"direction" binding:"required,oneof=in out"`
-	Protocol    string `json:"protocol,omitempty"`
-	Port        string `json:"port,omitempty"`
-	SourceIP    string `json:"source_ip,omitempty"`
-	Action      string `json:"action" binding:"required,oneof=ACCEPT DROP"`
-	Description string `json:"description,omitempty"`
-	Priority    int    `json:"priority,omitempty"`
-}
-
-// AddFirewallRule 添加防火墙规则
-func AddFirewallRule(c *gin.Context) {
-	var req AddFirewallRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
-		return
-	}
-
-	instanceID, _ := uuid.Parse(req.InstanceID)
-	userID, _ := c.Get("user_id")
-
-	rule, task, err := networkService.AddFirewallRule(instanceID, req.Network, req.Direction, req.Protocol, req.Port, req.SourceIP, req.Action, req.Description, req.Priority, userID.(uint))
-	if err != nil {
-		if err == service.ErrInstanceNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建规则失败"})
-		return
-	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"id":      rule.ID.String(),
-		"task_id": task.ID.String(),
-	})
-}
-
-// UpdateFirewallRuleRequest 更新防火墙规则请求
-type UpdateFirewallRuleRequest struct {
-	Protocol    string `json:"protocol,omitempty"`
-	Port        string `json:"port,omitempty"`
-	SourceIP    string `json:"source_ip,omitempty"`
-	Action      string `json:"action,omitempty"`
-	Enabled     *bool  `json:"enabled,omitempty"`
-	Priority    int    `json:"priority,omitempty"`
-	Description string `json:"description,omitempty"`
-}
-
-// UpdateFirewallRule 更新防火墙规则
-func UpdateFirewallRule(c *gin.Context) {
-	ruleID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则 ID"})
-		return
-	}
-
-	var req UpdateFirewallRuleRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
-		return
-	}
-
-	if err := networkService.UpdateFirewallRule(ruleID, req.Protocol, req.Port, req.SourceIP, req.Action, req.Enabled, req.Priority, req.Description); err != nil {
-		if err == service.ErrFirewallRuleNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
-}
-
-// DeleteFirewallRule 删除防火墙规则
-func DeleteFirewallRule(c *gin.Context) {
-	ruleID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则 ID"})
-		return
-	}
-
-	userID, _ := c.Get("user_id")
-	task, err := networkService.DeleteFirewallRule(ruleID, userID.(uint))
-	if err != nil {
-		if err == service.ErrFirewallRuleNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "删除成功", "task_id": task.ID.String()})
-}
-
-// ============= VPC 网络管理 =============
-
-// CreateVPCRequest 创建 VPC 请求
-type CreateVPCRequest struct {
-	NodeID           string   `json:"node_id" binding:"required,uuid"`
-	Name             string   `json:"name" binding:"required"`
-	IPv4CIDR         string   `json:"ipv4_cidr" binding:"required"`
-	IPv6ULACIDR      string   `json:"ipv6_ula_cidr,omitempty"`
-	IPv6GUACIDR      string   `json:"ipv6_gua_cidr,omitempty"`
-	DefaultGatewayV4 string   `json:"default_gateway_v4,omitempty"`
-	DefaultGatewayV6 string   `json:"default_gateway_v6,omitempty"`
-	EgressV4Primary  string   `json:"egress_v4_primary,omitempty"`
-	EgressV4Extra    []string `json:"egress_v4_extra,omitempty"` // 独立公网 IP 地址池
-	PortRangeStart   int      `json:"port_range_start,omitempty"`
-	PortRangeEnd     int      `json:"port_range_end,omitempty"`
-	ParentIface      string   `json:"parent_iface,omitempty"`
-}
-
-// ListVPCs 获取 VPC 列表
-func ListVPCs(c *gin.Context) {
-	nodeID := c.Query("node_id")
-
-	vpcs, err := networkService.ListVPCs(nodeID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
-		return
-	}
-
-	result := make([]gin.H, 0, len(vpcs))
-	for _, v := range vpcs {
-		var extraArr []string
-		if v.EgressV4Extra != "" {
-			_ = json.Unmarshal([]byte(v.EgressV4Extra), &extraArr)
-		}
-		result = append(result, gin.H{
-			"id":                 v.ID.String(),
-			"node_id":            v.NodeID.String(),
-			"name":               v.Name,
-			"ipv4_cidr":          v.IPv4CIDR,
-			"ipv6_ula_cidr":      v.IPv6ULACIDR,
-			"ipv6_gua_cidr":      v.IPv6GUACIDR,
-			"default_gateway_v4": v.DefaultGatewayV4,
-			"default_gateway_v6": v.DefaultGatewayV6,
-			"egress_v4_primary":  v.EgressV4Primary,
-			"egress_v4_extra":    extraArr,
-			"port_range_start":   v.PortRangeStart,
-			"port_range_end":     v.PortRangeEnd,
-			"parent_iface":       v.ParentIface,
-			"status":             v.Status,
-			"bridge_name":        v.GetBridgeName(),
-			"snat_enabled":       v.SNATEnabled,
-			"ipv4_filter":        v.IPv4Filter,
-			"ipv6_filter":        v.IPv6Filter,
-			"mac_filter":         v.MACFilter,
-			"created_at":         v.CreatedAt,
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
-	})
-}
-
-// CreateVPC 创建 VPC
-func CreateVPC(c *gin.Context) {
-	var req CreateVPCRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
-		return
-	}
-
-	nodeID, _ := uuid.Parse(req.NodeID)
-	userID, _ := c.Get("user_id")
-
-	vpc, task, err := networkService.CreateVPC(nodeID, req.Name, req.IPv4CIDR, req.IPv6ULACIDR, req.IPv6GUACIDR, req.DefaultGatewayV4, req.DefaultGatewayV6, req.EgressV4Primary, req.EgressV4Extra, req.PortRangeStart, req.PortRangeEnd, req.ParentIface, userID.(uint))
 	if err != nil {
 		if err == service.ErrNodeNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
 			return
 		}
 		if err == service.ErrInvalidCIDR {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "IPv4 CIDR 格式无效"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "CIDR 格式无效"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建 VPC 失败"})
+		if err == service.ErrNodeNotConnected {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "节点未在线"})
+			return
+		}
+		if err == service.ErrBridgeCIDROverlap {
+			c.JSON(http.StatusConflict, gin.H{"error": "网桥 CIDR 与同节点其他网桥重叠"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"id":                 vpc.ID.String(),
-		"name":               vpc.Name,
-		"bridge_name":        vpc.GetBridgeName(),
-		"ipv4_cidr":          vpc.IPv4CIDR,
-		"default_gateway_v4": vpc.DefaultGatewayV4,
-		"task_id":            task.ID.String(),
-	})
+	resp := gin.H{"bridge": bridge}
+	if task != nil {
+		resp["task_id"] = task.ID.String()
+	}
+	c.JSON(http.StatusCreated, resp)
 }
 
-// GetVPC 获取 VPC 详情
-func GetVPC(c *gin.Context) {
-	vpcID, err := uuid.Parse(c.Param("id"))
+type updateBridgeRequest struct {
+	Name           *string   `json:"name"`
+	IPv4Enabled    *bool     `json:"ipv4_enabled"`
+	IPv4CIDR       *string   `json:"ipv4_cidr"`
+	IPv4Gateway    *string   `json:"ipv4_gateway"`
+	IPv6Enabled    *bool     `json:"ipv6_enabled"`
+	IPv6CIDR       *string   `json:"ipv6_cidr"`
+	IPv6Gateway    *string   `json:"ipv6_gateway"`
+	DNSServers     *[]string `json:"dns_servers"`
+	PortRangeStart *int      `json:"port_range_start"`
+	PortRangeEnd   *int      `json:"port_range_end"`
+	Status         *string   `json:"status"`
+}
+
+func UpdateBridge(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 VPC ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
 		return
 	}
-
-	vpc, err := networkService.GetVPC(vpcID)
+	var req updateBridgeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	userID, _ := c.Get("user_id")
+	err = networkService.UpdateBridge(id, infrastructure.UpdateBridgeRequest{
+		Name:           req.Name,
+		IPv4Enabled:    req.IPv4Enabled,
+		IPv4CIDR:       req.IPv4CIDR,
+		IPv4Gateway:    req.IPv4Gateway,
+		IPv6Enabled:    req.IPv6Enabled,
+		IPv6CIDR:       req.IPv6CIDR,
+		IPv6Gateway:    req.IPv6Gateway,
+		DNSServers:     req.DNSServers,
+		PortRangeStart: req.PortRangeStart,
+		PortRangeEnd:   req.PortRangeEnd,
+		Status:         req.Status,
+		UserID:         userID.(uint),
+	})
 	if err != nil {
-		if err == service.ErrVPCNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "VPC 不存在"})
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "网桥不存在"})
 			return
 		}
+		if err == service.ErrBridgeHasInstances {
+			c.JSON(http.StatusConflict, gin.H{"error": "网桥下存在实例，无法修改"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func DeleteBridge(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+	err = networkService.DeleteBridge(id, userID.(uint))
+	if err != nil {
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "网桥不存在"})
+			return
+		}
+		if err == service.ErrBridgeHasInstances {
+			c.JSON(http.StatusConflict, gin.H{"error": "网桥下存在实例，无法删除"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// =====================================================================
+// Bridge NAT 出口 IP 绑定
+// =====================================================================
+
+type bindEgressRequest struct {
+	PoolID    string `json:"pool_id" binding:"required"`
+	IPVersion string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+}
+
+func BindBridgeEgress(c *gin.Context) {
+	bridgeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
+		return
+	}
+	var req bindEgressRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	poolID, err := uuid.Parse(req.PoolID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 EIP 池 ID"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+	if err := networkService.BindBridgeEgress(bridgeID, poolID, req.IPVersion, userID.(uint)); err != nil {
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "网桥不存在"})
+			return
+		}
+		if err == service.ErrEIPPoolNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "EIP 资源池不存在"})
+			return
+		}
+		if err == service.ErrNoAvailableEIP {
+			c.JSON(http.StatusConflict, gin.H{"error": "资源池中无可用 EIP"})
+			return
+		}
+		if err == service.ErrEIPNotAvailable {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "EIP 不可用"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "绑定失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "绑定成功"})
+}
+
+type unbindEgressRequest struct {
+	IPVersion string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+}
+
+func UnbindBridgeEgress(c *gin.Context) {
+	bridgeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
+		return
+	}
+	var req unbindEgressRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	userID, _ := c.Get("user_id")
+	if err := networkService.UnbindBridgeEgress(bridgeID, req.IPVersion, userID.(uint)); err != nil {
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "网桥不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "解绑失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "解绑成功"})
+}
+
+// =====================================================================
+// EIP 资源池
+// =====================================================================
+
+func ListEIPPools(c *gin.Context) {
+	nodeID := c.Query("node_id")
+	pools, err := networkService.ListEIPPools(nodeID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
-
-	var extraArr []string
-	if vpc.EgressV4Extra != "" {
-		_ = json.Unmarshal([]byte(vpc.EgressV4Extra), &extraArr)
-	}
-	var instanceCount int64
-	db.DB.Model(&models.Instance{}).Where("vpc_id = ?", vpcID).Count(&instanceCount)
-
-	c.JSON(http.StatusOK, gin.H{
-		"id":                 vpc.ID.String(),
-		"node_id":            vpc.NodeID.String(),
-		"name":               vpc.Name,
-		"ipv4_cidr":          vpc.IPv4CIDR,
-		"ipv6_ula_cidr":      vpc.IPv6ULACIDR,
-		"ipv6_gua_cidr":      vpc.IPv6GUACIDR,
-		"default_gateway_v4": vpc.DefaultGatewayV4,
-		"default_gateway_v6": vpc.DefaultGatewayV6,
-		"egress_v4_primary":  vpc.EgressV4Primary,
-		"egress_v4_extra":    extraArr,
-		"port_range_start":   vpc.PortRangeStart,
-		"port_range_end":     vpc.PortRangeEnd,
-		"parent_iface":       vpc.ParentIface,
-		"status":             vpc.Status,
-		"bridge_name":        vpc.GetBridgeName(),
-		"snat_enabled":       vpc.SNATEnabled,
-		"ipv4_filter":        vpc.IPv4Filter,
-		"ipv6_filter":        vpc.IPv6Filter,
-		"mac_filter":         vpc.MACFilter,
-		"instance_count":     instanceCount,
-	})
+	c.JSON(http.StatusOK, gin.H{"data": pools})
 }
 
-// UpdateVPC 更新 VPC
-func UpdateVPC(c *gin.Context) {
-	vpcID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 VPC ID"})
-		return
-	}
+type createEIPPoolRequest struct {
+	NodeID    string `json:"node_id" binding:"required"`
+	IPVersion string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+	CIDR      string `json:"cidr" binding:"required"`
+	Interface string `json:"interface"`
+	Gateway   string `json:"gateway"`
+	Alias     string `json:"alias"`
+	PoolType  string `json:"pool_type"`
+}
 
-	var req struct {
-		Name             string   `json:"name,omitempty"`
-		IPv4CIDR         string   `json:"ipv4_cidr,omitempty"`
-		IPv6ULACIDR      string   `json:"ipv6_ula_cidr,omitempty"`
-		IPv6GUACIDR      string   `json:"ipv6_gua_cidr,omitempty"`
-		DefaultGatewayV4 string   `json:"default_gateway_v4,omitempty"`
-		DefaultGatewayV6 string   `json:"default_gateway_v6,omitempty"`
-		EgressV4Primary  string   `json:"egress_v4_primary,omitempty"`
-		EgressV4Extra    []string `json:"egress_v4_extra,omitempty"`
-		PortRangeStart   int      `json:"port_range_start,omitempty"`
-		PortRangeEnd     int      `json:"port_range_end,omitempty"`
-		ParentIface      string   `json:"parent_iface,omitempty"`
-		Status           string   `json:"status,omitempty"`
-		SNATEnabled      *bool    `json:"snat_enabled,omitempty"`
-		IPv4Filter       *bool    `json:"ipv4_filter,omitempty"`
-		MACFilter        *bool    `json:"mac_filter,omitempty"`
-	}
+func CreateEIPPool(c *gin.Context) {
+	var req createEIPPoolRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
 		return
 	}
-
-	userID, _ := c.Get("user_id")
-	task, err := networkService.UpdateVPC(vpcID, req.Name, req.IPv4CIDR, req.IPv6ULACIDR, req.IPv6GUACIDR, req.DefaultGatewayV4, req.DefaultGatewayV6, req.EgressV4Primary, req.EgressV4Extra, req.PortRangeStart, req.PortRangeEnd, req.ParentIface, req.Status, req.SNATEnabled, req.IPv4Filter, req.MACFilter, userID.(uint))
+	nodeID, err := uuid.Parse(req.NodeID)
 	if err != nil {
-		if err == service.ErrVPCNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "VPC 不存在"})
-			return
-		}
-		if err == service.ErrVPCHasInstances {
-			c.JSON(http.StatusConflict, gin.H{"error": "VPC 下存在实例，无法修改"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
+		return
+	}
+	userID, _ := c.Get("user_id")
+	pool, err := networkService.CreateEIPPool(infrastructure.CreateEIPPoolRequest{
+		NodeID:    nodeID,
+		IPVersion: req.IPVersion,
+		CIDR:      req.CIDR,
+		Interface: req.Interface,
+		Gateway:   req.Gateway,
+		Alias:     req.Alias,
+		PoolType:  req.PoolType,
+		UserID:    userID.(uint),
+	})
+	if err != nil {
+		if err == service.ErrNodeNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
 			return
 		}
 		if err == service.ErrInvalidCIDR {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "IPv4 CIDR 格式无效"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "CIDR 格式无效"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新失败"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建失败"})
 		return
 	}
-
-	if task == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "无需更新"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "更新成功", "task_id": task.ID.String()})
+	c.JSON(http.StatusCreated, pool)
 }
 
-// DeleteVPC 删除 VPC
-func DeleteVPC(c *gin.Context) {
-	vpcID, err := uuid.Parse(c.Param("id"))
+func DeleteEIPPool(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 VPC ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的资源池 ID"})
 		return
 	}
+	if err := networkService.DeleteEIPPool(id); err != nil {
+		if err == service.ErrEIPPoolHasAllocations {
+			c.JSON(http.StatusConflict, gin.H{"error": "资源池中存在已分配的 EIP，无法删除"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
 
-	userID, _ := c.Get("user_id")
-	task, err := networkService.DeleteVPC(vpcID, userID.(uint))
+// =====================================================================
+// EIP 分配
+// =====================================================================
+
+func ListEIPAllocations(c *gin.Context) {
+	nodeID := c.Query("node_id")
+	instanceID := c.Query("instance_id")
+	allocs, err := networkService.ListEIPAllocations(nodeID, instanceID)
 	if err != nil {
-		if err == service.ErrVPCNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "VPC 不存在"})
-			return
-		}
-		if err == service.ErrVPCHasInstances {
-			c.JSON(http.StatusConflict, gin.H{"error": "该 VPC 下存在实例，无法删除"})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "删除成功", "task_id": task.ID.String()})
+	c.JSON(http.StatusOK, gin.H{"data": allocs})
 }
+
+type allocateEIPRequest struct {
+	NodeID     string `json:"node_id" binding:"required"`
+	IPVersion  string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+	PrefixLen  int    `json:"prefix_len"`
+	SpecificIP string `json:"specific_ip"`
+}
+
+func AllocateEIP(c *gin.Context) {
+	var req allocateEIPRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	nodeID, err := uuid.Parse(req.NodeID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
+		return
+	}
+	alloc, err := networkService.AllocateEIP(nodeID, req.IPVersion, req.PrefixLen, req.SpecificIP)
+	if err != nil {
+		if err == service.ErrNoAvailableEIP {
+			c.JSON(http.StatusConflict, gin.H{"error": "资源池中无可用 EIP"})
+			return
+		}
+		if err == service.ErrEIPAlreadyAssigned {
+			c.JSON(http.StatusConflict, gin.H{"error": "EIP 已分配"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "分配失败"})
+		return
+	}
+	c.JSON(http.StatusCreated, alloc)
+}
+
+type assignEIPRequest struct {
+	InstanceID string `json:"instance_id" binding:"required"`
+}
+
+func AssignEIPToInstance(c *gin.Context) {
+	allocID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 EIP 分配 ID"})
+		return
+	}
+	var req assignEIPRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	instanceID, err := uuid.Parse(req.InstanceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的实例 ID"})
+		return
+	}
+	if err := networkService.AssignEIPToInstance(allocID, instanceID); err != nil {
+		if err == service.ErrEIPAllocationNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "EIP 分配记录不存在"})
+			return
+		}
+		if err == service.ErrEIPNotAvailable {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "EIP 不可用"})
+			return
+		}
+		if err == service.ErrInstanceNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+			return
+		}
+		if err == service.ErrInstanceNoBridge {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "实例未关联网桥"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "分配失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "分配成功"})
+}
+
+func ReleaseEIP(c *gin.Context) {
+	allocID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 EIP 分配 ID"})
+		return
+	}
+	if err := networkService.ReleaseInstanceEIP(allocID); err != nil {
+		if err == service.ErrEIPAllocationNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "EIP 分配记录不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "释放失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "释放成功"})
+}
+
+// =====================================================================
+// 端口映射
+// =====================================================================
+
+func ListPortMappings(c *gin.Context) {
+	instanceID := c.Query("instance_id")
+	mappings, err := networkService.ListPortMappings(instanceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": mappings})
+}
+
+type addPortMappingRequest struct {
+	InstanceID    string `json:"instance_id" binding:"required"`
+	ContainerPort int    `json:"container_port" binding:"required,min=1,max=65535"`
+	Protocol      string `json:"protocol" binding:"required,oneof=tcp udp"`
+	IPVersion     string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+	Description   string `json:"description"`
+}
+
+func AddPortMapping(c *gin.Context) {
+	var req addPortMappingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	instanceID, err := uuid.Parse(req.InstanceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的实例 ID"})
+		return
+	}
+	pm, err := networkService.AddPortMapping(instanceID, req.ContainerPort, req.Protocol, req.IPVersion, req.Description)
+	if err != nil {
+		if err == service.ErrInstanceNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+			return
+		}
+		if err == service.ErrInstanceNoBridge {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "实例未关联网桥"})
+			return
+		}
+		if err == service.ErrNoBridgeEgressIP {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "网桥未配置 NAT 出口 IP"})
+			return
+		}
+		if err == service.ErrNoAvailablePorts {
+			c.JSON(http.StatusConflict, gin.H{"error": "网桥端口范围内无可用端口"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "添加失败"})
+		return
+	}
+	c.JSON(http.StatusCreated, pm)
+}
+
+func DeletePortMapping(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的端口映射 ID"})
+		return
+	}
+	if err := networkService.DeletePortMapping(id); err != nil {
+		if err == service.ErrPortMappingNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "端口映射不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// =====================================================================
+// 防火墙规则
+// =====================================================================
+
+func ListFirewallRules(c *gin.Context) {
+	instanceID := c.Query("instance_id")
+	rules, err := networkService.ListFirewallRules(instanceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rules})
+}
+
+type addFirewallRuleRequest struct {
+	InstanceID  string `json:"instance_id" binding:"required"`
+	Network     string `json:"network" binding:"required,oneof=ipv4 ipv6"`
+	Direction   string `json:"direction" binding:"required,oneof=inbound outbound"`
+	Protocol    string `json:"protocol"`
+	Port        string `json:"port"`
+	SourceIP    string `json:"source_ip"`
+	Action      string `json:"action" binding:"required,oneof=allow drop"`
+	Description string `json:"description"`
+	Priority    int    `json:"priority"`
+}
+
+func AddFirewallRule(c *gin.Context) {
+	var req addFirewallRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+	instanceID, err := uuid.Parse(req.InstanceID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的实例 ID"})
+		return
+	}
+	rule, err := networkService.AddFirewallRule(instanceID, req.Network, req.Direction, req.Protocol, req.Port, req.SourceIP, req.Action, req.Description, req.Priority)
+	if err != nil {
+		if err == service.ErrInstanceNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "添加失败"})
+		return
+	}
+	c.JSON(http.StatusCreated, rule)
+}
+
+func UpdateFirewallRule(c *gin.Context) {
+	c.JSON(http.StatusNotImplemented, gin.H{"error": "暂不支持"})
+}
+
+func DeleteFirewallRule(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则 ID"})
+		return
+	}
+	if err := networkService.DeleteFirewallRule(id); err != nil {
+		if err == service.ErrFirewallRuleNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// =====================================================================
+//  工具方法
+// =====================================================================

@@ -1,12 +1,10 @@
 package instance
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"net"
 	"strings"
 	"time"
 
@@ -14,9 +12,12 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"tsukiyo/master/internal/agent"
+	"tsukiyo/master/internal/console"
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/models"
 	"tsukiyo/master/internal/service"
+	"tsukiyo/master/internal/service/infrastructure"
 )
 
 var (
@@ -25,22 +26,23 @@ var (
 	ErrNodeOffline        = service.ErrNodeOffline
 	ErrInvalidNodeID      = service.ErrInvalidNodeID
 	ErrImageNotDownloaded = service.ErrImageNotDownloaded
-	ErrInvalidVPCID       = service.ErrInvalidVPCID
-	ErrVPCNotFound        = service.ErrVPCNotFound
+	ErrInvalidBridgeID    = service.ErrInvalidBridgeID
+	ErrBridgeNotFound     = service.ErrBridgeNotFound
 	ErrUserNotFound       = service.ErrUserNotFound
 	ErrInstanceNameExists = service.ErrInstanceNameExists
-	ErrInvalidIPv4ID      = service.ErrInvalidIPv4ID
-	ErrIPv4NotAvailable   = service.ErrIPv4NotAvailable
-	ErrInvalidIPv6ID      = service.ErrInvalidIPv6ID
-	ErrIPv6NotFound       = service.ErrIPv6NotFound
+	ErrInstanceNoBridge   = service.ErrInstanceNoBridge
+	ErrNoBridgeEgressIP   = service.ErrNoBridgeEgressIP
 )
 
 // InstanceService 实例服务
-type InstanceService struct{}
+type InstanceService struct {
+	networkSvc *infrastructure.NetworkService
+	agentMgr   *agent.Manager
+}
 
 // NewInstanceService 创建实例服务
-func NewInstanceService() *InstanceService {
-	return &InstanceService{}
+func NewInstanceService(networkSvc *infrastructure.NetworkService, agentMgr *agent.Manager) *InstanceService {
+	return &InstanceService{networkSvc: networkSvc, agentMgr: agentMgr}
 }
 
 // DataDiskRequest 数据磁盘请求
@@ -51,51 +53,35 @@ type DataDiskRequest struct {
 	MountPoint  string `json:"mount_point,omitempty"`
 }
 
-// NATRequest NAT 请求
-type NATRequest struct {
-	InternalIP   string `json:"internal_ip" binding:"required,ip"`
-	ExternalIP   string `json:"external_ip,omitempty"`
-	InternalPort int    `json:"internal_port,omitempty"`
-	ExternalPort int    `json:"external_port,omitempty"`
-	Protocol     string `json:"protocol,omitempty"`
-	Description  string `json:"description,omitempty"`
-}
-
 // CreateInstanceRequest 创建实例请求
 type CreateInstanceRequest struct {
-	Name               string            `json:"name" binding:"required"`
-	Type               string            `json:"type" binding:"required,oneof=container vm"`
-	TemplateID         string            `json:"template_id" binding:"required"`
-	ImageKey           string            `json:"image_key,omitempty"`
-	NodeID             string            `json:"node_id" binding:"required"`
-	VPCID              string            `json:"vpc_id,omitempty"`
-	AssignToUserID     uint              `json:"assign_to_user_id" binding:"required"`
-	LoginMethod        string            `json:"login_method" binding:"required,oneof=auto password sshkey"`
-	VCPU               float64           `json:"vcpu" binding:"required,min=0.1"`
-	MemoryMB           int               `json:"memory_mb" binding:"required,min=64"`
-	DiskGB             int               `json:"disk_gb" binding:"required,min=1"`
-	StoragePool        string            `json:"storage_pool,omitempty"`
-	DataDisks          []DataDiskRequest `json:"data_disks,omitempty"`
-	PublicIPv4ID       string            `json:"public_ipv4_id,omitempty"`
-	PublicIPv6PrefixID string            `json:"public_ipv6_prefix_id,omitempty"`
-	NATs               []NATRequest      `json:"nats,omitempty"`
-	AssignNAT          *bool             `json:"assign_nat,omitempty"`
-	PortMappingCount   int               `json:"port_mapping_count,omitempty"`
-	ExtraPorts         []int             `json:"extra_ports,omitempty"`
-	AssignIPv4         bool              `json:"assign_ipv4,omitempty"`
-	IPv4Count          int               `json:"ipv4_count,omitempty"`
-	AssignIPv6         bool              `json:"assign_ipv6,omitempty"`
-	IPv6Count          int               `json:"ipv6_count,omitempty"`
-	NetworkDownMbps    int               `json:"network_down_mbps,omitempty"`
-	NetworkUpMbps      int               `json:"network_up_mbps,omitempty"`
-	IOReadMBps         int               `json:"io_read_mbps,omitempty"`
-	IOWriteMBps        int               `json:"io_write_mbps,omitempty"`
-	SSHPassword        string            `json:"ssh_password,omitempty"`
-	SSHPublicKey       string            `json:"ssh_public_key,omitempty"`
-	MonthlyTrafficGB   int64             `json:"monthly_traffic_gb,omitempty"`
-	TrafficMode        string            `json:"traffic_mode,omitempty"`
-	SnapshotLimit      int               `json:"snapshot_limit,omitempty"`
-	ExpiresAt          *time.Time        `json:"expires_at,omitempty"`
+	Name             string            `json:"name" binding:"required"`
+	Type             string            `json:"type" binding:"required,oneof=container vm"`
+	TemplateID       string            `json:"template_id" binding:"required"`
+	ImageKey         string            `json:"image_key,omitempty"`
+	NodeID           string            `json:"node_id" binding:"required"`
+	BridgeID         string            `json:"bridge_id,omitempty"`
+	AssignToUserID   uint              `json:"assign_to_user_id" binding:"required"`
+	LoginMethod      string            `json:"login_method" binding:"required,oneof=auto password sshkey"`
+	VCPU             float64           `json:"vcpu" binding:"required,min=0.1"`
+	MemoryMB         int               `json:"memory_mb" binding:"required,min=64"`
+	DiskGB           int               `json:"disk_gb" binding:"required,min=1"`
+	StoragePool      string            `json:"storage_pool,omitempty"`
+	DataDisks        []DataDiskRequest `json:"data_disks,omitempty"`
+	AssignEIPv4      bool              `json:"assign_eip_ipv4,omitempty"`
+	AssignEIPv6      bool              `json:"assign_eip_ipv6,omitempty"`
+	PortMappingCount int               `json:"port_mapping_count,omitempty"`
+	ExtraPorts       []int             `json:"extra_ports,omitempty"`
+	NetworkDownMbps  int               `json:"network_down_mbps,omitempty"`
+	NetworkUpMbps    int               `json:"network_up_mbps,omitempty"`
+	IOReadMBps       int               `json:"io_read_mbps,omitempty"`
+	IOWriteMBps      int               `json:"io_write_mbps,omitempty"`
+	SSHPassword      string            `json:"ssh_password,omitempty"`
+	SSHPublicKey     string            `json:"ssh_public_key,omitempty"`
+	MonthlyTrafficGB int64             `json:"monthly_traffic_gb,omitempty"`
+	TrafficMode      string            `json:"traffic_mode,omitempty"`
+	SnapshotLimit    int               `json:"snapshot_limit,omitempty"`
+	ExpiresAt        *time.Time        `json:"expires_at,omitempty"`
 }
 
 // CreateInstance 创建实例
@@ -127,25 +113,34 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		}
 	}
 
-	// 检查 VPC
-	var vpc *models.VPCNetwork
+	// 检查网桥
+	var bridge *models.Bridge
 	var internalIPv4 string
-	if req.VPCID != "" {
-		vpcID, err := uuid.Parse(req.VPCID)
+	var internalIPv6 string
+	if req.BridgeID != "" {
+		bridgeID, err := uuid.Parse(req.BridgeID)
 		if err != nil {
-			return nil, nil, ErrInvalidVPCID
+			return nil, nil, ErrInvalidBridgeID
 		}
-		var vpcNet models.VPCNetwork
-		if err := db.DB.Where("id = ? AND node_id = ?", vpcID, nodeID).First(&vpcNet).Error; err != nil {
-			return nil, nil, ErrVPCNotFound
+		var bridgeNet models.Bridge
+		if err := db.DB.Where("id = ? AND node_id = ?", bridgeID, nodeID).First(&bridgeNet).Error; err != nil {
+			return nil, nil, ErrBridgeNotFound
 		}
-		vpc = &vpcNet
+		bridge = &bridgeNet
 
-		ip, err := allocateIPFromVPC(vpc.ID, nodeID, vpc.IPv4CIDR, vpc.DefaultGatewayV4)
-		if err != nil {
-			return nil, nil, fmt.Errorf("VPC 内网 IP 分配失败: %w", err)
+		if bridge.IPv4Enabled {
+			ip, err := s.networkSvc.AllocateInternalIP(bridge.ID, nodeID, bridge.IPv4CIDR, bridge.IPv4Gateway, "ipv4")
+			if err != nil {
+				return nil, nil, fmt.Errorf("网桥内网 IPv4 分配失败: %w", err)
+			}
+			internalIPv4 = ip
 		}
-		internalIPv4 = ip
+		if bridge.IPv6Enabled {
+			ip, err := s.networkSvc.AllocateInternalIP(bridge.ID, nodeID, bridge.IPv6CIDR, bridge.IPv6Gateway, "ipv6")
+			if err == nil {
+				internalIPv6 = ip
+			}
+		}
 	}
 
 	// 验证目标用户存在
@@ -171,6 +166,11 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		sshPassword = GenerateRandomPassword(16)
 	}
 
+	portMappingLimit := req.PortMappingCount
+	if portMappingLimit <= 0 {
+		portMappingLimit = 2
+	}
+
 	instance := models.Instance{
 		ID:               instanceID,
 		Name:             req.Name,
@@ -181,6 +181,7 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		IncusName:        incusName,
 		TemplateID:       req.TemplateID,
 		InternalIPv4:     internalIPv4,
+		InternalIPv6:     internalIPv6,
 		VCPU:             req.VCPU,
 		MemoryMB:         req.MemoryMB,
 		DiskGB:           req.DiskGB,
@@ -194,9 +195,10 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		IOWriteMBps:      req.IOWriteMBps,
 		MonthlyTrafficGB: req.MonthlyTrafficGB,
 		SnapshotLimit:    req.SnapshotLimit,
+		PortMappingLimit: portMappingLimit,
 	}
-	if vpc != nil {
-		instance.VPCID = &vpc.ID
+	if bridge != nil {
+		instance.BridgeID = &bridge.ID
 	}
 
 	if req.TrafficMode != "" {
@@ -206,43 +208,37 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		instance.ExpiresAt = req.ExpiresAt
 	}
 
-	// 处理公网 IPv4
-	if req.PublicIPv4ID != "" {
-		ipv4ID, err := uuid.Parse(req.PublicIPv4ID)
-		if err != nil {
-			return nil, nil, ErrInvalidIPv4ID
+	// 分配 EIP
+	if req.AssignEIPv4 && bridge != nil {
+		alloc, err := s.networkSvc.AllocateEIP(nodeID, "ipv4", 32, "")
+		if err == nil {
+			instance.IPv4EIPAllocationID = &alloc.ID
+			instance.IPv4Mode = "eip"
+		} else {
+			zap.L().Warn("分配 IPv4 EIP 失败（非致命）", zap.Error(err))
 		}
-		var ip models.PublicIPPool
-		if err := db.DB.Where("id = ? AND node_id = ? AND status = ?", ipv4ID, nodeID, models.IPStatusFree).First(&ip).Error; err != nil {
-			return nil, nil, ErrIPv4NotAvailable
-		}
-		instance.PublicIPv4ID = &ipv4ID
-		instance.IPv4Address = &ip.Address
-		now := time.Now()
-		db.DB.Model(&ip).Updates(map[string]interface{}{
-			"status":      models.IPStatusAssigned,
-			"instance_id": instanceID,
-			"assigned_at": &now,
-		})
 	}
-
-	// 处理公网 IPv6 前缀
-	if req.PublicIPv6PrefixID != "" {
-		ipv6ID, err := uuid.Parse(req.PublicIPv6PrefixID)
-		if err != nil {
-			return nil, nil, ErrInvalidIPv6ID
+	if req.AssignEIPv6 && bridge != nil {
+		alloc, err := s.networkSvc.AllocateEIP(nodeID, "ipv6", 128, "")
+		if err == nil {
+			instance.IPv6EIPAllocationID = &alloc.ID
+			instance.IPv6Mode = "eip"
+		} else {
+			zap.L().Warn("分配 IPv6 EIP 失败（非致命）", zap.Error(err))
 		}
-		var prefix models.IPv6Prefix
-		if err := db.DB.Where("id = ? AND node_id = ?", ipv6ID, nodeID).First(&prefix).Error; err != nil {
-			return nil, nil, ErrIPv6NotFound
-		}
-		instance.PublicIPv6PrefixID = &ipv6ID
-		instance.IPv6Address = &prefix.Prefix
 	}
 
 	if err := db.DB.Create(&instance).Error; err != nil {
 		zap.L().Error("创建实例失败", zap.Error(err))
 		return nil, nil, err
+	}
+
+	// 关联 EIP 分配记录
+	if instance.IPv4EIPAllocationID != nil {
+		s.networkSvc.AssignEIPToInstance(*instance.IPv4EIPAllocationID, instanceID)
+	}
+	if instance.IPv6EIPAllocationID != nil {
+		s.networkSvc.AssignEIPToInstance(*instance.IPv6EIPAllocationID, instanceID)
 	}
 
 	// 创建数据磁盘
@@ -262,76 +258,80 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 		db.DB.Create(&disk)
 	}
 
-	// 创建 NAT 配置
-	for _, nat := range req.NATs {
-		natCfg := models.NATConfig{
-			ID:           uuid.New(),
-			InstanceID:   instanceID,
-			NodeID:       nodeID,
-			InternalIP:   nat.InternalIP,
-			ExternalIP:   nat.ExternalIP,
-			InternalPort: nat.InternalPort,
-			ExternalPort: nat.ExternalPort,
-			Protocol:     nat.Protocol,
-			Description:  nat.Description,
+	// Master 集中分配端口映射（创建实例时只自动分配 SSH）
+	// 由 Master 分配端口，写入数据库后把完整映射列表下发给 Agent
+	var assignedPortMappings []map[string]interface{}
+
+	if bridge != nil {
+		ipVersion := "ipv4"
+		if bridge.IPv4Enabled {
+			ipVersion = "ipv4"
+		} else if bridge.IPv6Enabled {
+			ipVersion = "ipv6"
 		}
-		if natCfg.Protocol == "" {
-			natCfg.Protocol = "tcp"
+		mappings, err := s.networkSvc.AllocatePortMappingsForInstance(
+			instanceID, bridge.ID, nodeID, 0, req.ExtraPorts, ipVersion,
+		)
+		if err != nil {
+			zap.L().Warn("分配端口映射失败（非致命）", zap.Error(err))
+		} else {
+			for _, pm := range mappings {
+				var egressAlloc models.EIPAllocation
+				if err := db.DB.Where("id = ?", pm.EgressAllocationID).First(&egressAlloc).Error; err != nil {
+					zap.L().Error("查询 NAT 出口 EIP 分配记录失败", zap.String("egress_alloc_id", pm.EgressAllocationID.String()), zap.Error(err))
+					return nil, nil, fmt.Errorf("查询 NAT 出口 EIP 分配记录失败: %w", err)
+				}
+				hostIP := egressAlloc.GetIP()
+				if hostIP == "" {
+					return nil, nil, fmt.Errorf("NAT 出口 EIP 分配记录 CIDR 为空, alloc_id=%s", egressAlloc.ID.String())
+				}
+				assignedPortMappings = append(assignedPortMappings, map[string]interface{}{
+					"host_port":      pm.HostPort,
+					"container_port": pm.ContainerPort,
+					"protocol":       pm.Protocol,
+					"host_ip":        hostIP,
+					"description":    pm.Description,
+				})
+			}
 		}
-		db.DB.Create(&natCfg)
 	}
 
-	// 确定 NAT 分配策略
-	wantsNAT := true
-	if req.AssignNAT != nil {
-		wantsNAT = *req.AssignNAT
-	}
-	portMappingCount := req.PortMappingCount
-	if wantsNAT && portMappingCount < 1 {
-		portMappingCount = 2
-	}
-	if !wantsNAT {
-		portMappingCount = 0
-	}
-
-	// 创建任务
 	taskPayload := map[string]interface{}{
-		"instance_id":        instance.IncusName,
-		"type":               instance.Type,
-		"template_id":        instance.TemplateID,
-		"vcpu":               instance.VCPU,
-		"memory_mb":          instance.MemoryMB,
-		"disk_gb":            instance.DiskGB,
-		"storage_pool":       instance.StoragePool,
-		"login_method":       instance.LoginMethod,
-		"ssh_password":       instance.SSHPassword,
-		"ssh_public_key":     instance.SSHPublicKey,
-		"network_down":       instance.NetworkDownMbps,
-		"network_up":         instance.NetworkUpMbps,
-		"io_read":            instance.IOReadMBps,
-		"io_write":           instance.IOWriteMBps,
-		"data_disks":         req.DataDisks,
-		"nats":               req.NATs,
-		"assign_nat":         wantsNAT,
-		"port_mapping_count": portMappingCount,
-		"traffic_mode":       instance.TrafficMode,
-		"monthly_traffic":    instance.MonthlyTrafficGB,
-		"snapshot_limit":     instance.SnapshotLimit,
+		"instance_id":     instance.IncusName,
+		"type":            instance.Type,
+		"template_id":     instance.TemplateID,
+		"vcpu":            instance.VCPU,
+		"memory_mb":       instance.MemoryMB,
+		"disk_gb":         instance.DiskGB,
+		"storage_pool":    instance.StoragePool,
+		"login_method":    instance.LoginMethod,
+		"ssh_password":    instance.SSHPassword,
+		"ssh_public_key":  instance.SSHPublicKey,
+		"network_down":    instance.NetworkDownMbps,
+		"network_up":      instance.NetworkUpMbps,
+		"io_read":         instance.IOReadMBps,
+		"io_write":        instance.IOWriteMBps,
+		"data_disks":      req.DataDisks,
+		"traffic_mode":    instance.TrafficMode,
+		"monthly_traffic": instance.MonthlyTrafficGB,
+		"snapshot_limit":  instance.SnapshotLimit,
+		"port_mappings":   assignedPortMappings,
+		"image_source":    node.ImageRemoteURL,
 	}
-	if vpc != nil {
-		taskPayload["vpc_id"] = vpc.ID.String()
+	if bridge != nil {
+		taskPayload["bridge_id"] = bridge.ID.String()
+		taskPayload["bridge_name"] = bridge.BridgeName
 		taskPayload["internal_ipv4"] = internalIPv4
-		taskPayload["gateway_v4"] = vpc.DefaultGatewayV4
-		taskPayload["ipv4_cidr"] = vpc.IPv4CIDR
-		taskPayload["bridge_name"] = vpc.GetBridgeName()
-		taskPayload["ipv4_filter"] = vpc.IPv4Filter
-		taskPayload["mac_filter"] = vpc.MACFilter
-		egressV4 := vpc.EgressV4Primary
-		if idx := strings.Index(egressV4, "/"); idx > 0 {
-			egressV4 = egressV4[:idx]
-		}
-		taskPayload["egress_v4_primary"] = egressV4
-		taskPayload["parent_iface"] = vpc.ParentIface
+		taskPayload["internal_ipv6"] = internalIPv6
+		taskPayload["gateway_v4"] = bridge.IPv4Gateway
+		taskPayload["gateway_v6"] = bridge.IPv6Gateway
+		taskPayload["ipv4_cidr"] = bridge.IPv4CIDR
+		taskPayload["ipv6_cidr"] = bridge.IPv6CIDR
+		taskPayload["ipv4_enabled"] = bridge.IPv4Enabled
+		taskPayload["ipv6_enabled"] = bridge.IPv6Enabled
+		var dnsServers []string
+		json.Unmarshal(bridge.DNSServers, &dnsServers)
+		taskPayload["dns_servers"] = dnsServers
 	}
 
 	payloadBytes, _ := json.Marshal(taskPayload)
@@ -350,43 +350,6 @@ func (s *InstanceService) CreateInstance(req CreateInstanceRequest) (*models.Ins
 	}
 
 	return &instance, &task, nil
-}
-
-// allocateIPFromVPC 从 VPC CIDR 分配 IP
-func allocateIPFromVPC(vpcID, nodeID uuid.UUID, cidr, gateway string) (string, error) {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return "", err
-	}
-
-	// 获取已分配的 IP
-	var allocated []string
-	db.DB.Model(&models.Instance{}).Where("vpc_id = ? AND node_id = ? AND internal_ipv4 != ?", vpcID, nodeID, "").Pluck("internal_ipv4", &allocated)
-
-	allocatedSet := make(map[string]struct{})
-	for _, ip := range allocated {
-		allocatedSet[ip] = struct{}{}
-	}
-
-	// 排除网关
-	if gateway != "" {
-		allocatedSet[gateway] = struct{}{}
-	}
-
-	// 从 .2 开始分配
-	ip := ipNet.IP
-	ip[len(ip)-1] = 2
-
-	for ipNet.Contains(ip) {
-		ipStr := ip.String()
-		if _, exists := allocatedSet[ipStr]; !exists {
-			return ipStr, nil
-		}
-		// 增加最后一个字节
-		ip[len(ip)-1]++
-	}
-
-	return "", fmt.Errorf("VPC 内网 IP 已耗尽")
 }
 
 // GenerateRandomPassword 生成随机密码（crypto/rand 真随机，大小写字母+数字）
@@ -421,7 +384,6 @@ func (s *InstanceService) GetInstance(instanceID uuid.UUID) (*models.Instance, e
 
 	// 加载关联数据
 	db.DB.Model(&instance).Association("DataDisks").Find(&instance.DataDisks)
-	db.DB.Model(&instance).Association("NATConfigs").Find(&instance.NATConfigs)
 	db.DB.Model(&instance).Association("PortMappings").Find(&instance.PortMappings)
 
 	return &instance, nil
@@ -479,9 +441,19 @@ func (s *InstanceService) DeleteInstance(instanceID uuid.UUID, userID uint) (*mo
 		return nil, err
 	}
 
+	if instance.Status == models.InstanceStatusDeleting {
+		return nil, service.ErrInstanceBusy
+	}
+
+	oldStatus := string(instance.Status)
+
+	if err := db.DB.Model(&instance).Update("status", models.InstanceStatusDeleting).Error; err != nil {
+		return nil, fmt.Errorf("更新实例状态为 deleting 失败: %w", err)
+	}
+
 	payloadBytes, _ := json.Marshal(map[string]interface{}{
 		"instance_id": instance.IncusName,
-		"old_status":  string(instance.Status),
+		"old_status":  oldStatus,
 	})
 
 	task := models.Task{
@@ -495,7 +467,8 @@ func (s *InstanceService) DeleteInstance(instanceID uuid.UUID, userID uint) (*mo
 	}
 
 	if err := db.DB.Create(&task).Error; err != nil {
-		zap.L().Error("创建删除实例任务失败", zap.Error(err))
+		db.DB.Model(&instance).Update("status", oldStatus)
+		return nil, fmt.Errorf("创建删除实例任务失败: %w", err)
 	}
 
 	return &task, nil
@@ -594,8 +567,16 @@ func (s *InstanceService) RestartInstance(instanceID uuid.UUID, userID uint) (*m
 	return &task, nil
 }
 
+// ReinstallInstanceRequest 重装请求参数
+type ReinstallInstanceRequest struct {
+	TemplateID  string `json:"template_id"`
+	Password    string `json:"password"`
+	SSHKey      string `json:"ssh_key"`
+	LoginMethod string `json:"login_method"`
+}
+
 // ReinstallInstance 重装实例
-func (s *InstanceService) ReinstallInstance(instanceID uuid.UUID, userID uint) (*models.Task, error) {
+func (s *InstanceService) ReinstallInstance(instanceID uuid.UUID, userID uint, req ReinstallInstanceRequest) (*models.Task, error) {
 	var instance models.Instance
 	if err := db.DB.Where("id = ?", instanceID).First(&instance).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -604,8 +585,38 @@ func (s *InstanceService) ReinstallInstance(instanceID uuid.UUID, userID uint) (
 		return nil, err
 	}
 
+	if instance.Status == models.InstanceStatusReinstalling || instance.Status == models.InstanceStatusDeleting {
+		return nil, service.ErrInstanceBusy
+	}
+
+	templateID := req.TemplateID
+	if templateID == "" {
+		templateID = instance.TemplateID
+	}
+
+	password := req.Password
+	if password == "" {
+		password = instance.SSHPassword
+	}
+
+	loginMethod := req.LoginMethod
+	if loginMethod == "" {
+		loginMethod = string(instance.LoginMethod)
+	}
+
+	oldStatus := string(instance.Status)
+
+	if err := db.DB.Model(&instance).Update("status", models.InstanceStatusReinstalling).Error; err != nil {
+		return nil, fmt.Errorf("更新实例状态为 reinstalling 失败: %w", err)
+	}
+
 	payloadBytes, _ := json.Marshal(map[string]interface{}{
-		"instance_id": instance.IncusName,
+		"instance_id":  instance.IncusName,
+		"template_id":  templateID,
+		"password":     password,
+		"ssh_key":      req.SSHKey,
+		"login_method": loginMethod,
+		"old_status":   oldStatus,
 	})
 
 	task := models.Task{
@@ -619,7 +630,8 @@ func (s *InstanceService) ReinstallInstance(instanceID uuid.UUID, userID uint) (
 	}
 
 	if err := db.DB.Create(&task).Error; err != nil {
-		zap.L().Error("创建重装实例任务失败", zap.Error(err))
+		db.DB.Model(&instance).Update("status", oldStatus)
+		return nil, fmt.Errorf("创建重装实例任务失败: %w", err)
 	}
 
 	return &task, nil
@@ -656,7 +668,7 @@ func (s *InstanceService) ResizeInstance(instanceID uuid.UUID, userID uint) (*mo
 	return &task, nil
 }
 
-// ResetInstancePassword 重置密码
+// ResetInstancePassword 重置密码（同步调用 Agent，成功后才更新 DB）
 func (s *InstanceService) ResetInstancePassword(instanceID uuid.UUID, password string) error {
 	var instance models.Instance
 	if err := db.DB.Where("id = ?", instanceID).First(&instance).Error; err != nil {
@@ -666,15 +678,36 @@ func (s *InstanceService) ResetInstancePassword(instanceID uuid.UUID, password s
 		return err
 	}
 
-	// 更新数据库中的密码
+	if s.agentMgr == nil {
+		return service.ErrAgentManagerNotInitialized
+	}
+
+	if !s.agentMgr.IsNodeConnected(instance.NodeID) {
+		return service.ErrNodeNotConnected
+	}
+
+	_, err := s.agentMgr.SendRequest(instance.NodeID, "reset_password", map[string]string{
+		"instance_id": instance.IncusName,
+		"password":    password,
+	}, 15*time.Second)
+	if err != nil {
+		if strings.Contains(err.Error(), "超时") {
+			return service.ErrOperationTimeout
+		}
+		return fmt.Errorf("Agent 重置密码失败: %w", err)
+	}
+
 	if err := db.DB.Model(&instance).Update("ssh_password", password).Error; err != nil {
-		return err
+		zap.L().Error("密码已在 Agent 重置但 DB 更新失败",
+			zap.String("instance_id", instanceID.String()),
+			zap.Error(err))
+		return fmt.Errorf("Agent 已重置密码但数据库更新失败: %w", err)
 	}
 
 	return nil
 }
 
-// GetInstanceConsole 获取控制台 URL
+// GetInstanceConsole 获取控制台直连信息（返回 Agent 地址 + Token，前端直连 Agent）
 func (s *InstanceService) GetInstanceConsole(instanceID uuid.UUID, consoleType string) (map[string]interface{}, error) {
 	var instance models.Instance
 	if err := db.DB.Where("id = ?", instanceID).First(&instance).Error; err != nil {
@@ -685,29 +718,59 @@ func (s *InstanceService) GetInstanceConsole(instanceID uuid.UUID, consoleType s
 	}
 
 	if consoleType == "" {
-		consoleType = "vnc"
+		consoleType = "ssh"
 	}
-
 	if consoleType != "vnc" && consoleType != "ssh" {
-		return nil, fmt.Errorf("不支持的控制台类型")
+		return nil, fmt.Errorf("不支持的控制台类型: %s", consoleType)
 	}
 
-	// 生成一次性 Token
-	consoleToken := uuid.New().String()
+	var node models.Node
+	if err := db.DB.Where("id = ?", instance.NodeID).First(&node).Error; err != nil {
+		return nil, fmt.Errorf("查询节点信息失败: %w", err)
+	}
 
-	// 控制台会话写入 Redis (5分钟有效)
-	sessionKey := "console:" + consoleToken
-	sessionData, _ := json.Marshal(map[string]interface{}{
-		"instance_id": instance.ID.String(),
-		"node_id":     instance.NodeID.String(),
-		"type":        consoleType,
-		"incus_name":  instance.IncusName,
-	})
-	db.RedisClient.Set(context.Background(), sessionKey, sessionData, 5*time.Minute)
+	if !node.IsOnline() {
+		return nil, service.ErrNodeNotConnected
+	}
+
+	session := console.ConsoleSession{
+		InstanceID: instance.ID.String(),
+		NodeID:     instance.NodeID.String(),
+		Type:       consoleType,
+		IncusName:  instance.IncusName,
+	}
+	token, err := console.GenerateConsoleToken(session)
+	if err != nil {
+		return nil, fmt.Errorf("生成控制台 Token 失败: %w", err)
+	}
+
+	agentAddr := node.IPAddress
+	if agentAddr == "" {
+		agentAddr = node.Hostname
+	}
+
+	var agentURL string
+	if node.AgentURL != "" {
+		base := strings.TrimRight(node.AgentURL, "/")
+		scheme := "ws"
+		if strings.HasPrefix(base, "https://") {
+			scheme = "wss"
+			base = strings.TrimPrefix(base, "https://")
+		} else if strings.HasPrefix(base, "http://") {
+			base = strings.TrimPrefix(base, "http://")
+		}
+		agentURL = fmt.Sprintf("%s://%s/console/%s?token=%s&container=%s",
+			scheme, base, consoleType, token, instance.IncusName)
+	} else {
+		agentURL = fmt.Sprintf("ws://%s:9090/console/%s?token=%s&container=%s",
+			agentAddr, consoleType, token, instance.IncusName)
+	}
 
 	return map[string]interface{}{
 		"type":        consoleType,
-		"token":       consoleToken,
+		"token":       token,
+		"agent_url":   agentURL,
+		"agent_addr":  fmt.Sprintf("%s:9090", agentAddr),
 		"instance_id": instance.ID.String(),
 		"incus_name":  instance.IncusName,
 		"node_id":     instance.NodeID.String(),

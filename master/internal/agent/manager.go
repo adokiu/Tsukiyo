@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,8 +14,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 
 	"tsukiyo/master/internal/db"
+	"tsukiyo/master/internal/geoip"
 	"tsukiyo/master/internal/models"
 )
 
@@ -63,7 +66,7 @@ type Manager struct {
 	mu              sync.RWMutex
 	taskCh          chan *TaskMessage
 	nodeStatusCh    chan NodeStatusUpdate
-	pendingRequests map[string]chan []byte
+	pendingRequests map[string]chan agentResponse
 	reqMu           sync.RWMutex
 	OnTaskResult    func(taskID uuid.UUID, result json.RawMessage, errMsg string)
 	imageProgress   map[uuid.UUID]map[string]*NodeImageStatus // nodeID -> imageID -> status
@@ -116,25 +119,28 @@ type RegisterPayload struct {
 	TotalCPU     float64         `json:"total_cpu"`
 	TotalMemory  int64           `json:"total_memory"`
 	TotalDisk    int64           `json:"total_disk"`
-	LocalAddress string          `json:"local_address"`
+	PublicIPv4   string          `json:"public_ipv4"`
+	PublicIPv6   string          `json:"public_ipv6"`
 	SystemInfo   json.RawMessage `json:"system_info"`
 }
 
 // HeartbeatPayload Agent 心跳消息
 type HeartbeatPayload struct {
-	Token        string   `json:"token"`
-	CPUPercent   float64  `json:"cpu_percent"`
-	MemUsed      int64    `json:"mem_used"`
-	MemTotal     int64    `json:"mem_total"`
-	DiskUsed     int64    `json:"disk_used"`
-	DiskTotal    int64    `json:"disk_total"`
-	NetIn        int64    `json:"net_in"`
-	NetOut       int64    `json:"net_out"`
-	Instances    int      `json:"instances"`
-	Running      int      `json:"running"`
-	Timestamp    int64    `json:"timestamp"`
-	PublicIPv4s  []string `json:"public_ipv4s,omitempty"`
-	IPv6Prefixes []string `json:"ipv6_prefixes,omitempty"`
+	Token             string          `json:"token"`
+	CPUPercent        float64         `json:"cpu_percent"`
+	MemUsed           int64           `json:"mem_used"`
+	MemTotal          int64           `json:"mem_total"`
+	DiskUsed          int64           `json:"disk_used"`
+	DiskTotal         int64           `json:"disk_total"`
+	NetIn             int64           `json:"net_in"`
+	NetOut            int64           `json:"net_out"`
+	Uptime            int64           `json:"uptime"`
+	Instances         int             `json:"instances"`
+	Running           int             `json:"running"`
+	Timestamp         int64           `json:"timestamp"`
+	PublicIPv4s       []string        `json:"public_ipv4s"`
+	IPv6Prefixes      []string        `json:"ipv6_prefixes"`
+	NetworkInterfaces json.RawMessage `json:"network_interfaces"`
 }
 
 // InstanceStatusPayload 实例状态上报
@@ -186,7 +192,7 @@ func NewManager() *Manager {
 		connections:     make(map[uuid.UUID]*Connection),
 		taskCh:          make(chan *TaskMessage, 1000),
 		nodeStatusCh:    make(chan NodeStatusUpdate, 1000),
-		pendingRequests: make(map[string]chan []byte),
+		pendingRequests: make(map[string]chan agentResponse),
 		imageProgress:   make(map[uuid.UUID]map[string]*NodeImageStatus),
 		frontendConns:   make([]*FrontendConn, 0),
 	}
@@ -205,13 +211,11 @@ func (m *Manager) BroadcastImageProgress(nodeID uuid.UUID, payload ImageProgress
 
 	m.frontendMu.Lock()
 	defer m.frontendMu.Unlock()
-	zap.L().Info("广播镜像进度", zap.String("node_id", nodeID.String()), zap.String("image_id", payload.ImageID), zap.Int("前端连接数", len(m.frontendConns)))
 	alive := make([]*FrontendConn, 0, len(m.frontendConns))
 	for _, fc := range m.frontendConns {
 		select {
 		case fc.SendCh <- data:
 			alive = append(alive, fc)
-			zap.L().Info("发送成功", zap.String("image_id", payload.ImageID))
 		default:
 			// 发送缓冲区满，丢弃该连接
 			zap.L().Warn("发送缓冲区满，丢弃连接")
@@ -248,13 +252,11 @@ func (m *Manager) BroadcastInstanceProgress(nodeID uuid.UUID, payload InstancePr
 
 // HandleFrontendWebSocket 处理前端 WebSocket 连接
 func (m *Manager) HandleFrontendWebSocket(c *gin.Context) {
-	zap.L().Info("前端 WebSocket 连接请求", zap.String("path", c.Request.URL.Path))
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		zap.L().Error("前端 WebSocket 升级失败", zap.Error(err))
 		return
 	}
-	zap.L().Info("前端 WebSocket 连接成功", zap.String("path", c.Request.URL.Path))
 
 	fc := &FrontendConn{
 		Conn:   conn,
@@ -324,6 +326,12 @@ func (m *Manager) HandleFrontendWebSocket(c *gin.Context) {
 	removeConn()
 }
 
+// agentResponse Agent 响应
+type agentResponse struct {
+	payload []byte
+	errMsg  string
+}
+
 // SendRequest 向指定 Agent 发送同步请求并等待响应
 func (m *Manager) SendRequest(nodeID uuid.UUID, reqType string, payload interface{}, timeout time.Duration) ([]byte, error) {
 	m.mu.RLock()
@@ -335,7 +343,7 @@ func (m *Manager) SendRequest(nodeID uuid.UUID, reqType string, payload interfac
 	}
 
 	reqID := uuid.New().String()
-	respCh := make(chan []byte, 1)
+	respCh := make(chan agentResponse, 1)
 
 	m.reqMu.Lock()
 	m.pendingRequests[reqID] = respCh
@@ -363,7 +371,10 @@ func (m *Manager) SendRequest(nodeID uuid.UUID, reqType string, payload interfac
 
 	select {
 	case resp := <-respCh:
-		return resp, nil
+		if resp.errMsg != "" {
+			return nil, fmt.Errorf("%s", resp.errMsg)
+		}
+		return resp.payload, nil
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("请求超时 (%s)", timeout)
 	case <-conn.ctx.Done():
@@ -372,15 +383,152 @@ func (m *Manager) SendRequest(nodeID uuid.UUID, reqType string, payload interfac
 }
 
 // handleResponse 处理 Agent 响应
-func (m *Manager) handleResponse(msgID string, payload json.RawMessage) {
+func (m *Manager) handleResponse(msgID string, payload json.RawMessage, errMsg string) {
 	m.reqMu.RLock()
 	ch, exists := m.pendingRequests[msgID]
 	m.reqMu.RUnlock()
 
 	if exists {
 		select {
-		case ch <- []byte(payload):
+		case ch <- agentResponse{payload: []byte(payload), errMsg: errMsg}:
 		default:
+		}
+	}
+}
+
+// handleSecurityAlert 处理 Agent 上报的安全告警
+func (m *Manager) handleSecurityAlert(nodeID uuid.UUID, payload json.RawMessage) {
+	var alert struct {
+		Token      string `json:"token"`
+		InstanceID string `json:"instance_id"`
+		AlertType  string `json:"alert_type"`
+		Severity   string `json:"severity"`
+		SourceIP   string `json:"source_ip"`
+		DestPort   int    `json:"dest_port"`
+		Protocol   string `json:"protocol"`
+		Details    string `json:"details"`
+		RawData    string `json:"raw_data"`
+		DetectedAt int64  `json:"detected_at"`
+	}
+	if err := json.Unmarshal(payload, &alert); err != nil {
+		zap.L().Error("解析安全告警失败", zap.Error(err))
+		return
+	}
+
+	detectedAt := time.Unix(alert.DetectedAt, 0)
+	if alert.DetectedAt == 0 {
+		detectedAt = time.Now()
+	}
+
+	dbAlert := models.SecurityAlert{
+		ID:         uuid.New(),
+		NodeID:     nodeID,
+		InstanceID: alert.InstanceID,
+		AlertType:  alert.AlertType,
+		Severity:   models.AlertSeverity(alert.Severity),
+		Status:     models.AlertStatusOpen,
+		SourceIP:   alert.SourceIP,
+		DestPort:   alert.DestPort,
+		Protocol:   alert.Protocol,
+		Details:    alert.Details,
+		RawData:    alert.RawData,
+		DetectedAt: detectedAt,
+	}
+
+	if err := db.DB.Create(&dbAlert).Error; err != nil {
+		zap.L().Error("持久化安全告警失败",
+			zap.String("node_id", nodeID.String()),
+			zap.String("alert_type", alert.AlertType),
+			zap.Error(err))
+		return
+	}
+
+	zap.L().Warn("收到安全告警",
+		zap.String("node_id", nodeID.String()),
+		zap.String("alert_type", alert.AlertType),
+		zap.String("severity", alert.Severity),
+		zap.String("source_ip", alert.SourceIP),
+		zap.String("details", alert.Details))
+
+	if alert.AlertType == "mining" || alert.AlertType == "smtp_abuse" {
+		dbAlert.AutoAction = "auto_stop_instance"
+		db.DB.Model(&dbAlert).Update("auto_action", dbAlert.AutoAction)
+
+		if alert.InstanceID != "" {
+			var instance models.Instance
+			if err := db.DB.Where("incus_name = ? AND node_id = ?", alert.InstanceID, nodeID).First(&instance).Error; err == nil {
+				zap.L().Warn("自动处置：因安全告警暂停实例",
+					zap.String("instance_id", instance.ID.String()),
+					zap.String("alert_type", alert.AlertType))
+
+				payloadBytes, _ := json.Marshal(map[string]interface{}{
+					"instance_id": instance.IncusName,
+					"force":       true,
+				})
+				stopTask := models.Task{
+					ID:         uuid.New(),
+					Type:       models.TaskTypeStopInstance,
+					NodeID:     nodeID,
+					InstanceID: &instance.ID,
+					UserID:     0,
+					Status:     models.TaskStatusPending,
+					Payload:    payloadBytes,
+				}
+				db.DB.Create(&stopTask)
+			}
+		}
+	}
+
+	m.BroadcastToFrontend(map[string]interface{}{
+		"type": "security_alert",
+		"data": dbAlert,
+	})
+}
+
+// handleVerifyConsoleToken 处理 Agent 发来的 Token 验证请求
+func (m *Manager) handleVerifyConsoleToken(c *Connection, msgID string, payload json.RawMessage) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		m.sendResponseToAgent(c, msgID, map[string]interface{}{"valid": false, "error": "invalid request"})
+		return
+	}
+
+	sessionKey := "console_token:" + req.Token
+	result, err := db.RedisClient.Get(context.Background(), sessionKey).Result()
+	valid := err == nil && result != ""
+
+	m.sendResponseToAgent(c, msgID, map[string]interface{}{"valid": valid})
+}
+
+// sendResponseToAgent 向 Agent 连接发送 response 消息
+func (m *Manager) sendResponseToAgent(c *Connection, msgID string, data interface{}) {
+	respPayload, _ := json.Marshal(data)
+	msg, _ := json.Marshal(map[string]interface{}{
+		"type":    "response",
+		"id":      msgID,
+		"payload": json.RawMessage(respPayload),
+	})
+
+	select {
+	case c.SendCh <- msg:
+	default:
+		zap.L().Warn("Agent 发送队列已满，丢弃 response", zap.String("msg_id", msgID))
+	}
+}
+
+// BroadcastToFrontend 向所有前端 WebSocket 连接广播消息
+func (m *Manager) BroadcastToFrontend(data interface{}) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	m.frontendMu.RLock()
+	defer m.frontendMu.RUnlock()
+	for _, fc := range m.frontendConns {
+		if fc != nil && fc.Conn != nil {
+			fc.Conn.WriteMessage(websocket.TextMessage, payload)
 		}
 	}
 }
@@ -454,6 +602,8 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 	m.mu.Unlock()
 
 	// 更新节点状态及上报的宿主机信息
+	// IP 地址: 优先使用 agent 上报的公网 IP，fallback 用 WebSocket 连接出口 IP（参考 komari）
+	clientIP := c.ClientIP()
 	updates := map[string]interface{}{
 		"status":         models.NodeStatusOnline,
 		"hostname":       payload.Hostname,
@@ -464,92 +614,139 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 		"last_seen_at":   time.Now(),
 		"last_heartbeat": time.Now(),
 	}
+	if payload.PublicIPv4 != "" {
+		updates["ip_address"] = payload.PublicIPv4
+	} else if clientIP != "" {
+		ip := net.ParseIP(clientIP)
+		if ip != nil && ip.To4() != nil {
+			updates["ip_address"] = clientIP
+		}
+	}
+	if payload.PublicIPv6 != "" {
+		updates["ipv6_address"] = payload.PublicIPv6
+	} else if clientIP != "" {
+		ip := net.ParseIP(clientIP)
+		if ip != nil && ip.To4() == nil {
+			updates["ipv6_address"] = clientIP
+		}
+	}
+	// 通过 IP 查询国家码（异步，不阻塞注册流程）
+	lookupIP := payload.PublicIPv4
+	if lookupIP == "" {
+		lookupIP = clientIP
+	}
+	if lookupIP != "" {
+		go func(ip, nodeID string) {
+			code := geoip.LookupCountryCode(ip)
+			if code != "" {
+				db.DB.Model(&models.Node{}).Where("id = ?", nodeID).Update("country_code", code)
+			}
+		}(lookupIP, nodeID.String())
+	}
 	if len(payload.SystemInfo) > 0 {
 		updates["system_info"] = string(payload.SystemInfo)
 	}
 	db.DB.Model(&node).Updates(updates)
 
-	// 只有节点已被初始化过，才下发已有配置给 Agent
-	if node.Initialized {
-		go func() {
-			// 等待连接稳定后下发
-			time.Sleep(1 * time.Second)
-			cfg := map[string]interface{}{
-				"incus_socket_path":    node.IncusSocketPath,
-				"metrics_interval":     node.MetricsInterval,
-				"heartbeat_interval":   node.HeartbeatInterval,
-				"network_interface":    node.NetworkInterface,
-				"enable_nat":           node.EnableNAT,
-				"enable_firewall":      node.EnableFirewall,
-				"enable_security_scan": node.EnableSecurityScan,
-				"scan_interval":        node.ScanInterval,
-				"console_bind_addr":    node.ConsoleBindAddr,
-				"default_storage_pool": node.DefaultStoragePool,
-				"storage_pool_type":    node.StoragePoolType,
-				"storage_pool_source":  node.StoragePoolSource,
+	// Agent 连接后直接下发已有配置
+	go func() {
+		// 等待连接稳定后下发
+		time.Sleep(1 * time.Second)
+		cfg := map[string]interface{}{
+			"incus_socket_path":    node.IncusSocketPath,
+			"metrics_interval":     node.MetricsInterval,
+			"heartbeat_interval":   node.HeartbeatInterval,
+			"network_interface":    node.NetworkInterface,
+			"enable_nat":           node.EnableNAT,
+			"enable_firewall":      node.EnableFirewall,
+			"enable_security_scan": node.EnableSecurityScan,
+			"scan_interval":        node.ScanInterval,
+			"console_bind_addr":    node.ConsoleBindAddr,
+			"agent_url":            node.AgentURL,
+			"image_remote_url":     node.ImageRemoteURL,
+			"storage_pool_type":    node.StoragePoolType,
+			"storage_pool_source":  node.StoragePoolSource,
+		}
+
+		// 查询该节点所有网桥配置并下发
+		var bridges []models.Bridge
+		if err := db.DB.Where("node_id = ?", nodeID).Find(&bridges).Error; err == nil && len(bridges) > 0 {
+			bridgeConfigs := make([]map[string]interface{}, 0, len(bridges))
+			for _, b := range bridges {
+				var dnsServers []string
+				json.Unmarshal(b.DNSServers, &dnsServers)
+
+				bridgeConfigs = append(bridgeConfigs, map[string]interface{}{
+					"id":               b.ID.String(),
+					"name":             b.Name,
+					"bridge_name":      b.BridgeName,
+					"ipv4_enabled":     b.IPv4Enabled,
+					"ipv4_cidr":        b.IPv4CIDR,
+					"ipv4_gateway":     b.IPv4Gateway,
+					"ipv6_enabled":     b.IPv6Enabled,
+					"ipv6_cidr":        b.IPv6CIDR,
+					"ipv6_gateway":     b.IPv6Gateway,
+					"dns_servers":      dnsServers,
+					"port_range_start": b.PortRangeStart,
+					"port_range_end":   b.PortRangeEnd,
+					"status":           string(b.Status),
+					"nat_egress_ipv4":  getEIPAllocCIDR(b.NATEgressIPv4ID),
+					"nat_egress_ipv6":  getEIPAllocCIDR(b.NATEgressIPv6ID),
+				})
+			}
+			cfg["bridges"] = bridgeConfigs
+			zap.L().Info("下发网桥配置到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(bridgeConfigs)))
+		}
+
+		// 查询该节点所有实例的端口映射并下发（Agent 重启后恢复 proxy 设备）
+		var portMappings []models.PortMapping
+		if err := db.DB.Where("node_id = ?", nodeID).Find(&portMappings).Error; err == nil && len(portMappings) > 0 {
+			// 批量加载出口 EIP 分配
+			allocIDs := make([]uuid.UUID, 0, len(portMappings))
+			for _, pm := range portMappings {
+				allocIDs = append(allocIDs, pm.EgressAllocationID)
+			}
+			var allocs []models.EIPAllocation
+			db.DB.Where("id IN ?", allocIDs).Find(&allocs)
+			allocMap := make(map[uuid.UUID]string, len(allocs))
+			for _, a := range allocs {
+				allocMap[a.ID] = a.GetIP()
 			}
 
-			// 查询该节点所有 VPC 配置并下发
-			var vpcs []models.VPCNetwork
-			if err := db.DB.Where("node_id = ?", nodeID).Find(&vpcs).Error; err == nil && len(vpcs) > 0 {
-				vpcConfigs := make([]map[string]interface{}, 0, len(vpcs))
-				for _, v := range vpcs {
-					vpcConfigs = append(vpcConfigs, map[string]interface{}{
-						"id":                 v.ID.String(),
-						"name":               v.Name,
-						"ipv4_cidr":          v.IPv4CIDR,
-						"ipv6_ula_cidr":      v.IPv6ULACIDR,
-						"ipv6_gua_cidr":      v.IPv6GUACIDR,
-						"default_gateway_v4": v.DefaultGatewayV4,
-						"default_gateway_v6": v.DefaultGatewayV6,
-						"egress_v4_primary":  v.EgressV4Primary,
-						"parent_iface":       v.ParentIface,
-						"port_range_start":   v.PortRangeStart,
-						"port_range_end":     v.PortRangeEnd,
-						"snat_enabled":       v.SNATEnabled,
-						"ipv4_filter":        v.IPv4Filter,
-						"mac_filter":         v.MACFilter,
-						"bridge_name":        v.GetBridgeName(),
-						"status":             v.Status,
-					})
-				}
-				cfg["vpcs"] = vpcConfigs
-				zap.L().Info("下发 VPC 配置到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(vpcConfigs)))
-			}
-
-			// 查询该节点所有实例的端口映射并下发（Agent 重启后恢复 proxy 设备）
-			var portMappings []models.PortMapping
-			if err := db.DB.Where("node_id = ?", nodeID).Find(&portMappings).Error; err == nil && len(portMappings) > 0 {
-				pmConfigs := make([]map[string]interface{}, 0, len(portMappings))
-				for _, pm := range portMappings {
-					// 查询关联实例获取 incus_name 和 internal_ip
-					var inst models.Instance
-					incusName := ""
-					internalIP := ""
-					if db.DB.Where("id = ?", pm.InstanceID).First(&inst).Error == nil {
-						incusName = inst.IncusName
+			pmConfigs := make([]map[string]interface{}, 0, len(portMappings))
+			for _, pm := range portMappings {
+				var inst models.Instance
+				incusName := ""
+				internalIP := ""
+				if db.DB.Where("id = ?", pm.InstanceID).First(&inst).Error == nil {
+					incusName = inst.IncusName
+					if pm.IPVersion == "ipv6" {
+						internalIP = inst.InternalIPv6
+					} else {
 						internalIP = inst.InternalIPv4
 					}
-					pmConfigs = append(pmConfigs, map[string]interface{}{
-						"id":             pm.ID.String(),
-						"instance_id":    pm.InstanceID.String(),
-						"incus_name":     incusName,
-						"internal_ip":    internalIP,
-						"host_port":      pm.HostPort,
-						"container_port": pm.ContainerPort,
-						"protocol":       pm.Protocol,
-						"description":    pm.Description,
-					})
 				}
-				cfg["port_mappings"] = pmConfigs
-				zap.L().Info("下发端口映射到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(pmConfigs)))
+				pmConfigs = append(pmConfigs, map[string]interface{}{
+					"id":             pm.ID.String(),
+					"instance_id":    pm.InstanceID.String(),
+					"incus_name":     incusName,
+					"internal_ip":    internalIP,
+					"host_port":      pm.HostPort,
+					"container_port": pm.ContainerPort,
+					"protocol":       pm.Protocol,
+					"ip_version":     pm.IPVersion,
+					"host_ip":        allocMap[pm.EgressAllocationID],
+					"description":    pm.Description,
+				})
 			}
+			cfg["port_mappings"] = pmConfigs
+			zap.L().Info("下发端口映射到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(pmConfigs)))
+		}
 
-			if err := m.SendConfig(nodeID, cfg); err != nil {
-				zap.L().Warn("下发已有配置失败", zap.String("node_id", nodeID.String()), zap.Error(err))
-			}
-		}()
-	}
+		if err := m.SendConfig(nodeID, cfg); err != nil {
+			zap.L().Warn("下发已有配置失败", zap.String("node_id", nodeID.String()), zap.Error(err))
+		}
+	}()
 
 	// 写入 Redis 缓存
 	nodeKey := fmt.Sprintf("agent:%s", nodeID)
@@ -601,6 +798,7 @@ func (c *Connection) readPump(m *Manager) {
 			Type    string          `json:"type"`
 			ID      string          `json:"id,omitempty"`
 			Payload json.RawMessage `json:"payload,omitempty"`
+			Error   string          `json:"error,omitempty"`
 		}
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
 			zap.L().Warn("解析 Agent 消息失败", zap.String("node_id", c.NodeID.String()), zap.Error(err))
@@ -617,11 +815,17 @@ func (c *Connection) readPump(m *Manager) {
 		case "task_result":
 			m.handleTaskResult(c.NodeID, msg.Payload)
 		case "response":
-			m.handleResponse(msg.ID, msg.Payload)
+			m.handleResponse(msg.ID, msg.Payload, msg.Error)
 		case "image_progress":
 			m.handleImageProgress(c.NodeID, msg.Payload)
 		case "instance_progress":
 			m.handleInstanceProgress(c.NodeID, msg.Payload)
+		case "task_log":
+			m.handleTaskLog(c.NodeID, msg.Payload)
+		case "security_alert":
+			m.handleSecurityAlert(c.NodeID, msg.Payload)
+		case "verify_console_token":
+			m.handleVerifyConsoleToken(c, msg.ID, msg.Payload)
 		default:
 			zap.L().Debug("收到未处理的 Agent 消息", zap.String("type", msg.Type), zap.String("node_id", c.NodeID.String()))
 		}
@@ -731,6 +935,9 @@ func (m *Manager) removeConnection(nodeID uuid.UUID) {
 	db.RedisClient.Del(ctx, nodeKey)
 
 	zap.L().Info("Agent 断开连接", zap.String("node_id", nodeID.String()))
+
+	// 广播节点离线到前端
+	m.broadcastNodeOffline(nodeID)
 }
 
 // handleHeartbeat 处理心跳
@@ -747,6 +954,9 @@ func (m *Manager) handleHeartbeat(nodeID uuid.UUID, payload json.RawMessage) {
 		"used_cpu":       hb.CPUPercent,
 		"used_memory":    hb.MemUsed,
 		"used_disk":      hb.DiskUsed,
+		"net_in":         hb.NetIn,
+		"net_out":        hb.NetOut,
+		"uptime":         hb.Uptime,
 		"instance_count": hb.Instances,
 		"running_count":  hb.Running,
 		"last_heartbeat": now,
@@ -768,11 +978,126 @@ func (m *Manager) handleHeartbeat(nodeID uuid.UUID, payload json.RawMessage) {
 		"disk_total":  hb.DiskTotal,
 		"net_in":      hb.NetIn,
 		"net_out":     hb.NetOut,
+		"uptime":      hb.Uptime,
 		"instances":   hb.Instances,
 		"running":     hb.Running,
 		"timestamp":   now.Unix(),
 	})
 	db.RedisClient.Set(ctx, resourceKey, resourceData, 15*time.Second)
+
+	// 更新 system_info 中的网卡信息，并检测 host EIP 池失效
+	if len(hb.NetworkInterfaces) > 0 {
+		db.DB.Model(&models.Node{}).Where("id = ?", nodeID).UpdateColumn("system_info", gorm.Expr("jsonb_set(COALESCE(system_info, '{}'::jsonb), '{network_interfaces}', ?::jsonb)", string(hb.NetworkInterfaces)))
+		m.checkHostEIPPoolExpired(nodeID, hb.NetworkInterfaces)
+	}
+
+	// 广播心跳数据到前端 WebSocket
+	m.broadcastNodeHeartbeat(nodeID, hb, now)
+}
+
+// checkHostEIPPoolExpired 检测 host 类型 EIP 池的 IP 是否已不在网卡上，不在则标记为 inactive
+func (m *Manager) checkHostEIPPoolExpired(nodeID uuid.UUID, networkInterfaces json.RawMessage) {
+	type ipProbe struct {
+		Address string `json:"address"`
+	}
+	type netInfo struct {
+		Name string    `json:"name"`
+		IPv4 []ipProbe `json:"ipv4"`
+		IPv6 []ipProbe `json:"ipv6"`
+	}
+	var nics []netInfo
+	if err := json.Unmarshal(networkInterfaces, &nics); err != nil {
+		return
+	}
+
+	// 构建当前所有网卡上的 IP 集合
+	currentIPs := map[string]bool{}
+	for _, nic := range nics {
+		for _, ip := range nic.IPv4 {
+			currentIPs[ip.Address] = true
+		}
+		for _, ip := range nic.IPv6 {
+			currentIPs[ip.Address] = true
+		}
+	}
+
+	// 查询该节点所有 active 的 host 类型 EIP 池
+	var pools []models.EIPPool
+	db.DB.Where("node_id = ? AND pool_type = ? AND status = ?", nodeID, models.EIPPoolTypeHost, models.EIPPoolStatusActive).Find(&pools)
+
+	for i := range pools {
+		pool := &pools[i]
+		// 从 CIDR 中提取 IP
+		poolIP := pool.CIDR
+		if idx := strings.Index(pool.CIDR, "/"); idx > 0 {
+			poolIP = pool.CIDR[:idx]
+		}
+		if !currentIPs[poolIP] {
+			// IP 已不在网卡上，标记为 inactive
+			db.DB.Model(pool).Update("status", "inactive")
+			zap.L().Warn("host EIP 池 IP 已失效，标记为 inactive", zap.String("pool_id", pool.ID.String()), zap.String("old_ip", poolIP), zap.String("interface", pool.Interface))
+		}
+	}
+}
+
+// broadcastNodeHeartbeat 向前端广播节点心跳数据
+func (m *Manager) broadcastNodeHeartbeat(nodeID uuid.UUID, hb HeartbeatPayload, now time.Time) {
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    "node_heartbeat",
+		"node_id": nodeID.String(),
+		"payload": map[string]interface{}{
+			"status":         "online",
+			"is_online":      true,
+			"used_cpu":       hb.CPUPercent,
+			"used_memory":    hb.MemUsed,
+			"mem_total":      hb.MemTotal,
+			"used_disk":      hb.DiskUsed,
+			"disk_total":     hb.DiskTotal,
+			"net_in":         hb.NetIn,
+			"net_out":        hb.NetOut,
+			"uptime":         hb.Uptime,
+			"instance_count": hb.Instances,
+			"running_count":  hb.Running,
+			"last_heartbeat": now,
+		},
+	})
+	if err != nil {
+		return
+	}
+
+	m.frontendMu.RLock()
+	defer m.frontendMu.RUnlock()
+	for _, fc := range m.frontendConns {
+		select {
+		case fc.SendCh <- data:
+		default:
+		}
+	}
+}
+
+// broadcastNodeOffline 向前端广播节点离线
+func (m *Manager) broadcastNodeOffline(nodeID uuid.UUID) {
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    "node_heartbeat",
+		"node_id": nodeID.String(),
+		"payload": map[string]interface{}{
+			"status":         "offline",
+			"is_online":      false,
+			"last_heartbeat": time.Now(),
+		},
+	})
+	if err != nil {
+		return
+	}
+
+	m.frontendMu.RLock()
+	defer m.frontendMu.RUnlock()
+	for _, fc := range m.frontendConns {
+		select {
+		case fc.SendCh <- data:
+		default:
+		}
+	}
 }
 
 // handleInstanceStatus 处理实例状态上报
@@ -965,6 +1290,59 @@ func (m *Manager) broadcastTaskStatus(taskID uuid.UUID, taskType models.TaskType
 		"status":    string(status),
 		"error":     errMsg,
 		"timestamp": time.Now().Unix(),
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	for _, conn := range m.frontendConns {
+		if conn != nil && conn.Conn != nil {
+			conn.Conn.WriteMessage(websocket.TextMessage, payloadBytes)
+		}
+	}
+}
+
+// handleTaskLog 处理 Agent 上报的任务日志
+func (m *Manager) handleTaskLog(nodeID uuid.UUID, payload json.RawMessage) {
+	var log struct {
+		TaskID  string `json:"task_id"`
+		Level   string `json:"level"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(payload, &log); err != nil {
+		zap.L().Error("解析任务日志失败", zap.Error(err))
+		return
+	}
+
+	taskID, err := uuid.Parse(log.TaskID)
+	if err != nil {
+		zap.L().Error("解析任务 ID 失败", zap.String("task_id", log.TaskID), zap.Error(err))
+		return
+	}
+
+	taskLog := models.TaskLog{
+		TaskID:  taskID,
+		Level:   log.Level,
+		Message: log.Message,
+	}
+	if err := db.DB.Create(&taskLog).Error; err != nil {
+		zap.L().Error("创建任务日志失败", zap.Error(err))
+		return
+	}
+
+	// WebSocket 推送任务日志给前端
+	m.broadcastTaskLog(taskID, log.Level, log.Message, taskLog.CreatedAt)
+}
+
+// broadcastTaskLog 向前端广播任务日志
+func (m *Manager) broadcastTaskLog(taskID uuid.UUID, level string, message string, createdAt time.Time) {
+	m.frontendMu.RLock()
+	defer m.frontendMu.RUnlock()
+
+	payload := map[string]interface{}{
+		"type":      "task_log",
+		"task_id":   taskID.String(),
+		"level":     level,
+		"message":   message,
+		"timestamp": createdAt.Unix(),
 	}
 
 	payloadBytes, _ := json.Marshal(payload)
@@ -1293,4 +1671,16 @@ func (m *Manager) GetSingleImageProgress(nodeID uuid.UUID, imageID string) *Node
 		}
 	}
 	return nil
+}
+
+// getEIPAllocCIDR 查询 EIP 分配记录的 CIDR
+func getEIPAllocCIDR(allocID *uuid.UUID) string {
+	if allocID == nil {
+		return ""
+	}
+	var alloc models.EIPAllocation
+	if err := db.DB.Where("id = ?", *allocID).First(&alloc).Error; err != nil {
+		return ""
+	}
+	return alloc.CIDR
 }
