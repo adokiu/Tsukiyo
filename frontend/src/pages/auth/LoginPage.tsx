@@ -21,7 +21,7 @@ export default function LoginPage() {
     try {
       const res = await apiClient.post('/auth/login', { username, password })
       setToken(res.data.token)
-      navigate('/admin/dashboard', { replace: true })
+      navigate('/admin/systemOverview', { replace: true })
     } catch (err: any) {
       setError(err.response?.data?.error || t('auth.loginFailed'))
     } finally {

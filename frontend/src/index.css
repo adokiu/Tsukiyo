@@ -2,6 +2,14 @@
 @tailwind components;
 @tailwind utilities;
 
+@font-face {
+  font-family: 'TCloud Number VF';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/TCloudNumberVF.ttf') format('truetype');
+}
+
 @layer base {
   :root {
     --background: 0 0% 96.5%;
@@ -74,14 +82,23 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    margin: 0;
+    padding: 0;
   }
   body {
-    @apply bg-background text-foreground font-sans;
+    @apply bg-background text-foreground;
+    font-family: "MiSans VF", sans-serif;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    margin: 0;
+    padding: 0;
   }
   h1, h2, h3, h4, h5, h6 {
     @apply font-display tracking-tight;
   }
+}
+
+.font-number {
+  font-family: "TCloud Number VF", "MiSans VF", sans-serif !important;
 }
 
 @layer utilities {

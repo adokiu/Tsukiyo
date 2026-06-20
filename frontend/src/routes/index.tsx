@@ -12,9 +12,9 @@ import InstanceDetailPage from '@/pages/admin/InstanceDetailPage'
 import ImagesPage from '@/pages/admin/ImagesPage'
 import TasksPage from '@/pages/admin/TasksPage'
 import NetworkPage from '@/pages/admin/NetworkPage'
+import StoragePage from '@/pages/admin/StoragePage'
 import SecurityPage from '@/pages/admin/SecurityPage'
-import UsersPage from '@/pages/admin/UsersPage'
-import AuditLogsPage from '@/pages/admin/AuditLogsPage'
+import SecurityPlaceholderPage from '@/pages/admin/SecurityPlaceholderPage'
 import SettingsPage from '@/pages/admin/SettingsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -37,7 +37,7 @@ function InitGuard({ children }: { children: React.ReactNode }) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="text-center">
-          <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-apple-blue border-t-transparent" />
+          <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-[#087ed1] border-t-transparent" />
         </div>
       </div>
     )
@@ -67,18 +67,21 @@ export default function AppRoutes() {
             </ProtectedRoute>
           }
         >
-          <Route index element={<Navigate to="/admin/dashboard" replace />} />
-          <Route path="dashboard" element={<DashboardPage />} />
-          <Route path="nodes" element={<NodesPage />} />
-          <Route path="instances" element={<InstancesPage />} />
-          <Route path="instances/:id" element={<InstanceDetailPage />} />
-          <Route path="images" element={<ImagesPage />} />
-          <Route path="tasks" element={<TasksPage />} />
-          <Route path="network" element={<NetworkPage />} />
-          <Route path="security" element={<SecurityPage />} />
-          <Route path="users" element={<UsersPage />} />
-          <Route path="audit-logs" element={<AuditLogsPage />} />
-          <Route path="settings" element={<SettingsPage />} />
+          <Route index element={<Navigate to="/admin/systemOverview" replace />} />
+          <Route path="systemOverview" element={<DashboardPage />} />
+          <Route path="hostManagement/nodes" element={<NodesPage />} />
+          <Route path="hostManagement/images" element={<ImagesPage />} />
+          <Route path="hostManagement/network" element={<NetworkPage />} />
+          <Route path="hostManagement/storage" element={<StoragePage />} />
+          <Route path="hostManagement/tasks" element={<TasksPage />} />
+          <Route path="instanceManagement/vm" element={<InstancesPage instanceType="vm" />} />
+          <Route path="instanceManagement/container" element={<InstancesPage instanceType="container" />} />
+          <Route path="instanceManagement/instances/:id" element={<InstanceDetailPage />} />
+          <Route path="securityManagement/security" element={<SecurityPage />} />
+          <Route path="securityManagement/firewall" element={<SecurityPlaceholderPage titleKey="nav.firewallManagement" />} />
+          <Route path="securityManagement/acl" element={<SecurityPlaceholderPage titleKey="nav.aclRules" />} />
+          <Route path="securityManagement/url-filter" element={<SecurityPlaceholderPage titleKey="nav.urlFilter" />} />
+          <Route path="systemManagement/settings" element={<SettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/admin" replace />} />
       </Routes>

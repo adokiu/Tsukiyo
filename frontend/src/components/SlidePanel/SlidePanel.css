@@ -2,8 +2,7 @@
   position: fixed;
   inset: 0;
   z-index: 4000;
-  background: rgba(0, 0, 0, 0.2);
-  backdrop-filter: blur(2px);
+  background: rgba(0, 0, 0, 0.25);
   opacity: 0;
   transition: opacity 0.2s ease;
 }
@@ -13,10 +12,10 @@
 }
 
 .slide-panel {
-  position: absolute;
+  position: fixed;
   top: 0;
   right: 0;
-  height: 100%;
+  bottom: 0;
   max-width: 100%;
   background: var(--color-white);
   box-shadow: -8px 0 32px rgba(0, 0, 0, 0.08);
@@ -24,6 +23,7 @@
   flex-direction: column;
   transform: translateX(100%);
   transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 4001;
 }
 
 .slide-panel--visible {
@@ -67,7 +67,15 @@
 .slide-panel__body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
+  scrollbar-gutter: stable;
+}
+
+.slide-panel__body input,
+.slide-panel__body select,
+.slide-panel__body textarea {
+  color: var(--color-black);
 }
 
 .slide-panel__footer {

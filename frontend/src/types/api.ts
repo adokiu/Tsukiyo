@@ -68,7 +68,13 @@ export interface Instance {
   expires_at: string
   created_at: string
   data_disks?: DataDisk[]
-  nat_configs?: NATConfig[]
+  port_mappings?: PortMapping[]
+  bridge_id?: string
+  bridge_name?: string
+  internal_ipv4?: string
+  internal_ipv6?: string
+  ipv4_eip?: string
+  ipv6_eip?: string
 }
 
 export interface DataDisk {
@@ -79,13 +85,65 @@ export interface DataDisk {
   mount_point: string
 }
 
-export interface NATConfig {
+export interface PortMapping {
   id: string
-  internal_ip: string
-  external_ip: string
-  internal_port: number
-  external_port: number
+  instance_id: string
+  bridge_id: string
+  ip_version: string
+  egress_allocation_id: string
+  container_port: number
+  host_port: number
   protocol: string
+  description?: string
+}
+
+export interface Bridge {
+  id: string
+  node_id: string
+  name: string
+  bridge_name: string
+  ipv4_enabled: boolean
+  ipv4_cidr: string
+  ipv4_gateway: string
+  ipv6_enabled: boolean
+  ipv6_cidr: string
+  ipv6_gateway: string
+  dns_servers: string[]
+  nat_egress_ipv4_id?: string
+  nat_egress_ipv6_id?: string
+  port_range_start: number
+  port_range_end: number
+  status: string
+  instance_count?: number
+  created_at: string
+}
+
+export interface EIPPool {
+  id: string
+  node_id: string
+  ip_version: string
+  cidr: string
+  interface: string
+  gateway: string
+  prefix_len: number
+  alias: string
+  pool_type: string
+  status: string
+  created_at: string
+}
+
+export interface EIPAllocation {
+  id: string
+  pool_id: string
+  node_id: string
+  cidr: string
+  prefix_len: number
+  ip_version: string
+  usage: string
+  bridge_id?: string
+  instance_id?: string
+  status: string
+  allocated_at: string
 }
 
 export interface ImageTemplate {
@@ -101,33 +159,18 @@ export interface ImageTemplate {
   created_at: string
 }
 
-export interface IPPool {
-  id: string
-  node_id: string
-  ip_address: string
-  gateway: string
-  netmask: string
-  type: string
-  status: string
-}
-
-export interface IPv6Prefix {
-  id: string
-  node_id: string
-  prefix: string
-  gateway: string
-  subnet_mask: number
-}
-
 export interface FirewallRule {
   id: string
   instance_id: string
+  node_id: string
+  network: string
   direction: string
   protocol: string
-  port_start: number
-  port_end: number
+  port: string
   source_ip: string
   action: string
+  description?: string
+  enabled: boolean
   priority: number
 }
 

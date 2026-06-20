@@ -10,7 +10,6 @@ interface SiteConfig {
   site_description: string
   site_url: string
   contact_email: string
-  incus_remote_url: string
 }
 
 export default function SettingsPage() {
@@ -28,7 +27,11 @@ export default function SettingsPage() {
     setSaving(true)
     try {
       await apiClient.put('/settings/site', {
-        incus_remote_url: config.incus_remote_url,
+        site_name: config.site_name,
+        site_subtitle: config.site_subtitle,
+        site_description: config.site_description,
+        site_url: config.site_url,
+        contact_email: config.contact_email,
       })
       alert('保存成功')
     } catch (error) {
@@ -58,19 +61,7 @@ export default function SettingsPage() {
 
       <div className="glass-card p-6 max-w-2xl">
         <div className="space-y-6">
-          <div>
-            <label className="block text-sm font-medium mb-2">Incus 镜像源</label>
-            <input
-              type="text"
-              value={config?.incus_remote_url || ''}
-              onChange={(e) => setConfig({ ...config!, incus_remote_url: e.target.value })}
-              placeholder="images:"
-              className="w-full px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <p className="text-xs text-muted-foreground mt-1">
-              留空使用默认的 Incus 官方镜像源（images:）
-            </p>
-          </div>
+          <p className="text-sm text-muted-foreground">镜像源配置已移至「实例模板管理」页面</p>
 
           <div className="pt-4">
             <button

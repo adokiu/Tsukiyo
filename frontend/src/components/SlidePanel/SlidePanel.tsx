@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 import './SlidePanel.css'
 
@@ -50,7 +51,7 @@ export function SlidePanel({ open, onClose, title, children, footer, width = 480
     downOnOverlayRef.current = false
   }
 
-  return (
+  return createPortal(
     <div
       ref={overlayRef}
       className="slide-overlay"
@@ -67,6 +68,7 @@ export function SlidePanel({ open, onClose, title, children, footer, width = 480
         <div className="slide-panel__body">{children}</div>
         {footer && <div className="slide-panel__footer">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

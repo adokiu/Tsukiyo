@@ -22,11 +22,15 @@ interface Instance {
   internal_ipv4?: string
   ipv4_address?: string
   ssh_port?: number
-  vpc_id?: string
+  bridge_id?: string
   created_at: string
 }
 
-export default function InstancesPage() {
+interface Props {
+  instanceType?: 'vm' | 'container'
+}
+
+export default function InstancesPage({ instanceType }: Props) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const toast = useToastStore()
@@ -36,10 +40,24 @@ export default function InstancesPage() {
 
   const fetchInstances = () => {
     setLoading(true)
-    apiClient.get('/instances').then((res) => setInstances(res.data.data || [])).finally(() => setLoading(false))
+    apiClient.get('/instances').then((res) => {
+      let list: Instance[] = res.data.data || []
+      if (instanceType === 'vm') {
+        list = list.filter((i) => i.type === 'vm' || i.type === 'virtual-machine')
+      } else if (instanceType === 'container') {
+        list = list.filter((i) => i.type === 'container' || i.type === 'lxc')
+      }
+      setInstances(list)
+    }).finally(() => setLoading(false))
   }
 
-  useEffect(() => { fetchInstances() }, [])
+  useEffect(() => { fetchInstances() }, [instanceType])
+
+  const pageTitle = instanceType === 'vm'
+    ? t('nav.virtualMachines')
+    : instanceType === 'container'
+      ? t('nav.containers')
+      : t('instance.title')
 
   const handleAction = async (id: string, action: string) => {
     try {
@@ -81,7 +99,7 @@ export default function InstancesPage() {
 
   const columns: Column<Instance>[] = [
     { key: 'name', title: '名称', render: (row) => (
-      <button className="text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline" onClick={() => navigate(`/admin/instances/${row.id}`)}>
+      <button className="text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline" onClick={() => navigate(`/admin/instanceManagement/instances/${row.id}`)}>
         {row.name}
       </button>
     )},
@@ -99,7 +117,7 @@ export default function InstancesPage() {
         <div className="text-xs text-gray-600 space-y-0.5">
           {row.internal_ipv4 ? <div className="font-mono text-gray-700">内网: {row.internal_ipv4}</div> : null}
           {row.ipv4_address ? <div className="font-mono text-blue-600">公网: {row.ipv4_address}</div> : null}
-          {row.vpc_id ? <div className="text-gray-400">VPC:{row.vpc_id.slice(0, 8)}</div> : null}
+          {row.bridge_id ? <div className="text-gray-400">Bridge:{row.bridge_id.slice(0, 8)}</div> : null}
           {row.ssh_port ? <div className="text-gray-400">SSH:{row.ssh_port}</div> : null}
         </div>
       ),
@@ -135,18 +153,20 @@ export default function InstancesPage() {
   ]
 
   return (
-    <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Boxes size={22} className="text-black" />
-          <h1 className="text-xl font-semibold text-black">{t('instance.title')}</h1>
-        </div>
+    <div className="page-container">
+      <div className="page-header">
+        <h1 className="page-title flex items-center gap-2">
+          <Boxes size={20} />
+          {pageTitle}
+        </h1>
         <Button icon={<Plus size={16} />} onClick={() => setModalOpen(true)}>
           {t('instance.createInstance')}
         </Button>
       </div>
 
-      <DataTable columns={columns} data={instances} rowKey={(r) => r.id} loading={loading} />
+      <div className="page-card p-4">
+        <DataTable columns={columns} data={instances} rowKey={(r) => r.id} loading={loading} />
+      </div>
       <CreateInstanceModal open={modalOpen} onClose={() => setModalOpen(false)} onSuccess={fetchInstances} />
     </div>
   )

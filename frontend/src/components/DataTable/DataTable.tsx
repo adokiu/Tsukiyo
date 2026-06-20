@@ -36,6 +36,8 @@ interface DataTableProps<T> {
   onSelectionChange?: (keys: Set<string | number>) => void
   sort?: SortState
   onSortChange?: (sort: SortState) => void
+  header?: ReactNode
+  footer?: ReactNode
 }
 
 export function DataTable<T>({
@@ -52,6 +54,8 @@ export function DataTable<T>({
   onSelectionChange,
   sort,
   onSortChange,
+  header,
+  footer,
 }: DataTableProps<T>) {
   const safeData = Array.isArray(data) ? data : []
   const allKeys = useMemo(() => safeData.map((r) => rowKey(r)), [safeData, rowKey])
@@ -88,6 +92,8 @@ export function DataTable<T>({
 
   return (
     <div className="data-table-wrapper">
+      {header && <div className="data-table-header">{header}</div>}
+      <div className="data-table-body">
       <div className="data-table-scroll">
         <table className="data-table">
           <thead>
@@ -105,8 +111,8 @@ export function DataTable<T>({
               {columns.map((col) => (
                 <th
                   key={col.key}
-                  style={col.width ? { width: col.width } : undefined}
-                  className={col.sortable ? 'data-table__th--sortable' : ''}
+                  style={col.width ? { minWidth: col.width } : undefined}
+                  className={`${col.sortable ? 'data-table__th--sortable' : ''} ${col.key === 'action' ? 'data-table__th--sticky-right' : ''}`}
                   onClick={col.sortable && onSortChange ? () => {
                     if (sort?.field === col.key) {
                       onSortChange({ field: col.key, order: sort.order === 'asc' ? 'desc' : 'asc' })
@@ -164,7 +170,7 @@ export function DataTable<T>({
                       </td>
                     )}
                     {columns.map((col) => (
-                      <td key={col.key}>
+                      <td key={col.key} className={col.key === 'action' ? 'data-table__td--sticky-right' : ''}>
                         {col.render
                           ? col.render(row, idx)
                           : String((row as Record<string, unknown>)[col.key] ?? '')}
@@ -178,6 +184,8 @@ export function DataTable<T>({
         </table>
       </div>
 
+      </div>
+      {footer && <div className="data-table-footer">{footer}</div>}
       {pagination && pagination.total > 0 && (
         <Pagination
           page={pagination.page}

@@ -35,11 +35,13 @@ interface Instance {
   monthly_traffic?: number
   traffic_mode: string
   snapshot_limit: number
-  vpc_id?: string
-  vpc_name?: string
-  vpc_bridge?: string
-  vpc_cidr?: string
-  vpc_gateway?: string
+  bridge_id?: string
+  bridge_name?: string
+  bridge_cidr?: string
+  bridge_gateway?: string
+  internal_ipv6?: string
+  ipv4_eip?: string
+  ipv6_eip?: string
   created_at: string
   expires_at?: string
   port_mappings?: PortMapping[]
@@ -176,27 +178,63 @@ export default function InstanceDetailPage() {
         if (!confirm('确认删除该实例？此操作不可恢复。')) return
         await apiClient.delete(`/instances/${id}`)
         toast.success('删除任务已下发')
-        navigate('/admin/instances')
+        navigate('/admin/instanceManagement/container')
         return
       }
       if (action === 'console') {
-        const res = await apiClient.get(`/instances/${id}/console`)
-        if (res.data.token) {
-          window.open(`/console?token=${res.data.token}`, '_blank')
+        try {
+          const res = await apiClient.get(`/instances/${id}/console?type=ssh`)
+          if (res.data.agent_url) {
+            window.open(res.data.agent_url, '_blank')
+          } else if (res.data.token) {
+            window.open(`/console?token=${res.data.token}`, '_blank')
+          }
+        } catch (err: any) {
+          if (err.response?.status === 503) {
+            toast.error('节点离线，无法连接控制台')
+          } else {
+            toast.error(err.response?.data?.error || '获取控制台信息失败')
+          }
         }
         return
       }
       if (action === 'reset_password') {
-        if (!confirm('确认重置 root 密码？')) return
-        await apiClient.post(`/instances/${id}/reset-password`)
-        toast.success('密码重置任务已下发')
-        fetchInstance()
+        const newPwd = prompt('请输入新密码（留空则自动生成）：')
+        if (newPwd === null) return
+        try {
+          const body: Record<string, string> = {}
+          if (newPwd) body.password = newPwd
+          await apiClient.post(`/instances/${id}/reset-password`, body)
+          toast.success('密码重置成功')
+          fetchInstance()
+        } catch (err: any) {
+          if (err.response?.status === 503) {
+            toast.error('节点离线，无法重置密码')
+          } else if (err.response?.status === 504) {
+            toast.error('操作超时')
+          } else if (err.response?.status === 409) {
+            toast.error('实例正在执行其他操作')
+          } else {
+            toast.error(err.response?.data?.error || '密码重置失败')
+          }
+        }
         return
       }
       if (action === 'reinstall') {
         if (!confirm('确认重装系统？所有数据将丢失。')) return
-        await apiClient.post(`/instances/${id}/reinstall`)
-        toast.success('重装任务已下发')
+        try {
+          await apiClient.post(`/instances/${id}/reinstall`, {
+            template_id: instance?.template_id || '',
+          })
+          toast.success('重装任务已下发')
+          fetchInstance()
+        } catch (err: any) {
+          if (err.response?.status === 409) {
+            toast.error('实例正在执行其他操作，请稍后重试')
+          } else {
+            toast.error(err.response?.data?.error || '重装失败')
+          }
+        }
         return
       }
       await apiClient.post(`/instances/${id}/${action}`)
@@ -220,11 +258,18 @@ export default function InstanceDetailPage() {
       }
       if (hostPort) body.host_port = hostPort
       await apiClient.post('/network/port-mappings', body)
-      toast.success('端口映射任务已下发')
+      toast.success('端口映射添加成功')
       setAddingPM(false)
       fetchInstance()
     } catch (err: any) {
-      toast.error(err.response?.data?.error || '添加失败')
+      const status = err.response?.status
+      if (status === 503) {
+        toast.error('节点离线，无法添加端口映射')
+      } else if (status === 502) {
+        toast.error('Agent 执行失败')
+      } else {
+        toast.error(err.response?.data?.error || '添加失败')
+      }
     }
   }
 
@@ -232,10 +277,17 @@ export default function InstanceDetailPage() {
     if (!confirm('确认删除该端口映射？')) return
     try {
       await apiClient.delete(`/network/port-mappings/${pmID}`)
-      toast.success('端口映射删除任务已下发')
+      toast.success('端口映射已删除')
       fetchInstance()
     } catch (err: any) {
-      toast.error(err.response?.data?.error || '删除失败')
+      const status = err.response?.status
+      if (status === 503) {
+        toast.error('节点离线，无法删除端口映射')
+      } else if (status === 502) {
+        toast.error('Agent 执行失败')
+      } else {
+        toast.error(err.response?.data?.error || '删除失败')
+      }
     }
   }
 
@@ -278,7 +330,7 @@ export default function InstanceDetailPage() {
   if (!instance) {
     return (
       <div className="p-6">
-        <button onClick={() => navigate('/admin/instances')} className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700 mb-4">
+        <button onClick={() => navigate('/admin/instanceManagement/container')} className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700 mb-4">
           <ArrowLeft size={16} /> 返回实例列表
         </button>
         <div className="text-center text-gray-500">实例不存在</div>
@@ -294,7 +346,7 @@ export default function InstanceDetailPage() {
       {/* 顶部导航 */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <button onClick={() => navigate('/admin/instances')} className="text-gray-500 hover:text-gray-700">
+          <button onClick={() => navigate('/admin/instanceManagement/container')} className="text-gray-500 hover:text-gray-700">
             <ArrowLeft size={20} />
           </button>
           <div>
@@ -433,18 +485,20 @@ export default function InstanceDetailPage() {
             <div>{instance.ssh_port || '-'}</div>
           </div>
 
-          {instance.vpc_id && (
+          {instance.bridge_id && (
             <div className="pt-3 border-t border-gray-100">
-              <div className="text-sm font-medium text-gray-900 mb-2">VPC 网络</div>
+              <div className="text-sm font-medium text-gray-900 mb-2">Bridge 网络</div>
               <div className="grid grid-cols-2 gap-y-2 text-sm">
-                <div className="text-gray-500">VPC 名称</div>
-                <div>{instance.vpc_name || '-'}</div>
-                <div className="text-gray-500">Bridge</div>
-                <div className="font-mono">{instance.vpc_bridge || '-'}</div>
+                <div className="text-gray-500">Bridge 名称</div>
+                <div>{instance.bridge_name || '-'}</div>
                 <div className="text-gray-500">CIDR</div>
-                <div className="font-mono">{instance.vpc_cidr || '-'}</div>
+                <div className="font-mono">{instance.bridge_cidr || '-'}</div>
                 <div className="text-gray-500">网关</div>
-                <div className="font-mono">{instance.vpc_gateway || '-'}</div>
+                <div className="font-mono">{instance.bridge_gateway || '-'}</div>
+                <div className="text-gray-500">内网 IPv4</div>
+                <div className="font-mono">{instance.internal_ipv4 || '-'}</div>
+                <div className="text-gray-500">EIP IPv4</div>
+                <div className="font-mono">{instance.ipv4_eip || '-'}</div>
               </div>
             </div>
           )}

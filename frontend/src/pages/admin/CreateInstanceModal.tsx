@@ -7,7 +7,7 @@ interface Node { id: string; name: string; status: string }
 interface StoragePool { name: string; driver: string; size: number; used: number }
 interface ImageTemplate { id: string; alias: string; name: string; type: string; distro: string; release: string; arch: string; downloaded: boolean; stage?: string }
 interface User { id: number; username: string }
-interface VPC { id: string; name: string; node_id: string; ipv4_cidr: string; default_gateway_v4: string; bridge_name: string }
+interface Bridge { id: string; name: string; node_id: string; ipv4_cidr: string; ipv4_gateway: string; bridge_name: string }
 
 interface Props {
   open: boolean
@@ -24,14 +24,14 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
   const [templates, setTemplates] = useState<ImageTemplate[]>([])
   const [storages, setStorages] = useState<StoragePool[]>([])
   const [users, setUsers] = useState<User[]>([])
-  const [vpcs, setVpcs] = useState<VPC[]>([])
+  const [bridges, setBridges] = useState<Bridge[]>([])
 
   const [name, setName] = useState('')
   const [type, setType] = useState<'container' | 'vm'>('container')
   const [nodeId, setNodeId] = useState('')
   const [templateId, setTemplateId] = useState('')
   const [assignToUserId, setAssignToUserId] = useState<number | ''>('')
-  const [vpcId, setVpcId] = useState('')
+  const [bridgeId, setBridgeId] = useState('')
 
   const [vcpu, setVcpu] = useState(1)
   const [memoryMb, setMemoryMb] = useState(512)
@@ -40,10 +40,8 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
 
   const [assignNat, setAssignNat] = useState(true)
   const [portMappingCount, setPortMappingCount] = useState(2)
-  const [assignIpv4, setAssignIpv4] = useState(false)
-  const [ipv4Count, setIpv4Count] = useState(0)
-  const [assignIpv6, setAssignIpv6] = useState(false)
-  const [ipv6Count, setIpv6Count] = useState(0)
+  const [assignEipv4, setAssignEipv4] = useState(false)
+  const [assignEipv6, setAssignEipv6] = useState(false)
 
   const [loginMethod, setLoginMethod] = useState<'auto' | 'password' | 'sshkey'>('auto')
   const [sshPassword, setSshPassword] = useState('')
@@ -86,18 +84,18 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
   }, [open, nodeId, type])
 
   useEffect(() => {
-    if (!nodeId) { setStorages([]); setVpcs([]); setVpcId(''); return }
+    if (!nodeId) { setStorages([]); setBridges([]); setBridgeId(''); return }
     apiClient.get(`/nodes/${nodeId}/storages`).then((r) => {
       const list = r.data.data || []
       setStorages(list)
       if (list.length > 0) setStoragePool(list[0].name)
     }).catch(() => setStorages([]))
-    // 加载节点VPC列表
-    apiClient.get('/network/vpcs', { params: { node_id: nodeId } }).then((r) => {
+    // 加载节点 Bridge 列表
+    apiClient.get('/network/bridges', { params: { node_id: nodeId } }).then((r) => {
       const list = r.data.data || []
-      setVpcs(list)
-      if (list.length > 0) setVpcId(list[0].id)
-    }).catch(() => { setVpcs([]); setVpcId('') })
+      setBridges(list)
+      if (list.length > 0) setBridgeId(list[0].id)
+    }).catch(() => { setBridges([]); setBridgeId('') })
   }, [nodeId])
 
   const resetForm = () => {
@@ -106,17 +104,15 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
     setNodeId('')
     setTemplateId('')
     setAssignToUserId('')
-    setVpcId('')
+    setBridgeId('')
     setVcpu(1)
     setMemoryMb(512)
     setDiskGb(5)
     setStoragePool('')
     setAssignNat(true)
     setPortMappingCount(2)
-    setAssignIpv4(false)
-    setIpv4Count(0)
-    setAssignIpv6(false)
-    setIpv6Count(0)
+    setAssignEipv4(false)
+    setAssignEipv6(false)
     setLoginMethod('auto')
     setSshPassword('')
     setSshPublicKey('')
@@ -151,18 +147,15 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
         image_key: templateId,
         node_id: nodeId,
         assign_to_user_id: assignToUserId,
-        vpc_id: vpcId || undefined,
+        bridge_id: bridgeId || undefined,
         login_method: loginMethod,
         vcpu,
         memory_mb: memoryMb,
         disk_gb: diskGb,
         storage_pool: storagePool || undefined,
-        assign_nat: assignNat,
+        assign_eip_ipv4: assignEipv4,
+        assign_eip_ipv6: assignEipv6,
         port_mapping_count: assignNat ? portMappingCount : 0,
-        assign_ipv4: assignIpv4,
-        ipv4_count: assignIpv4 ? ipv4Count : 0,
-        assign_ipv6: assignIpv6,
-        ipv6_count: assignIpv6 ? ipv6Count : 0,
         ssh_password: loginMethod === 'password' ? sshPassword : undefined,
         ssh_public_key: loginMethod === 'sshkey' ? sshPublicKey : undefined,
         network_down_mbps: networkDown || undefined,
@@ -282,25 +275,25 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
           {/* Step 2: 网络和SSH */}
           {step === 2 && (
             <div className="space-y-4">
-              {/* VPC 选择 */}
+              {/* Bridge 选择 */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">所属 VPC 网络</label>
-                <select value={vpcId} onChange={(e) => setVpcId(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
-                  {vpcs.length === 0 && <option value="">该节点暂无 VPC，请先创建</option>}
-                  {vpcs.map((v) => (
-                    <option key={v.id} value={v.id}>{v.name} ({v.ipv4_cidr})</option>
+                <label className="block text-sm font-medium text-gray-700 mb-1">所属 Bridge 网络</label>
+                <select value={bridgeId} onChange={(e) => setBridgeId(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+                  {bridges.length === 0 && <option value="">该节点暂无 Bridge，请先创建</option>}
+                  {bridges.map((b) => (
+                    <option key={b.id} value={b.id}>{b.name} ({b.ipv4_cidr})</option>
                   ))}
                 </select>
-                {vpcId && (
+                {bridgeId && (
                   <p className="text-xs text-gray-500 mt-1">
-                    网关: {vpcs.find((v) => v.id === vpcId)?.default_gateway_v4} | Bridge: {vpcs.find((v) => v.id === vpcId)?.bridge_name}
+                    网关: {bridges.find((b) => b.id === bridgeId)?.ipv4_gateway} | Bridge: {bridges.find((b) => b.id === bridgeId)?.bridge_name}
                   </p>
                 )}
               </div>
 
               <div className="flex items-center gap-2">
                 <input type="checkbox" id="nat" checked={assignNat} onChange={(e) => setAssignNat(e.target.checked)} className="w-4 h-4" />
-                <label htmlFor="nat" className="text-sm text-gray-700">自动分配 NAT 端口映射</label>
+                <label htmlFor="nat" className="text-sm text-gray-700">自动分配端口映射</label>
               </div>
               {assignNat && (
                 <div className="pl-6">
@@ -313,21 +306,15 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
               <div className="border-t border-gray-100 pt-4 grid grid-cols-2 gap-4">
                 <div>
                   <div className="flex items-center gap-2 mb-2">
-                    <input type="checkbox" id="ipv4" checked={assignIpv4} onChange={(e) => setAssignIpv4(e.target.checked)} className="w-4 h-4" />
-                    <label htmlFor="ipv4" className="text-sm font-medium text-gray-700">分配公网 IPv4</label>
+                    <input type="checkbox" id="eipv4" checked={assignEipv4} onChange={(e) => setAssignEipv4(e.target.checked)} className="w-4 h-4" />
+                    <label htmlFor="eipv4" className="text-sm font-medium text-gray-700">分配 EIP IPv4</label>
                   </div>
-                  {assignIpv4 && (
-                    <input type="number" min={1} max={64} value={ipv4Count} onChange={(e) => setIpv4Count(Math.max(1, Math.min(64, Number(e.target.value))))} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder="数量" />
-                  )}
                 </div>
                 <div>
                   <div className="flex items-center gap-2 mb-2">
-                    <input type="checkbox" id="ipv6" checked={assignIpv6} onChange={(e) => setAssignIpv6(e.target.checked)} className="w-4 h-4" />
-                    <label htmlFor="ipv6" className="text-sm font-medium text-gray-700">分配 IPv6 前缀</label>
+                    <input type="checkbox" id="eipv6" checked={assignEipv6} onChange={(e) => setAssignEipv6(e.target.checked)} className="w-4 h-4" />
+                    <label htmlFor="eipv6" className="text-sm font-medium text-gray-700">分配 EIP IPv6</label>
                   </div>
-                  {assignIpv6 && (
-                    <input type="number" min={1} max={64} value={ipv6Count} onChange={(e) => setIpv6Count(Math.max(1, Math.min(64, Number(e.target.value))))} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder="数量" />
-                  )}
                 </div>
               </div>
 

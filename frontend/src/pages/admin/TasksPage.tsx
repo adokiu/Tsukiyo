@@ -54,8 +54,10 @@ const typeMap: Record<string, string> = {
   apply_firewall: '应用防火墙',
   format_disk: '格式化磁盘',
   init_storage: '初始化存储',
+  create_partition: '创建分区',
+  delete_partition: '删除分区',
   migrate_instance: '迁移实例',
-  vpc_network: 'VPC 网络',
+  bridge_network: 'Bridge 网络',
 }
 
 export default function TasksPage() {

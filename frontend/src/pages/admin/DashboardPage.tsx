@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Server, Boxes, Monitor, Bell, Loader2 } from 'lucide-react'
+import { Server, Boxes, Monitor, Bell, Loader2, LayoutDashboard } from 'lucide-react'
 import apiClient from '@/api/client'
 
 interface DashboardData {
@@ -30,33 +30,38 @@ export default function DashboardPage() {
   ]
 
   return (
-    <div className="p-8">
-      <h1 className="text-2xl font-display font-semibold tracking-tight mb-8">{t('dashboard.title')}</h1>
+    <div className="page-container">
+      <div className="page-header">
+        <h1 className="page-title flex items-center gap-2">
+          <LayoutDashboard size={20} />
+          {t('nav.systemOverview')}
+        </h1>
+      </div>
 
       {loading && (
-        <div className="flex items-center gap-2 text-muted-foreground mb-8">
+        <div className="flex items-center gap-2 text-muted-foreground mb-4">
           <Loader2 size={18} className="animate-spin" />
-          <span className="text-sm">加载中...</span>
+          <span className="text-sm">{t('common.loading')}</span>
         </div>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
         {stats.map((s) => (
-          <div key={s.label} className="glass-card p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gray-100 dark:bg-gray-700">
-                <s.icon className="text-black dark:text-white" size={20} />
+          <div key={s.label} className="page-card p-5">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#e6f4ff] text-[#087ed1]">
+                <s.icon size={18} />
               </div>
             </div>
-            <p className="text-3xl font-display font-semibold tracking-tight">{s.value}</p>
-            <p className="text-sm text-muted-foreground mt-1">{s.label}</p>
+            <p className="text-2xl font-semibold">{s.value}</p>
+            <p className="text-sm text-[#8597ab] mt-1">{s.label}</p>
           </div>
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-        <div className="lg:col-span-2 glass-card p-6">
-          <h3 className="text-base font-semibold mb-4">节点资源</h3>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 page-card p-5">
+          <h3 className="text-base font-semibold mb-4">{t('dashboard.nodesOverview')}</h3>
           {data && data.node_resources.length > 0 ? (
             <div className="space-y-3">
               {data.node_resources.map((node) => (
@@ -74,8 +79,8 @@ export default function DashboardPage() {
             <div className="h-64 flex items-center justify-center text-muted-foreground text-sm">{t('common.noData')}</div>
           )}
         </div>
-        <div className="glass-card p-6">
-          <h3 className="text-base font-semibold mb-4">最近任务</h3>
+        <div className="page-card p-5">
+          <h3 className="text-base font-semibold mb-4">{t('dashboard.recentActivity')}</h3>
           {data && data.recent_tasks.length > 0 ? (
             <div className="space-y-3">
               {data.recent_tasks.map((task) => (
