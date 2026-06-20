@@ -1,14 +1,15 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"tsukiyo/agent/internal/network"
 	"tsukiyo/agent/internal/reconcile"
 	"tsukiyo/agent/internal/security"
+	"tsukiyo/agent/internal/system"
 	"tsukiyo/agent/internal/task"
 	"tsukiyo/agent/internal/ws"
 	"tsukiyo/agent/pkg/logger"
@@ -69,6 +71,9 @@ func main() {
 		moduleMu     sync.Mutex
 	)
 
+	// 采集静态数据（CPU型号、内存条、GPU、环境工具版本等，仅启动时采集一次）
+	system.InitStaticProbe()
+
 	// 初始化 WebSocket 客户端
 	wsClient := ws.NewClient(config.AppConfig)
 
@@ -89,25 +94,25 @@ func main() {
 		if ic != nil {
 			applyConfig(config.AppConfig, ic)
 
-			// 解析 VPC 配置并执行全量状态对齐
-			if vpcsRaw, ok := data["vpcs"]; ok {
-				var vpcs []reconcile.VPCConfig
-				if rawJSON, err := json.Marshal(vpcsRaw); err == nil {
-					if err := json.Unmarshal(rawJSON, &vpcs); err == nil {
-						zap.L().Info("收到 VPC 配置，执行状态对齐", zap.Int("count", len(vpcs)))
+			// 解析 Bridge 配置并执行全量状态对齐
+			if bridgesRaw, ok := data["bridges"]; ok {
+				var bridges []reconcile.BridgeConfig
+				if rawJSON, err := json.Marshal(bridgesRaw); err == nil {
+					if err := json.Unmarshal(rawJSON, &bridges); err == nil {
+						zap.L().Info("收到 Bridge 配置，执行状态对齐", zap.Int("count", len(bridges)))
 						r := reconcile.NewReconciler(ic)
-						if err := r.Reconcile(vpcs); err != nil {
-							zap.L().Error("VPC 状态对齐失败", zap.Error(err))
+						if err := r.Reconcile(bridges); err != nil {
+							zap.L().Error("Bridge 状态对齐失败", zap.Error(err))
 						}
 					} else {
-						zap.L().Warn("解析 VPC 配置失败", zap.Error(err))
+						zap.L().Warn("解析 Bridge 配置失败", zap.Error(err))
 					}
 				}
 			} else {
-				if vpcs, err := reconcile.LoadDesiredState(); err == nil && len(vpcs) > 0 {
-					zap.L().Info("使用本地持久化 VPC 状态进行恢复", zap.Int("count", len(vpcs)))
+				if bridges, err := reconcile.LoadDesiredState(); err == nil && len(bridges) > 0 {
+					zap.L().Info("使用本地持久化 Bridge 状态进行恢复", zap.Int("count", len(bridges)))
 					r := reconcile.NewReconciler(ic)
-					_ = r.Reconcile(vpcs)
+					_ = r.Reconcile(bridges)
 				}
 			}
 
@@ -184,7 +189,17 @@ func main() {
 	// 初始化任务执行器
 	taskExecutor := task.NewExecutor(config.AppConfig, ic, netManager, wsClient)
 	wsClient.SetTaskHandler(func(taskID string, taskType string, payload json.RawMessage) (json.RawMessage, error) {
-		return taskExecutor.Execute(taskType, payload)
+		// 将 task_id 注入 payload
+		var raw map[string]interface{}
+		if err := json.Unmarshal(payload, &raw); err != nil {
+			return taskExecutor.Execute(taskType, payload)
+		}
+		raw["task_id"] = taskID
+		newPayload, err := json.Marshal(raw)
+		if err != nil {
+			return taskExecutor.Execute(taskType, payload)
+		}
+		return taskExecutor.Execute(taskType, newPayload)
 	})
 
 	// 注册 Master 同步请求处理器
@@ -226,6 +241,164 @@ func main() {
 				"images": images,
 				"total":  len(images),
 			})
+		case "get_disks":
+			return handleGetDisks()
+		case "delete_storage":
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析删除存储池参数失败: %w", err)
+			}
+			detail, err := ic.GetStoragePool(req.Name)
+			if err != nil {
+				return nil, fmt.Errorf("查询存储池 %s 失败: %w", req.Name, err)
+			}
+			if len(detail.UsedBy) > 0 {
+				return nil, fmt.Errorf("存储池 %s 仍有 %d 个资源在使用，无法删除", req.Name, len(detail.UsedBy))
+			}
+			if err := ic.DeleteStoragePool(req.Name); err != nil {
+				return nil, err
+			}
+			return json.Marshal(map[string]interface{}{"deleted": true, "name": req.Name})
+		case "get_volumes":
+			var req struct {
+				Pool string `json:"pool"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析获取卷列表参数失败: %w", err)
+			}
+			volumes, err := ic.ListStorageVolumes(req.Pool)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(volumes)
+		case "get_storage_resources":
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析获取存储资源参数失败: %w", err)
+			}
+			res, err := ic.GetStoragePoolResources(req.Name)
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(res)
+		case "add_port_mapping":
+			var req struct {
+				InstanceID    string `json:"instance_id"`
+				HostPort      int    `json:"host_port"`
+				ContainerPort int    `json:"container_port"`
+				Protocol      string `json:"protocol"`
+				HostIP        string `json:"host_ip"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析端口映射参数失败: %w", err)
+			}
+			ips, err := ic.GetInstanceNetworkInfo(req.InstanceID)
+			if err != nil || len(ips) == 0 {
+				return nil, fmt.Errorf("获取实例 %s 内网 IP 失败", req.InstanceID)
+			}
+			hostIP := req.HostIP
+			if idx := strings.Index(hostIP, "/"); idx > 0 {
+				hostIP = hostIP[:idx]
+			}
+			if hostIP == "" {
+				hostIP = "0.0.0.0"
+			}
+			deviceName := fmt.Sprintf("proxy-%d-%s", req.HostPort, req.Protocol)
+			listenAddr := fmt.Sprintf("%s:%s:%d", req.Protocol, hostIP, req.HostPort)
+			connectAddr := fmt.Sprintf("%s:%s:%d", req.Protocol, ips[0], req.ContainerPort)
+			if err := ic.AddProxyDevice(req.InstanceID, deviceName, listenAddr, connectAddr); err != nil {
+				return nil, fmt.Errorf("添加端口映射失败: %w", err)
+			}
+			return json.Marshal(map[string]interface{}{
+				"success":     true,
+				"device_name": deviceName,
+				"listen":      listenAddr,
+				"connect":     connectAddr,
+			})
+		case "del_port_mapping":
+			var req struct {
+				InstanceID string `json:"instance_id"`
+				HostPort   int    `json:"host_port"`
+				Protocol   string `json:"protocol"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析删除端口映射参数失败: %w", err)
+			}
+			deviceName := fmt.Sprintf("proxy-%d-%s", req.HostPort, req.Protocol)
+			if err := ic.RemoveProxyDevice(req.InstanceID, deviceName); err != nil {
+				return nil, fmt.Errorf("删除端口映射失败: %w", err)
+			}
+			return json.Marshal(map[string]interface{}{"deleted": true, "device_name": deviceName})
+		case "reset_password":
+			var req struct {
+				InstanceID string `json:"instance_id"`
+				Password   string `json:"password"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析重置密码参数失败: %w", err)
+			}
+			if err := ic.SetInstancePassword(req.InstanceID, req.Password); err != nil {
+				return nil, fmt.Errorf("重置密码失败: %w", err)
+			}
+			return json.Marshal(map[string]interface{}{"success": true, "instance_id": req.InstanceID})
+		case "add_firewall_rule":
+			var req struct {
+				Direction string `json:"direction"`
+				Protocol  string `json:"protocol"`
+				Source    string `json:"source"`
+				Port      int    `json:"port"`
+				Action    string `json:"action"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析防火墙规则参数失败: %w", err)
+			}
+			netManager.AddFirewallRule(req.Direction, req.Protocol, req.Source, req.Port, req.Action)
+			return json.Marshal(map[string]interface{}{"success": true})
+		case "del_firewall_rule":
+			var req struct {
+				Direction string `json:"direction"`
+				Protocol  string `json:"protocol"`
+				Source    string `json:"source"`
+				Port      int    `json:"port"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析删除防火墙规则参数失败: %w", err)
+			}
+			netManager.RemoveFirewallRule(req.Direction, req.Protocol, req.Source, req.Port)
+			return json.Marshal(map[string]interface{}{"deleted": true})
+		case "add_ip":
+			var req struct {
+				CIDR      string `json:"cidr"`
+				Interface string `json:"interface"`
+			}
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, fmt.Errorf("解析参数失败: %w", err)
+			}
+			if req.CIDR == "" {
+				return nil, fmt.Errorf("cidr 不能为空")
+			}
+			if err := netManager.BindIP(req.CIDR, req.Interface); err != nil {
+				return nil, fmt.Errorf("添加 IP 失败: %w", err)
+			}
+			return json.Marshal(map[string]interface{}{"success": true})
+		case "bridge_network":
+			return taskExecutor.Execute("bridge_network", payload)
+		case "bind_bridge_egress":
+			return taskExecutor.Execute("bind_bridge_egress", payload)
+		case "unbind_bridge_egress":
+			return taskExecutor.Execute("unbind_bridge_egress", payload)
+		case "create_partition":
+			return taskExecutor.Execute("create_partition", payload)
+		case "delete_partition":
+			return taskExecutor.Execute("delete_partition", payload)
+		case "format_disk":
+			return taskExecutor.Execute("format_disk", payload)
+		case "init_storage":
+			return taskExecutor.Execute("init_storage", payload)
 		default:
 			return nil, fmt.Errorf("未知请求类型: %s", reqType)
 		}
@@ -236,65 +409,37 @@ func main() {
 	collector.Start()
 
 	// 初始化安全扫描器
-	scanner = security.NewScanner(config.AppConfig, netManager)
+	scanner = security.NewScanner(config.AppConfig, netManager, wsClient)
 	scanner.Start()
 
-	// 初始化控制台代理
-	consoleProxy = console.NewProxy(config.AppConfig)
+	// 初始化统一 HTTP 服务（健康检查 + 控制台代理 + Token 鉴权）
+	consoleProxy = console.NewProxy(config.AppConfig, wsClient)
 	go func() {
 		if err := consoleProxy.ServeHTTP(); err != nil {
-			zap.L().Error("控制台代理异常", zap.Error(err))
+			zap.L().Error("统一 HTTP 服务异常", zap.Error(err))
 		}
 	}()
 
 	// 首次上报本地 Incus 镜像列表
 	go func() {
 		time.Sleep(3 * time.Second)
+		if !ic.IsAvailable() {
+			return
+		}
 		syncLocalImages(ic, wsClient)
 	}()
 
 	// 确保所有 bridge 网络启用 NAT
 	go func() {
 		time.Sleep(2 * time.Second)
+		if !ic.IsAvailable() {
+			return
+		}
 		r := reconcile.NewReconciler(ic)
 		r.EnsureAllBridgeNAT()
 	}()
 
-	// 健康检查 HTTP
 	var wg sync.WaitGroup
-	healthMux := http.NewServeMux()
-	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		status := map[string]interface{}{
-			"status":    "healthy",
-			"version":   agentVersion,
-			"connected": wsClient.IsConnected(),
-			"timestamp": time.Now().Unix(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(status)
-	})
-	healthMux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		ready := wsClient.IsConnected()
-		if ready {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"ready":true}`))
-		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"ready":false}`))
-		}
-	})
-	healthServer := &http.Server{
-		Addr:    ":9090",
-		Handler: healthMux,
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		zap.L().Info("健康检查服务启动", zap.String("addr", ":9090"))
-		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			zap.L().Error("健康检查服务异常", zap.Error(err))
-		}
-	}()
 
 	// systemd notify
 	systemdNotify("READY=1")
@@ -309,10 +454,6 @@ func main() {
 	zap.L().Info("收到退出信号，正在关闭...")
 
 	// 优雅关闭
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	healthServer.Shutdown(ctx)
-
 	wsClient.Shutdown()
 	collector.Stop()
 	scanner.Stop()
@@ -322,9 +463,14 @@ func main() {
 }
 
 func syncLocalImages(ic *incus.Client, wsClient *ws.Client) {
+	if !ic.IsAvailable() {
+		return
+	}
 	aliases, err := ic.ListImages()
 	if err != nil {
-		zap.L().Warn("查询本地 Incus 镜像失败", zap.Error(err))
+		if ic.IsAvailable() {
+			zap.L().Warn("查询本地 Incus 镜像失败", zap.Error(err))
+		}
 		return
 	}
 	if len(aliases) == 0 {
@@ -338,32 +484,42 @@ func syncLocalImages(ic *incus.Client, wsClient *ws.Client) {
 }
 
 func applyConfig(cfg *config.Config, ic *incus.Client) {
-	poolName := cfg.DefaultStoragePool()
-	poolType := cfg.StoragePoolType()
-	poolSource := cfg.StoragePoolSource()
+	// 同步镜像源 remote 到 Incus
+	syncImageRemote(cfg, ic)
+}
 
-	if poolName == "" || poolType == "" {
-		zap.L().Debug("存储池配置未指定，跳过")
+// syncImageRemote 根据配置同步镜像源 remote 到 Incus
+func syncImageRemote(cfg *config.Config, ic *incus.Client) {
+	remoteURL := cfg.ImageRemoteURL()
+	remoteName, serverURL := parseRemoteConfig(remoteURL)
+	if remoteName == "" || serverURL == "" {
 		return
 	}
-
-	if ic.StoragePoolExists(poolName) {
-		zap.L().Info("存储池已存在，跳过创建",
-			zap.String("pool", poolName))
-		return
-	}
-
-	zap.L().Info("正在创建存储池",
-		zap.String("pool", poolName),
-		zap.String("type", poolType),
-		zap.String("source", poolSource))
-
-	if err := ic.CreateStoragePool(poolName, poolType, poolSource); err != nil {
-		zap.L().Error("创建存储池失败",
-			zap.String("pool", poolName),
-			zap.Error(err))
+	if err := ic.SyncRemote(remoteName, serverURL); err != nil {
+		zap.L().Warn("同步镜像源 remote 失败", zap.String("remote", remoteName), zap.String("url", serverURL), zap.Error(err))
 	} else {
-		zap.L().Info("存储池创建成功", zap.String("pool", poolName))
+		zap.L().Info("镜像源 remote 同步成功", zap.String("remote", remoteName), zap.String("url", serverURL))
+	}
+}
+
+// parseRemoteConfig 解析镜像源配置，返回 remote 名称和服务器 URL
+// "spiritlhl:" -> ("spiritlhl", "https://incusimages.spiritlhl.net")
+// "images:" -> ("images", "https://images.linuxcontainers.org")
+// "https://mirror.example.com" -> ("tsukiyo-mirror", "https://mirror.example.com")
+// "" -> ("spiritlhl", "https://incusimages.spiritlhl.net")
+func parseRemoteConfig(remoteURL string) (name, serverURL string) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	remoteURL = strings.TrimSuffix(remoteURL, ":")
+	switch remoteURL {
+	case "", "spiritlhl":
+		return "spiritlhl", "https://incusimages.spiritlhl.net"
+	case "images":
+		return "images", "https://images.linuxcontainers.org"
+	default:
+		if strings.HasPrefix(remoteURL, "http://") || strings.HasPrefix(remoteURL, "https://") {
+			return "tsukiyo-mirror", strings.TrimRight(remoteURL, "/")
+		}
+		return "spiritlhl", "https://incusimages.spiritlhl.net"
 	}
 }
 
@@ -381,4 +537,141 @@ func getDefaultConfigPath() string {
 		return "config.yaml"
 	}
 	return filepath.Join(filepath.Dir(exe), "config.yaml")
+}
+
+type partitionInfoResult struct {
+	Device     string `json:"device"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	Used       int64  `json:"used,omitempty"`
+	Type       string `json:"type,omitempty"`
+	Filesystem string `json:"filesystem,omitempty"`
+	MountPoint string `json:"mount_point,omitempty"`
+	IsSystem   bool   `json:"is_system"`
+}
+
+type diskInfoResult struct {
+	Device     string                `json:"device"`
+	Size       int64                 `json:"size"`
+	Used       int64                 `json:"used,omitempty"`
+	Model      string                `json:"model,omitempty"`
+	Serial     string                `json:"serial,omitempty"`
+	Type       string                `json:"type,omitempty"`
+	Filesystem string                `json:"filesystem,omitempty"`
+	MountPoint string                `json:"mount_point,omitempty"`
+	IsSystem   bool                  `json:"is_system"`
+	IsInUse    bool                  `json:"is_in_use"`
+	Partitions []partitionInfoResult `json:"partitions,omitempty"`
+}
+
+func handleGetDisks() (json.RawMessage, error) {
+	// 获取各挂载点使用量
+	usedMap := make(map[string]int64)
+	dfCmd := exec.Command("df", "-B1", "--output=used,target")
+	if dfOut, err := dfCmd.CombinedOutput(); err == nil {
+		lines := strings.Split(string(dfOut), "\n")
+		for i, line := range lines {
+			if i == 0 {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				used, _ := strconv.ParseInt(fields[0], 10, 64)
+				usedMap[fields[1]] = used
+			}
+		}
+	}
+
+	cmd := exec.Command("lsblk", "--json", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("lsblk 执行失败: %w, output: %s", err, string(output))
+	}
+
+	var lsblkOutput struct {
+		BlockDevices []struct {
+			Name       string `json:"name"`
+			Size       int64  `json:"size"`
+			Type       string `json:"type"`
+			Fstype     string `json:"fstype"`
+			Mountpoint string `json:"mountpoint"`
+			Model      string `json:"model"`
+			Serial     string `json:"serial"`
+			Children   []struct {
+				Name       string `json:"name"`
+				Size       int64  `json:"size"`
+				Type       string `json:"type"`
+				Fstype     string `json:"fstype"`
+				Mountpoint string `json:"mountpoint"`
+			} `json:"children"`
+		} `json:"blockdevices"`
+	}
+	if err := json.Unmarshal(output, &lsblkOutput); err != nil {
+		return nil, fmt.Errorf("解析 lsblk 输出失败: %w", err)
+	}
+
+	var disks []diskInfoResult
+	for _, dev := range lsblkOutput.BlockDevices {
+		if dev.Type != "disk" {
+			continue
+		}
+
+		isSystem := false
+		isInUse := false
+		fstype := dev.Fstype
+		mountpoint := dev.Mountpoint
+
+		if mountpoint == "/" || mountpoint == "/boot" || strings.HasPrefix(mountpoint, "/boot") {
+			isSystem = true
+		}
+		if fstype != "" || mountpoint != "" {
+			isInUse = true
+		}
+
+		var partitions []partitionInfoResult
+		for _, child := range dev.Children {
+			if child.Mountpoint == "/" || child.Mountpoint == "/boot" || strings.HasPrefix(child.Mountpoint, "/boot") {
+				isSystem = true
+			}
+			if child.Fstype != "" || child.Mountpoint != "" {
+				isInUse = true
+			}
+			if fstype == "" && child.Fstype != "" {
+				fstype = child.Fstype
+			}
+			if mountpoint == "" && child.Mountpoint != "" {
+				mountpoint = child.Mountpoint
+			}
+
+			childDevice := "/dev/" + child.Name
+			childIsSystem := child.Mountpoint == "/" || child.Mountpoint == "/boot" || strings.HasPrefix(child.Mountpoint, "/boot")
+
+			partitions = append(partitions, partitionInfoResult{
+				Device:     childDevice,
+				Name:       child.Name,
+				Size:       child.Size,
+				Used:       usedMap[child.Mountpoint],
+				Type:       child.Type,
+				Filesystem: child.Fstype,
+				MountPoint: child.Mountpoint,
+				IsSystem:   childIsSystem,
+			})
+		}
+
+		disks = append(disks, diskInfoResult{
+			Device:     "/dev/" + dev.Name,
+			Size:       dev.Size,
+			Used:       usedMap[mountpoint],
+			Model:      strings.TrimSpace(dev.Model),
+			Serial:     strings.TrimSpace(dev.Serial),
+			Type:       dev.Type,
+			Filesystem: fstype,
+			MountPoint: mountpoint,
+			IsSystem:   isSystem,
+			IsInUse:    isInUse,
+			Partitions: partitions,
+		})
+	}
+
+	return json.Marshal(disks)
 }

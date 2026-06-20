@@ -3,16 +3,19 @@ package incus
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -20,8 +23,12 @@ import (
 
 // Client Incus API 客户端
 type Client struct {
-	httpClient *http.Client
-	baseURL    string
+	httpClient  *http.Client
+	baseURL     string
+	socketPath  string
+	avail       atomic.Bool  // Incus 是否可用
+	consecFail  atomic.Int64 // 连续失败次数
+	lastLogTime atomic.Int64 // 上次错误日志时间 (unix nano)
 }
 
 // NewClient 创建 Incus 客户端
@@ -30,19 +37,63 @@ func NewClient(socketPath string) (*Client, error) {
 		socketPath = "/var/lib/incus/unix.socket"
 	}
 
+	c := &Client{
+		socketPath: socketPath,
+		baseURL:    "http://unix/1.0",
+	}
+	c.avail.Store(true) // 初始假设可用，首次失败后自动切换
+
 	transport := &http.Transport{
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			return net.Dial("unix", socketPath)
 		},
 	}
 
-	return &Client{
-		httpClient: &http.Client{
-			Transport: transport,
-			Timeout:   60 * time.Second,
-		},
-		baseURL: "http://unix/1.0",
-	}, nil
+	c.httpClient = &http.Client{
+		Transport: transport,
+		Timeout:   90 * time.Second,
+	}
+	return c, nil
+}
+
+// IsAvailable 返回 Incus 是否可用
+func (c *Client) IsAvailable() bool {
+	return c.avail.Load()
+}
+
+// SocketPath 返回 socket 路径
+func (c *Client) SocketPath() string {
+	return c.socketPath
+}
+
+// markSuccess 标记请求成功，重置失败计数
+func (c *Client) markSuccess() {
+	wasDown := !c.avail.Load()
+	c.consecFail.Store(0)
+	c.avail.Store(true)
+	if wasDown {
+		zap.L().Info("Incus 连接已恢复", zap.String("socket", c.socketPath))
+	}
+}
+
+// markFailure 标记请求失败，返回是否应该记录日志（抑制刷屏）
+func (c *Client) markFailure() bool {
+	failures := c.consecFail.Add(1)
+	c.avail.Store(false)
+
+	// 首次失败立即记录
+	if failures == 1 {
+		return true
+	}
+
+	// 后续失败每 30 秒最多记录一次
+	now := time.Now().UnixNano()
+	last := c.lastLogTime.Load()
+	if now-last > int64(30*time.Second) {
+		c.lastLogTime.Store(now)
+		return true
+	}
+	return false
 }
 
 // doRequest 执行 HTTP 请求
@@ -66,9 +117,15 @@ func (c *Client) doRequest(method, path string, body interface{}) (*http.Respons
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		zap.L().Error("Incus HTTP 请求失败", zap.String("method", method), zap.String("path", path), zap.Error(err))
+		if c.markFailure() {
+			zap.L().Error("Incus 不可达", zap.String("socket", c.socketPath),
+				zap.String("method", method), zap.String("path", path),
+				zap.Int64("consecutive_failures", c.consecFail.Load()),
+				zap.Error(err))
+		}
 		return nil, err
 	}
+	c.markSuccess()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		zap.L().Warn("Incus HTTP 响应非 2xx", zap.String("method", method), zap.String("path", path), zap.Int("status", resp.StatusCode))
 		body, _ := io.ReadAll(resp.Body)
@@ -115,31 +172,85 @@ func parseResponse(resp *http.Response, out interface{}) (string, error) {
 	return base.Operation, nil
 }
 
+// parseOperationWaitResponse 解析 /operations/{id}/wait 响应，兼容 metadata 与顶层 status
+func parseOperationWaitResponse(resp *http.Response) (status, errMsg string, err error) {
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	var base struct {
+		Type       string          `json:"type"`
+		Status     string          `json:"status"`
+		StatusCode int             `json:"status_code"`
+		Error      string          `json:"error"`
+		Metadata   json.RawMessage `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &base); err != nil {
+		return "", "", err
+	}
+	if base.Type == "error" || base.StatusCode >= 400 {
+		msg := base.Error
+		if msg == "" {
+			msg = string(data)
+		}
+		return "", "", fmt.Errorf("incus error: %s", msg)
+	}
+	var meta struct {
+		Status string `json:"status"`
+		Err    string `json:"err"`
+	}
+	if base.Metadata != nil {
+		_ = json.Unmarshal(base.Metadata, &meta)
+	}
+	status = meta.Status
+	if status == "" {
+		status = base.Status
+	}
+	return status, meta.Err, nil
+}
+
 // waitOperation 等待异步操作完成
 func (c *Client) waitOperation(opID string) error {
-	for i := 0; i < 300; i++ {
-		resp, err := c.doRequest("GET", "/operations/"+opID+"/wait?timeout=30", nil)
+	return c.waitOperationTimeout(opID, 5*time.Minute)
+}
+
+// waitOperationTimeout 在限定时间内等待 operation 完成
+func (c *Client) waitOperationTimeout(opID string, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		waitSec := 10
+		if remaining < time.Duration(waitSec)*time.Second {
+			waitSec = int(remaining.Seconds())
+			if waitSec < 1 {
+				waitSec = 1
+			}
+		}
+		resp, err := c.doRequest("GET", fmt.Sprintf("/operations/%s/wait?timeout=%d", opID, waitSec), nil)
+		if err != nil {
+			// 网络错误，短暂等待后重试
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		status, errMsg, err := parseOperationWaitResponse(resp)
 		if err != nil {
 			return err
 		}
-		// parseResponse 已将外层 metadata 剥离，直接解析 operation 对象
-		var result struct {
-			Status     string `json:"status"`
-			Err        string `json:"err"`
-			StatusCode int    `json:"status_code"`
-		}
-		if _, err := parseResponse(resp, &result); err != nil {
-			return err
-		}
-		if result.Status == "Success" {
+		zap.L().Debug("operation 等待中", zap.String("op_id", opID), zap.String("status", status))
+		switch status {
+		case "Success":
 			return nil
+		case "Failure":
+			if errMsg == "" {
+				errMsg = "unknown error"
+			}
+			return fmt.Errorf("operation failed: %s", errMsg)
+		case "Cancelled":
+			return fmt.Errorf("operation cancelled")
 		}
-		if result.Status == "Failure" {
-			return fmt.Errorf("operation failed: %s", result.Err)
-		}
-		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("operation timeout")
+	return fmt.Errorf("operation timeout after %s", maxWait)
 }
 
 // GetServerInfo 获取服务器信息
@@ -192,7 +303,7 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 		"type":    "nic",
 	}
 
-	// VPC 网络配置：使用 Incus managed network（NAT + IP 分配由 Incus 处理）
+	// Bridge 网络配置：使用 Incus managed network（NAT + IP 分配由 Incus 处理）
 	if req.BridgeName != "" {
 		delete(nicDevice, "nictype")
 		nicDevice["network"] = req.BridgeName
@@ -224,6 +335,9 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	if req.UserData != "" {
 		configMap["user.user-data"] = req.UserData
 	}
+	if req.NetworkConfig != "" {
+		configMap["user.network-config"] = req.NetworkConfig
+	}
 
 	body := map[string]interface{}{
 		"name":    req.Name,
@@ -233,7 +347,7 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	}
 	if req.BridgeName != "" {
 		body["profiles"] = []string{}
-		zap.L().Info("VPC 模式排除默认 profile", zap.String("name", req.Name))
+		zap.L().Info("Bridge 模式排除默认 profile", zap.String("name", req.Name))
 	}
 	if req.Type == "" {
 		body["type"] = "container"
@@ -250,6 +364,10 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 
 	opStr, err := parseResponse(resp, nil)
 	if err != nil {
+		if c.InstanceExists(req.Name) {
+			zap.L().Warn("CreateInstance 实例已存在，跳过创建", zap.String("name", req.Name), zap.Error(err))
+			return req.Name, nil
+		}
 		zap.L().Error("CreateInstance 解析响应失败", zap.String("name", req.Name), zap.Error(err))
 		return "", err
 	}
@@ -261,10 +379,18 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 	}
 
 	opID := filepath.Base(opStr)
-	zap.L().Info("CreateInstance 等待 operation", zap.String("name", req.Name), zap.String("op_id", opID))
-	if err := c.waitOperation(opID); err != nil {
-		zap.L().Error("CreateInstance waitOperation 失败", zap.String("name", req.Name), zap.String("op_id", opID), zap.Error(err))
-		return "", err
+	zap.L().Info("CreateInstance 等待 operation（Incus 创建容器）", zap.String("name", req.Name), zap.String("op_id", opID))
+	if err := c.waitOperationTimeout(opID, 120*time.Second); err != nil {
+		if c.InstanceExists(req.Name) {
+			zap.L().Warn("CreateInstance operation 等待异常但实例已存在，等待存储就绪后继续", zap.String("name", req.Name), zap.Error(err))
+			// 等待存储目录就绪
+			if err := c.waitForInstanceStorage(req.Name, req.StoragePool, 30*time.Second); err != nil {
+				zap.L().Warn("CreateInstance 等待存储就绪失败", zap.String("name", req.Name), zap.Error(err))
+			}
+		} else {
+			zap.L().Error("CreateInstance waitOperation 失败", zap.String("name", req.Name), zap.String("op_id", opID), zap.Error(err))
+			return "", err
+		}
 	}
 	zap.L().Info("CreateInstance operation 完成", zap.String("name", req.Name))
 
@@ -273,18 +399,55 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 
 // StartInstance 启动实例
 func (c *Client) StartInstance(name string) error {
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/instances/%s/state", name), map[string]string{"action": "start"})
-	if err != nil {
-		return err
+	return c.StartInstanceWithPool(name, "")
+}
+
+// StartInstanceWithPool 启动实例，指定存储池用于等待存储就绪
+func (c *Client) StartInstanceWithPool(name, pool string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			zap.L().Info("StartInstance 重试", zap.String("name", name), zap.Int("attempt", attempt+1))
+			if err := c.waitForInstanceStorage(name, pool, 30*time.Second); err != nil {
+				zap.L().Warn("StartInstance 等待存储就绪失败", zap.String("name", name), zap.Error(err))
+			}
+		}
+		resp, err := c.doRequest("PUT", fmt.Sprintf("/instances/%s/state", name), map[string]string{"action": "start"})
+		if err != nil {
+			lastErr = err
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		opStr, err := parseResponse(resp, nil)
+		if err != nil {
+			if isInstanceAlreadyRunning(err) {
+				return nil
+			}
+			lastErr = err
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		if opStr != "" {
+			if err := c.waitOperation(filepath.Base(opStr)); err != nil {
+				if isInstanceAlreadyRunning(err) {
+					return nil
+				}
+				lastErr = err
+				time.Sleep(3 * time.Second)
+				continue
+			}
+		}
+		return nil
 	}
-	opStr, err := parseResponse(resp, nil)
-	if err != nil {
-		return err
+	return lastErr
+}
+
+func isInstanceAlreadyRunning(err error) bool {
+	if err == nil {
+		return false
 	}
-	if opStr != "" {
-		return c.waitOperation(filepath.Base(opStr))
-	}
-	return nil
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already running") || strings.Contains(msg, "is already running")
 }
 
 // StopInstance 停止实例
@@ -325,10 +488,8 @@ func (c *Client) RestartInstance(name string) error {
 
 // DeleteInstance 删除实例（先强制停止再删除）
 func (c *Client) DeleteInstance(name string) error {
-	// 1. 获取实例状态
 	info, err := c.GetInstance(name)
 	if err != nil {
-		// 实例已不存在，视为成功
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Not found") {
 			zap.L().Info("实例已不存在，删除成功", zap.String("name", name))
 			return nil
@@ -336,7 +497,8 @@ func (c *Client) DeleteInstance(name string) error {
 		return fmt.Errorf("获取实例状态失败: %w", err)
 	}
 
-	// 2. 如果正在运行，先强制停止
+	pool := instanceStoragePool(info)
+
 	if info.Status == "Running" || info.Status == "Frozen" {
 		zap.L().Info("实例正在运行，先强制停止", zap.String("name", name), zap.String("status", info.Status))
 		stopBody := map[string]interface{}{
@@ -357,12 +519,117 @@ func (c *Client) DeleteInstance(name string) error {
 				zap.L().Warn("停止实例等待失败，继续尝试删除", zap.Error(err))
 			}
 		}
-		// 给 Incus 一点时间完成状态切换
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 3. 删除实例
-	resp, err := c.doRequest("DELETE", fmt.Sprintf("/instances/%s", name), nil)
+	if err := c.deleteInstanceAPI(name, true); err == nil {
+		return nil
+	} else if !isStorageDeleteError(err) {
+		return err
+	}
+
+	zap.L().Warn("Incus 删除存储卷失败，尝试强制清理后重试",
+		zap.String("name", name),
+		zap.String("pool", pool),
+		zap.Error(err))
+
+	if cleanupErr := c.forceCleanupContainerStorage(pool, name); cleanupErr != nil {
+		zap.L().Warn("强制清理容器存储目录失败", zap.Error(cleanupErr))
+	}
+	_ = c.deleteStorageVolumeForce(pool, "container", name)
+
+	if err := c.deleteInstanceAPI(name, true); err == nil {
+		return nil
+	} else if !isStorageDeleteError(err) {
+		return err
+	}
+
+	if err := c.deleteInstanceCLI(name); err == nil {
+		return nil
+	} else if !c.InstanceExists(name) {
+		return nil
+	}
+	return err
+}
+
+func instanceStoragePool(info *InstanceInfo) string {
+	if info == nil || info.Devices == nil {
+		return "default"
+	}
+	if root, ok := info.Devices["root"].(map[string]interface{}); ok {
+		if pool, ok := root["pool"].(string); ok && pool != "" {
+			return pool
+		}
+	}
+	return "default"
+}
+
+func isStorageDeleteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "deleting storage volume") ||
+		strings.Contains(msg, "btrfs subvolume") ||
+		strings.Contains(msg, "not a btrfs subvolume")
+}
+
+func (c *Client) storagePoolsDir() string {
+	if info, err := c.GetServerInfo(); err == nil {
+		storage := info.Environment.Storage
+		if strings.HasPrefix(storage, "/") {
+			if strings.HasSuffix(storage, "storage-pools") {
+				return storage
+			}
+			return filepath.Join(storage, "storage-pools")
+		}
+	}
+	return "/var/lib/incus/storage-pools"
+}
+
+// waitForInstanceStorage 等待实例存储目录就绪
+func (c *Client) waitForInstanceStorage(name, pool string, maxWait time.Duration) error {
+	if pool == "" {
+		pool = "default"
+	}
+	base := filepath.Join(c.storagePoolsDir(), pool, "containers", name)
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(base); err == nil {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("等待实例存储目录就绪超时: %s", base)
+}
+
+func (c *Client) forceCleanupContainerStorage(pool, name string) error {
+	base := filepath.Join(c.storagePoolsDir(), pool)
+	paths := []string{
+		filepath.Join(base, "containers", name),
+		filepath.Join(base, "containers-snapshots", name),
+		filepath.Join(base, "custom", name),
+	}
+	var lastErr error
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		zap.L().Warn("强制删除容器存储路径", zap.String("path", p))
+		if err := os.RemoveAll(p); err != nil {
+			lastErr = err
+			zap.L().Warn("删除存储路径失败", zap.String("path", p), zap.Error(err))
+		}
+	}
+	return lastErr
+}
+
+func (c *Client) deleteInstanceAPI(name string, force bool) error {
+	path := fmt.Sprintf("/instances/%s", name)
+	if force {
+		path += "?force=1"
+	}
+	resp, err := c.doRequest("DELETE", path, nil)
 	if err != nil {
 		return fmt.Errorf("删除实例请求失败: %w", err)
 	}
@@ -372,6 +639,36 @@ func (c *Client) DeleteInstance(name string) error {
 	}
 	if opStr != "" {
 		return c.waitOperation(filepath.Base(opStr))
+	}
+	return nil
+}
+
+func (c *Client) deleteStorageVolumeForce(pool, volType, name string) error {
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/storage-pools/%s/volumes/%s/%s?force=1", pool, volType, name), nil)
+	if err != nil {
+		return err
+	}
+	opStr, err := parseResponse(resp, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil
+		}
+		return err
+	}
+	if opStr != "" {
+		return c.waitOperation(filepath.Base(opStr))
+	}
+	return nil
+}
+
+func (c *Client) deleteInstanceCLI(name string) error {
+	cmd := exec.Command("incus", "delete", name, "--force")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(output), "not found") {
+			return nil
+		}
+		return fmt.Errorf("incus delete --force 失败: %w, output: %s", err, string(output))
 	}
 	return nil
 }
@@ -455,6 +752,24 @@ func (c *Client) ReinstallInstance(name string, templateID string) error {
 	}
 	_, err := c.CreateInstance(req)
 	return err
+}
+
+// DeviceExists 检查实例是否已有指定设备
+func (c *Client) DeviceExists(instanceName, deviceName string) (bool, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/instances/%s", instanceName), nil)
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		Metadata struct {
+			Devices map[string]map[string]string `json:"devices"`
+		} `json:"metadata"`
+	}
+	if _, err := parseResponse(resp, &result); err != nil {
+		return false, err
+	}
+	_, exists := result.Metadata.Devices[deviceName]
+	return exists, nil
 }
 
 // AddProxyDevice 为实例添加 Incus 原生 proxy 设备端口映射（使用 incus CLI，和 Old 项目一致）
@@ -709,10 +1024,15 @@ func (c *Client) ExecCommand(instanceName string, cmd []string, env map[string]s
 
 // SetInstancePassword 设置实例密码 (通过 cloud-init 或 exec)
 func (c *Client) SetInstancePassword(name string, password string) error {
-	// 尝试使用 incus exec 设置密码
-	cmd := []string{"/bin/sh", "-c", fmt.Sprintf("echo 'root:%s' | chpasswd", password)}
-	_, err := c.ExecCommand(name, cmd, nil, "", 0)
-	return err
+	cmd := fmt.Sprintf("echo 'root:%s' | chpasswd", password)
+	_, err := c.ExecCommand(name, []string{"sh", "-c", cmd}, nil, "", 0)
+	if err != nil {
+		cli := exec.Command("incus", "exec", name, "--", "sh", "-c", cmd)
+		if output, cliErr := cli.CombinedOutput(); cliErr != nil {
+			return fmt.Errorf("设置密码失败: %w, cli output: %s", err, string(output))
+		}
+	}
+	return nil
 }
 
 // ImageAliasExists 检查镜像别名是否存在
@@ -743,9 +1063,21 @@ type RemoteImage struct {
 	Type         string `json:"type"` // container / virtual-machine
 }
 
+// normalizeArch 将 Incus 架构名统一为 master 使用的格式
+func normalizeArch(arch string) string {
+	switch arch {
+	case "x86_64":
+		return "amd64"
+	case "aarch64":
+		return "arm64"
+	default:
+		return arch
+	}
+}
+
 // BuildImageKey 构建镜像复合键
 func BuildImageKey(alias, imageType, arch string) string {
-	return alias + "|" + imageType + "|" + arch
+	return alias + "|" + imageType + "|" + normalizeArch(arch)
 }
 
 // ParseImageKey 解析镜像复合键，返回 alias, type, arch
@@ -872,6 +1204,94 @@ properties:
 	return nil
 }
 
+// SyncRemote 确保 Incus remote 已注册，如果不存在或 URL 不一致则添加/更新
+// name: remote 名称（如 spiritlhl、tsukiyo-mirror）
+// serverURL: remote 服务器地址（如 https://incusimages.spiritlhl.net）
+func (c *Client) SyncRemote(name, serverURL string) error {
+	if name == "" || serverURL == "" {
+		return nil
+	}
+	// images 是 Incus 内置 remote，无需注册
+	if name == "images" {
+		return nil
+	}
+
+	// 查询当前 remote 列表
+	cmd := exec.Command("incus", "remote", "list", "--format", "csv")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("查询 remote 列表失败: %w", err)
+	}
+
+	zap.L().Info("remote list 原始输出", zap.String("output", string(output)))
+
+	// CSV 格式: name,type,protocol,url,default (Incus 实际输出顺序)
+	// 字段可能带引号，用 csv.Reader 解析
+	rdr := csv.NewReader(strings.NewReader(string(output)))
+	records, err := rdr.ReadAll()
+	if err != nil {
+		zap.L().Warn("解析 remote list CSV 失败，回退到简单分割", zap.Error(err))
+		// 回退到简单分割
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		for _, line := range lines {
+			fields := strings.Split(line, ",")
+			if len(fields) >= 4 && strings.TrimSpace(fields[0]) == name {
+				// 尝试两种列顺序：name,type,url,default,protocol 或 name,type,protocol,url,default
+				existingURL := ""
+				for _, f := range fields[2:] {
+					f = strings.Trim(strings.TrimSpace(f), "\"")
+					if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") {
+						existingURL = f
+						break
+					}
+				}
+				if existingURL == serverURL {
+					zap.L().Info("remote 已存在且 URL 一致，跳过", zap.String("name", name), zap.String("url", serverURL))
+					return nil
+				}
+				zap.L().Info("remote URL 不一致，移除后重新添加", zap.String("name", name), zap.String("existing", existingURL), zap.String("expected", serverURL))
+				if out, err := exec.Command("incus", "remote", "remove", name).CombinedOutput(); err != nil {
+					return fmt.Errorf("移除 remote %s 失败: %w, output: %s", name, err, string(out))
+				}
+				break
+			}
+		}
+	} else {
+		for _, record := range records {
+			zap.L().Info("remote list 记录", zap.Strings("fields", record))
+			if len(record) >= 4 && strings.TrimSpace(record[0]) == name {
+				// 在所有字段中查找 URL（以 http 开头）
+				existingURL := ""
+				for _, f := range record {
+					f = strings.TrimSpace(f)
+					if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") {
+						existingURL = f
+						break
+					}
+				}
+				if existingURL == serverURL {
+					zap.L().Info("remote 已存在且 URL 一致，跳过", zap.String("name", name), zap.String("url", serverURL))
+					return nil
+				}
+				zap.L().Info("remote URL 不一致，移除后重新添加", zap.String("name", name), zap.String("existing", existingURL), zap.String("expected", serverURL))
+				if out, err := exec.Command("incus", "remote", "remove", name).CombinedOutput(); err != nil {
+					return fmt.Errorf("移除 remote %s 失败: %w, output: %s", name, err, string(out))
+				}
+				break
+			}
+		}
+	}
+
+	// 添加 remote
+	cmd = exec.Command("incus", "remote", "add", name, serverURL, "--protocol", "simplestreams", "--public")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("添加 remote %s 失败: %w, output: %s", name, err, string(output))
+	}
+
+	zap.L().Info("remote 注册成功", zap.String("name", name), zap.String("url", serverURL))
+	return nil
+}
+
 // CopyImage 复制镜像到本地 (从 remote 下载)
 func (c *Client) CopyImage(alias string, sourceRemote string) error {
 	body := map[string]interface{}{
@@ -906,15 +1326,22 @@ func (c *Client) CopyImage(alias string, sourceRemote string) error {
 
 // CreateStoragePool 创建存储池
 func (c *Client) CreateStoragePool(name, driver, source string) error {
+	config := map[string]string{}
+	if source != "" {
+		config["source"] = source
+	}
+	return c.CreateStoragePoolWithConfig(name, driver, config)
+}
+
+// CreateStoragePoolWithConfig 使用完整配置创建存储池
+func (c *Client) CreateStoragePoolWithConfig(name, driver string, config map[string]string) error {
+	if config == nil {
+		config = map[string]string{}
+	}
 	body := map[string]interface{}{
-		"config": map[string]string{},
+		"config": config,
 		"driver": driver,
 		"name":   name,
-	}
-	if source != "" {
-		body["config"] = map[string]string{
-			"source": source,
-		}
 	}
 	resp, err := c.doRequest("POST", "/storage-pools", body)
 	if err != nil {
@@ -932,12 +1359,13 @@ func (c *Client) CreateStoragePool(name, driver, source string) error {
 
 // StoragePoolInfo 存储池信息
 type StoragePoolInfo struct {
-	Name   string `json:"name"`
-	Driver string `json:"driver"`
-	Source string `json:"source"`
-	Size   int64  `json:"size"`
-	Used   int64  `json:"used"`
-	InUse  bool   `json:"in_use"`
+	Name           string `json:"name"`
+	Driver         string `json:"driver"`
+	Source         string `json:"source"`
+	Size           int64  `json:"size"`
+	Used           int64  `json:"used"`
+	InUse          bool   `json:"in_use"`
+	QuotaSupported bool   `json:"quota_supported"`
 }
 
 // ListStoragePools 列出所有存储池
@@ -947,25 +1375,120 @@ func (c *Client) ListStoragePools() ([]StoragePoolInfo, error) {
 		return nil, err
 	}
 	var pools []struct {
-		Name   string `json:"name"`
-		Driver string `json:"driver"`
-		Config struct {
-			Source string `json:"source,omitempty"`
+		Name        string `json:"name"`
+		Driver      string `json:"driver"`
+		Description string `json:"description"`
+		Config      struct {
+			Source string `json:"source"`
+			Size   string `json:"size"`
+			Zfs    string `json:"zfs.pool_name"`
+			LvmVg  string `json:"lvm.vg_name"`
 		} `json:"config"`
+		Status string   `json:"status"`
+		UsedBy []string `json:"used_by"`
 	}
 	if _, err := parseResponse(resp, &pools); err != nil {
 		return nil, err
 	}
 	var result []StoragePoolInfo
 	for _, p := range pools {
-		result = append(result, StoragePoolInfo{
+		source := p.Config.Source
+		if source == "" {
+			source = p.Config.LvmVg
+		}
+
+		info := StoragePoolInfo{
 			Name:   p.Name,
 			Driver: p.Driver,
-			Source: p.Config.Source,
-			InUse:  true,
-		})
+			Source: source,
+			InUse:  len(p.UsedBy) > 0,
+		}
+
+		// 配额支持：dir 驱动需检查 source 分区是否 ext4/xfs 启用 project quota，其他驱动原生支持
+		if p.Driver == "dir" {
+			info.QuotaSupported = checkDirQuota(source)
+		} else {
+			info.QuotaSupported = true
+		}
+
+		// 查询存储池资源使用情况
+		resResp, err := c.doRequest("GET", fmt.Sprintf("/storage-pools/%s/resources", url.PathEscape(p.Name)), nil)
+		if err == nil {
+			var res struct {
+				Space struct {
+					Used  int64 `json:"used"`
+					Total int64 `json:"total"`
+				} `json:"space"`
+			}
+			if _, err := parseResponse(resResp, &res); err == nil {
+				info.Used = res.Space.Used
+				info.Size = res.Space.Total
+			}
+		}
+
+		result = append(result, info)
 	}
 	return result, nil
+}
+
+// checkDirQuota 检查 dir 存储池的 source 路径是否支持 project quota
+// source 是挂载点路径或设备路径，需要检查底层文件系统是否 ext4/xfs 且启用 project quota
+func checkDirQuota(source string) bool {
+	if source == "" {
+		return false
+	}
+
+	// source 可能是设备路径（如 /dev/sda1）或挂载点路径
+	// 先尝试用 findmnt 查找该路径的文件系统信息
+	var mountpoint string
+	if strings.HasPrefix(source, "/dev/") {
+		// 设备路径，查找其挂载点
+		out, err := exec.Command("findmnt", "-no", "TARGET", source).Output()
+		if err != nil {
+			return false
+		}
+		mountpoint = strings.TrimSpace(string(out))
+	} else {
+		mountpoint = source
+	}
+
+	if mountpoint == "" {
+		return false
+	}
+
+	// 获取文件系统类型和挂载选项
+	out, err := exec.Command("findmnt", "-no", "FSTYPE,OPTIONS", mountpoint).Output()
+	if err != nil {
+		return false
+	}
+	parts := strings.Fields(strings.TrimSpace(string(out)))
+	if len(parts) < 2 {
+		return false
+	}
+	fsType := parts[0]
+	options := parts[1]
+
+	switch fsType {
+	case "ext4":
+		if strings.Contains(options, "prjquota") || strings.Contains(options, "quota") {
+			return true
+		}
+		// 检查 tune2fs 是否启用了 project quota
+		deviceOut, err := exec.Command("findmnt", "-no", "SOURCE", mountpoint).Output()
+		if err != nil {
+			return false
+		}
+		device := strings.TrimSpace(string(deviceOut))
+		tuneOut, err := exec.Command("tune2fs", "-l", device).Output()
+		if err == nil {
+			return strings.Contains(string(tuneOut), "Project")
+		}
+		return false
+	case "xfs":
+		return strings.Contains(options, "prjquota")
+	default:
+		return false
+	}
 }
 
 // ImageAlias Incus 镜像别名
@@ -1018,6 +1541,116 @@ func (c *Client) StoragePoolExists(name string) bool {
 		return false
 	}
 	return pool.Name == name
+}
+
+// StoragePoolDetail 存储池详情（含 used_by 和状态）
+type StoragePoolDetail struct {
+	Name   string            `json:"name"`
+	Driver string            `json:"driver"`
+	Config map[string]string `json:"config"`
+	UsedBy []string          `json:"used_by"`
+	Status string            `json:"status"`
+}
+
+// GetStoragePool 获取单个存储池详情
+func (c *Client) GetStoragePool(name string) (*StoragePoolDetail, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/storage-pools/%s", name), nil)
+	if err != nil {
+		return nil, fmt.Errorf("获取存储池 %s 失败: %w", name, err)
+	}
+	var detail StoragePoolDetail
+	if _, err := parseResponse(resp, &detail); err != nil {
+		return nil, fmt.Errorf("解析存储池 %s 详情失败: %w", name, err)
+	}
+	return &detail, nil
+}
+
+// DeleteStoragePool 删除存储池
+func (c *Client) DeleteStoragePool(name string) error {
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/storage-pools/%s", name), nil)
+	if err != nil {
+		return fmt.Errorf("删除存储池 %s 请求失败: %w", name, err)
+	}
+	opStr, err := parseResponse(resp, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			zap.L().Info("存储池不存在，无需删除", zap.String("name", name))
+			return nil
+		}
+		return fmt.Errorf("删除存储池 %s 失败: %w", name, err)
+	}
+	if opStr != "" {
+		return c.waitOperation(filepath.Base(opStr))
+	}
+	return nil
+}
+
+// StoragePoolResources 存储池空间资源
+type StoragePoolResources struct {
+	Space struct {
+		Total uint64 `json:"total"`
+		Used  uint64 `json:"used"`
+	} `json:"space"`
+	Inodes struct {
+		Total uint64 `json:"total"`
+		Used  uint64 `json:"used"`
+	} `json:"inodes"`
+}
+
+// GetStoragePoolResources 获取存储池空间用量
+func (c *Client) GetStoragePoolResources(name string) (*StoragePoolResources, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/storage-pools/%s/resources", name), nil)
+	if err != nil {
+		return nil, fmt.Errorf("获取存储池 %s 资源失败: %w", name, err)
+	}
+	var res StoragePoolResources
+	if _, err := parseResponse(resp, &res); err != nil {
+		return nil, fmt.Errorf("解析存储池 %s 资源失败: %w", name, err)
+	}
+	return &res, nil
+}
+
+// VolumeInfo 存储卷信息
+type VolumeInfo struct {
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	ContentType string            `json:"content_type"`
+	Config      map[string]string `json:"config"`
+	UsedBy      []string          `json:"used_by"`
+	Location    string            `json:"location"`
+	CreatedAt   time.Time         `json:"created_at"`
+}
+
+// ListStorageVolumes 列出指定存储池内的所有 volume
+func (c *Client) ListStorageVolumes(pool string) ([]VolumeInfo, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/storage-pools/%s/volumes?recursion=1", pool), nil)
+	if err != nil {
+		return nil, fmt.Errorf("列出存储池 %s 卷失败: %w", pool, err)
+	}
+	var volumes []VolumeInfo
+	if _, err := parseResponse(resp, &volumes); err != nil {
+		return nil, fmt.Errorf("解析存储池 %s 卷列表失败: %w", pool, err)
+	}
+	return volumes, nil
+}
+
+// DeleteStorageVolume 删除指定存储池中的 volume
+func (c *Client) DeleteStorageVolume(pool, volType, name string) error {
+	resp, err := c.doRequest("DELETE", fmt.Sprintf("/storage-pools/%s/volumes/%s/%s", pool, volType, name), nil)
+	if err != nil {
+		return fmt.Errorf("删除 volume %s/%s/%s 请求失败: %w", pool, volType, name, err)
+	}
+	opStr, err := parseResponse(resp, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil
+		}
+		return fmt.Errorf("删除 volume %s/%s/%s 失败: %w", pool, volType, name, err)
+	}
+	if opStr != "" {
+		return c.waitOperation(filepath.Base(opStr))
+	}
+	return nil
 }
 
 // NetworkInfo Incus 网络信息
@@ -1107,9 +1740,10 @@ type CreateInstanceRequest struct {
 	IPv4Address   string
 	IPv6Address   string
 	UserData      string     // cloud-init user-data YAML
+	NetworkConfig string     // cloud-init network-config YAML
 	DataDisks     []DataDisk // 数据盘
-	// VPC 网络配置
-	BridgeName   string // Incus bridge 名称，如 vpc-xxx
+	// Bridge 网络配置
+	BridgeName   string // Incus bridge 名称，如 br-xxx
 	InternalIPv4 string // 静态内网 IP
 	GatewayV4    string // IPv4 网关
 	IPv4CIDR     string // IPv4 CIDR，用于生成 network-config
@@ -1224,7 +1858,7 @@ func (c *Client) UpdateBridgeNetwork(name string, config map[string]string) erro
 	body := map[string]interface{}{
 		"config": config,
 	}
-	resp, err := c.doRequest("PUT", "/networks/"+name, body)
+	resp, err := c.doRequest("PATCH", "/networks/"+name, body)
 	if err != nil {
 		return fmt.Errorf("更新 bridge 网络请求失败: %w", err)
 	}
@@ -1248,6 +1882,11 @@ func (c *Client) UpdateBridgeNetwork(name string, config map[string]string) erro
 func (c *Client) DeleteBridgeNetwork(name string) error {
 	resp, err := c.doRequest("DELETE", "/networks/"+name, nil)
 	if err != nil {
+		// 网络不存在不算错误
+		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Network not found") || strings.Contains(err.Error(), "not found") {
+			zap.L().Info("bridge 网络不存在，无需删除", zap.String("name", name))
+			return nil
+		}
 		return fmt.Errorf("删除 bridge 网络请求失败: %w", err)
 	}
 	opID, err := parseResponse(resp, nil)
