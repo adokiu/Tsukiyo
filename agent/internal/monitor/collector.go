@@ -17,6 +17,7 @@ import (
 	"tsukiyo/agent/internal/config"
 	"tsukiyo/agent/internal/incus"
 	"tsukiyo/agent/internal/network"
+	"tsukiyo/agent/internal/system"
 	"tsukiyo/agent/internal/ws"
 )
 
@@ -29,6 +30,14 @@ type Collector struct {
 	cancel      context.CancelFunc
 	prevCPU     *cpuTimes
 	prevNet     map[string]netCounters
+	prevNetIO   *netIOCounters
+	prevNetTime time.Time
+}
+
+// netIOCounters 网络IO总计数器
+type netIOCounters struct {
+	rxBytes uint64
+	txBytes uint64
 }
 
 // cpuTimes CPU 时间统计
@@ -120,9 +129,14 @@ func (c *Collector) syncImages() {
 	if !c.wsClient.IsConnected() {
 		return
 	}
+	if !c.incusClient.IsAvailable() {
+		return
+	}
 	aliases, err := c.incusClient.ListImages()
 	if err != nil {
-		zap.L().Warn("定期镜像同步: 查询失败", zap.Error(err))
+		if c.incusClient.IsAvailable() {
+			zap.L().Warn("定期镜像同步: 查询失败", zap.Error(err))
+		}
 		return
 	}
 	if err := c.wsClient.SendLocalImages(aliases); err != nil {
@@ -132,9 +146,15 @@ func (c *Collector) syncImages() {
 
 // collectAndReport 采集并上报
 func (c *Collector) collectAndReport() {
+	if !c.incusClient.IsAvailable() {
+		return
+	}
+
 	instances, err := c.incusClient.ListInstances()
 	if err != nil {
-		zap.L().Warn("获取实例列表失败", zap.Error(err))
+		if c.incusClient.IsAvailable() {
+			zap.L().Warn("获取实例列表失败", zap.Error(err))
+		}
 		return
 	}
 
@@ -213,20 +233,33 @@ func (c *Collector) sendHeartbeat() {
 	cpuPercent := c.getCPUUsage()
 	memUsed, memTotal := c.getMemUsage()
 	diskUsed, diskTotal := c.getDiskUsage()
+	netIn, netOut := c.getNetworkIO()
+	uptime := getUptimeSeconds()
 
-	instances, _ := c.incusClient.ListInstances()
+	instanceCount := 0
 	running := 0
-	for _, inst := range instances {
-		if inst.Status == "Running" {
-			running++
+	if c.incusClient.IsAvailable() {
+		instances, _ := c.incusClient.ListInstances()
+		instanceCount = len(instances)
+		for _, inst := range instances {
+			if inst.Status == "Running" {
+				running++
+			}
 		}
 	}
 
 	publicIPv4s := getPublicIPv4s()
 	ipv6Prefixes := getIPv6Prefixes()
 
+	// 采集网卡信息
+	var networkInterfaces json.RawMessage
+	hostInfo := system.Probe()
+	if nicData, err := json.Marshal(hostInfo.NetworkInterfaces); err == nil {
+		networkInterfaces = nicData
+	}
+
 	if err := c.wsClient.SendHeartbeat(cpuPercent, memUsed, memTotal, diskUsed, diskTotal,
-		len(instances), running, publicIPv4s, ipv6Prefixes); err != nil {
+		netIn, netOut, uptime, instanceCount, running, publicIPv4s, ipv6Prefixes, networkInterfaces); err != nil {
 		zap.L().Warn("发送心跳失败", zap.Error(err))
 	}
 }
@@ -315,17 +348,118 @@ func (c *Collector) getMemUsage() (used int64, total int64) {
 	return
 }
 
-// getDiskUsage 获取磁盘使用 (Linux unix.Statfs)
+// getDiskUsage 获取所有物理磁盘使用量 (Linux /proc/mounts + unix.Statfs)
 func (c *Collector) getDiskUsage() (used int64, total int64) {
-	var stat unix.Statfs_t
-	if err := unix.Statfs("/", &stat); err != nil {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
 		return 0, 0
 	}
-	totalBytes := stat.Blocks * uint64(stat.Bsize)
-	freeBytes := stat.Bfree * uint64(stat.Bsize)
-	total = int64(totalBytes / 1024 / 1024 / 1024) // GB
-	used = total - int64(freeBytes/1024/1024/1024)
+	defer f.Close()
+
+	// 需要跳过的虚拟文件系统类型
+	skipFS := map[string]bool{
+		"tmpfs": true, "devtmpfs": true, "proc": true, "sysfs": true,
+		"cgroup": true, "cgroup2": true, "pstore": true, "securityfs": true,
+		"mqueue": true, "hugetlbfs": true, "debugfs": true, "tracefs": true,
+		"configfs": true, "fusectl": true, "fuse": true, "fuseblk": true,
+		"rpc_pipefs": true, "bpf": true, "efivarfs": true,
+	}
+
+	seen := map[string]bool{}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		device := fields[0]
+		mountPoint := fields[1]
+		fstype := fields[2]
+
+		// 跳过虚拟文件系统
+		if skipFS[fstype] {
+			continue
+		}
+		// 跳过已处理的设备（同一设备可能挂载多次）
+		if seen[device] {
+			continue
+		}
+		// 跳过 overlay/docker 等容器文件系统
+		if strings.HasPrefix(device, "overlay") {
+			continue
+		}
+
+		seen[device] = true
+
+		var stat unix.Statfs_t
+		if err := unix.Statfs(mountPoint, &stat); err != nil {
+			continue
+		}
+
+		totalBytes := stat.Blocks * uint64(stat.Bsize)
+		freeBytes := stat.Bfree * uint64(stat.Bsize)
+		total += int64(totalBytes / 1024 / 1024 / 1024) // GB
+		used += int64(totalBytes/1024/1024/1024) - int64(freeBytes/1024/1024/1024)
+	}
+
+	return used, total
+}
+
+// getNetworkIO 获取网络IO速率 (bytes/s)
+func (c *Collector) getNetworkIO() (rxSpeed int64, txSpeed int64) {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0, 0
+	}
+
+	var totalRx, totalTx uint64
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		iface := strings.TrimSuffix(fields[0], ":")
+		if iface == "lo" {
+			continue
+		}
+		rx, _ := strconv.ParseUint(fields[1], 10, 64)
+		tx, _ := strconv.ParseUint(fields[9], 10, 64)
+		totalRx += rx
+		totalTx += tx
+	}
+
+	now := time.Now()
+	if c.prevNetIO != nil && c.prevNetTime.Before(now) {
+		elapsed := now.Sub(c.prevNetTime).Seconds()
+		if elapsed > 0 {
+			rxSpeed = int64(float64(totalRx-c.prevNetIO.rxBytes) / elapsed)
+			txSpeed = int64(float64(totalTx-c.prevNetIO.txBytes) / elapsed)
+			if rxSpeed < 0 {
+				rxSpeed = 0
+			}
+			if txSpeed < 0 {
+				txSpeed = 0
+			}
+		}
+	}
+	c.prevNetIO = &netIOCounters{rxBytes: totalRx, txBytes: totalTx}
+	c.prevNetTime = now
 	return
+}
+
+// getUptimeSeconds 获取系统运行时间 (秒)
+func getUptimeSeconds() int64 {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0
+	}
+	sec, _ := strconv.ParseFloat(fields[0], 64)
+	return int64(sec)
 }
 
 // getPublicIPv4s 获取公网 IPv4

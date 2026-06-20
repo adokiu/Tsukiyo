@@ -1,100 +1,251 @@
 package system
 
 import (
-	"bufio"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// HostInfo 宿主机探测信息
+// HostInfo 宿主机探测信息（对齐 CLICD HostProbeReport）
 type HostInfo struct {
-	Hostname     string        `json:"hostname"`
-	OS           string        `json:"os"`
-	Kernel       string        `json:"kernel"`
-	Arch         string        `json:"arch"`
-	Uptime       string        `json:"uptime"`
-	ProcessCount int           `json:"process_count"`
-	CPU          CPUInfo       `json:"cpu"`
-	Memory       MemoryInfo    `json:"memory"`
-	Disks        []DiskInfo    `json:"disks"`
-	Networks     []NetworkInfo `json:"networks"`
-	Environment  EnvInfo       `json:"environment"`
+	GeneratedAt       string         `json:"generated_at"`
+	Hostname          string         `json:"hostname"`
+	OS                string         `json:"os"`
+	Kernel            string         `json:"kernel"`
+	CPU               CPUInfo        `json:"cpu"`
+	Memory            MemoryInfo     `json:"memory"`
+	MemModules        []MemModule    `json:"mem_modules"`
+	Disks             []DiskInfo     `json:"disks"`
+	NetworkInterfaces []NetworkInfo  `json:"network_interfaces"`
+	PublicIPv4        []string       `json:"public_ipv4"`
+	IPv4Addresses     []IPProbe      `json:"ipv4_addresses"`
+	IPv4Prefixes      []IPv4Prefix   `json:"ipv4_prefixes"`
+	IPv6Addresses     []IPProbe      `json:"ipv6_addresses"`
+	IPv6Prefixes      []IPv6Prefix   `json:"ipv6_prefixes"`
+	Gateways          []GatewayProbe `json:"gateways"`
+	GPUs              []GPUInfo      `json:"gpus"`
+	Runtime           RuntimeProbe   `json:"runtime"`
+	System            SystemProbe    `json:"system"`
+	Environment       []EnvCheck     `json:"environment"`
 }
 
 // CPUInfo CPU 信息
 type CPUInfo struct {
-	Model          string `json:"model"`
-	Cores          int    `json:"cores"`
-	Threads        int    `json:"threads"`
-	Virtualization string `json:"virtualization"` // vmx / svm / none
-	NestedKVM      bool   `json:"nested_kvm"`
-	HasGPU         bool   `json:"has_gpu"`
+	Model             string   `json:"model"`
+	Cores             int      `json:"cores"`
+	Threads           int      `json:"threads"`
+	Architecture      string   `json:"architecture"`
+	Flags             []string `json:"flags"`
+	HasIntegratedGPU  bool     `json:"has_integrated_gpu"`
+	Virtualization    bool     `json:"virtualization"`
+	VirtualizationKey string   `json:"virtualization_key"`
 }
 
 // MemoryInfo 内存信息
 type MemoryInfo struct {
-	Total int64 `json:"total"` // bytes
-	Used  int64 `json:"used"`  // bytes
+	TotalMB int64 `json:"total_mb"`
+	UsedMB  int64 `json:"used_mb"`
+	FreeMB  int64 `json:"free_mb"`
+}
+
+// MemModule 内存条信息
+type MemModule struct {
+	Locator      string `json:"locator"`
+	Size         string `json:"size"`
+	Type         string `json:"type"`
+	Speed        string `json:"speed"`
+	Manufacturer string `json:"manufacturer"`
+	PartNumber   string `json:"part_number"`
+	SerialNumber string `json:"serial_number"`
 }
 
 // DiskInfo 磁盘信息
 type DiskInfo struct {
-	Device     string `json:"device"`
-	Model      string `json:"model"`
-	Size       string `json:"size"`
-	Type       string `json:"type"` // ssd / hdd / virtual
-	MountPoint string `json:"mount_point"`
-	Health     string `json:"health"`
+	Name         string    `json:"name"`
+	Path         string    `json:"path"`
+	Model        string    `json:"model"`
+	Serial       string    `json:"serial"`
+	SizeBytes    uint64    `json:"size_bytes"`
+	Type         string    `json:"type"`
+	Virtual      bool      `json:"virtual"`
+	Rotational   bool      `json:"rotational"`
+	Mountpoints  []string  `json:"mountpoints"`
+	Health       string    `json:"health"`
+	HealthDetail string    `json:"health_detail"`
+	SMART        DiskSMART `json:"smart"`
+}
+
+// DiskSMART SMART 健康信息
+type DiskSMART struct {
+	Available         bool   `json:"available"`
+	LifeUsedPercent   *int   `json:"life_used_percent,omitempty"`
+	PowerOnHours      int64  `json:"power_on_hours,omitempty"`
+	PowerCycleCount   int64  `json:"power_cycle_count,omitempty"`
+	ReadDataBytes     uint64 `json:"read_data_bytes,omitempty"`
+	WrittenDataBytes  uint64 `json:"written_data_bytes,omitempty"`
+	ReadCommands      uint64 `json:"read_commands,omitempty"`
+	WriteCommands     uint64 `json:"write_commands,omitempty"`
+	WearLevelingCount string `json:"wear_leveling_count,omitempty"`
+	EraseCount        string `json:"erase_count,omitempty"`
+	MediaErrors       uint64 `json:"media_errors,omitempty"`
 }
 
 // NetworkInfo 网卡信息
 type NetworkInfo struct {
-	Name   string   `json:"name"`
-	Status string   `json:"status"` // up / down
-	Driver string   `json:"driver"`
-	MAC    string   `json:"mac"`
-	IPv4   []string `json:"ipv4"`
-	IPv6   []string `json:"ipv6"`
-	Speed  string   `json:"speed"`
+	Name      string    `json:"name"`
+	MAC       string    `json:"mac"`
+	State     string    `json:"state"`
+	SpeedMbps int       `json:"speed_mbps"`
+	Driver    string    `json:"driver"`
+	Model     string    `json:"model"`
+	IPv4      []IPProbe `json:"ipv4"`
+	IPv6      []IPProbe `json:"ipv6"`
 }
 
-// EnvInfo 环境支持信息
-type EnvInfo struct {
-	SystemdVersion   string `json:"systemd_version"`
-	LXCVersion       string `json:"lxc_version"`
-	IPRoute2Version  string `json:"iproute2_version"`
-	ConntrackVersion string `json:"conntrack_version"`
-	LibvirtVersion   string `json:"libvirt_version"`
-	QEMUVersion      string `json:"qemu_version"`
-	SmartctlVersion  string `json:"smartctl_version"`
-	HasKVM           bool   `json:"has_kvm"`
-	HasIPv4Forward   bool   `json:"has_ipv4_forward"`
-	LXCFSActive      bool   `json:"lxcfs_active"`
-	LibvirtActive    bool   `json:"libvirt_active"`
+// IPProbe IP 地址信息
+type IPProbe struct {
+	Interface string `json:"interface"`
+	Address   string `json:"address"`
+	PrefixLen int    `json:"prefix_len"`
+	Scope     string `json:"scope"`
+	Gateway   string `json:"gateway,omitempty"`
 }
 
-// Probe 探测宿主机完整信息
-func Probe() *HostInfo {
-	h := &HostInfo{
-		Hostname: getHostname(),
-		OS:       getOS(),
-		Kernel:   getKernel(),
-		Arch:     getArch(),
-		Uptime:   getUptime(),
+// IPv4Prefix IPv4 段信息
+type IPv4Prefix struct {
+	Interface  string `json:"interface"`
+	Address    string `json:"address"`
+	Prefix     string `json:"prefix"`
+	PrefixLen  int    `json:"prefix_len"`
+	SubnetMask string `json:"subnet_mask"`
+	Gateway    string `json:"gateway"`
+	Source     string `json:"source"`
+}
+
+// IPv6Prefix IPv6 段信息
+type IPv6Prefix struct {
+	Address   string `json:"address"`
+	PrefixLen int    `json:"prefix_len"`
+	Interface string `json:"interface"`
+	Gateway   string `json:"gateway"`
+}
+
+// GatewayProbe 网关信息
+type GatewayProbe struct {
+	Family    string `json:"family"`
+	Interface string `json:"interface"`
+	Gateway   string `json:"gateway"`
+}
+
+// GPUInfo 显卡信息
+type GPUInfo struct {
+	Name   string `json:"name"`
+	Vendor string `json:"vendor"`
+	Driver string `json:"driver"`
+	Type   string `json:"type"`
+}
+
+// RuntimeProbe 运行能力探测
+type RuntimeProbe struct {
+	LXCAvailable         bool   `json:"lxc_available"`
+	KVMAvailable         bool   `json:"kvm_available"`
+	DevKVM               bool   `json:"dev_kvm"`
+	NestedVirtualization bool   `json:"nested_virtualization"`
+	NestedDetail         string `json:"nested_detail"`
+}
+
+// SystemProbe 系统运行状态
+type SystemProbe struct {
+	UptimeSeconds int64  `json:"uptime_seconds"`
+	UptimeText    string `json:"uptime_text"`
+	ProcessCount  int    `json:"process_count"`
+}
+
+// EnvCheck 环境工具检测项
+type EnvCheck struct {
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	OK       bool   `json:"ok"`
+	Required bool   `json:"required"`
+	Detail   string `json:"detail"`
+}
+
+// staticCache 缓存启动时采集的静态数据
+var staticCache *staticData
+
+type staticData struct {
+	hostname   string
+	os         string
+	kernel     string
+	cpu        CPUInfo
+	memModules []MemModule
+	gpus       []GPUInfo
+	env        []EnvCheck
+}
+
+// InitStaticProbe 启动时采集一次静态数据（CPU型号、内存条、GPU、环境工具版本等）
+func InitStaticProbe() {
+	staticCache = &staticData{
+		hostname:   getHostname(),
+		os:         getOS(),
+		kernel:     getKernel(),
+		cpu:        probeCPU(),
+		memModules: probeMemoryModules(),
+		gpus:       probeGPUs(),
+		env:        probeEnvironment(),
 	}
-	h.ProcessCount = getProcessCount()
-	h.CPU = probeCPU()
-	h.Memory = probeMemory()
-	h.Disks = probeDisks()
-	h.Networks = probeNetworks()
-	h.Environment = probeEnvironment()
+	staticCache.cpu.HasIntegratedGPU = hasIntegratedGPU(staticCache.gpus)
+}
+
+// Probe 探测宿主机完整信息（动态数据每次采集，静态数据从缓存读取）
+func Probe() *HostInfo {
+	if staticCache == nil {
+		InitStaticProbe()
+	}
+
+	nics := probeNICs()
+	gateways := probeGateways()
+	ipv4Addrs := collectIPv4Addresses(nics)
+	ipv6Addrs := collectIPv6Addresses(nics)
+	ipv4Prefixes := probeIPv4Prefixes(nics, gateways)
+	ipv6Prefixes := probeIPv6Prefixes()
+	publicIPv4 := probeAllPublicIPv4(nics)
+	disks := probeDisks()
+	env := staticCache.env
+	runtime := probeRuntime(env)
+
+	h := &HostInfo{
+		GeneratedAt:       time.Now().Format("2006-01-02 15:04:05"),
+		Hostname:          staticCache.hostname,
+		OS:                staticCache.os,
+		Kernel:            staticCache.kernel,
+		CPU:               staticCache.cpu,
+		Memory:            probeMemory(),
+		MemModules:        staticCache.memModules,
+		Disks:             disks,
+		NetworkInterfaces: nics,
+		PublicIPv4:        publicIPv4,
+		IPv4Addresses:     ipv4Addrs,
+		IPv4Prefixes:      ipv4Prefixes,
+		IPv6Addresses:     ipv6Addrs,
+		IPv6Prefixes:      ipv6Prefixes,
+		Gateways:          gateways,
+		GPUs:              staticCache.gpus,
+		Runtime:           runtime,
+		System:            probeSystem(),
+		Environment:       env,
+	}
 	return h
 }
+
+// --- 基础信息 ---
 
 func getHostname() string {
 	h, _ := os.Hostname()
@@ -103,386 +254,193 @@ func getHostname() string {
 
 func getOS() string {
 	data, _ := os.ReadFile("/etc/os-release")
-	lines := strings.Split(string(data), "\n")
-	name := "Unknown"
-	for _, line := range lines {
+	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "PRETTY_NAME=") {
-			name = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
-			break
+			return strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
 		}
 	}
-	return name
+	return strings.TrimSpace(runCommandOutput(2*time.Second, "uname", "-o"))
 }
 
 func getKernel() string {
-	out, _ := exec.Command("uname", "-sr").Output()
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(runCommandOutput(2*time.Second, "uname", "-srmo"))
 }
 
 func getArch() string {
-	out, _ := exec.Command("uname", "-m").Output()
-	return strings.TrimSpace(string(out))
+	return runtime.GOARCH
 }
 
-func getUptime() string {
-	data, err := os.ReadFile("/proc/uptime")
-	if err != nil {
-		return ""
+// --- 系统运行状态 ---
+
+func probeSystem() SystemProbe {
+	uptime := int64(0)
+	if data, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 {
+			val, _ := strconv.ParseFloat(fields[0], 64)
+			uptime = int64(val)
+		}
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return ""
+	return SystemProbe{
+		UptimeSeconds: uptime,
+		UptimeText:    formatDurationText(uptime),
+		ProcessCount:  countProcesses(),
 	}
-	sec, _ := strconv.ParseFloat(fields[0], 64)
-	d := time.Duration(sec) * time.Second
-	return fmt.Sprintf("%dd %dh %dm", int(d.Hours())/24, int(d.Hours())%24, int(d.Minutes())%60)
 }
 
-func getProcessCount() int {
+func formatDurationText(seconds int64) string {
+	days := seconds / 86400
+	seconds %= 86400
+	hours := seconds / 3600
+	seconds %= 3600
+	minutes := seconds / 60
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm", days, hours, minutes)
+	}
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+func countProcesses() int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0
 	}
 	count := 0
-	for _, e := range entries {
-		if e.IsDir() {
-			if _, err := strconv.Atoi(e.Name()); err == nil {
-				count++
-			}
+	for _, entry := range entries {
+		if _, err := strconv.Atoi(entry.Name()); err == nil {
+			count++
 		}
 	}
 	return count
 }
 
-func probeCPU() CPUInfo {
-	c := CPUInfo{}
-	f, err := os.Open("/proc/cpuinfo")
-	if err != nil {
-		return c
-	}
-	defer f.Close()
+// --- 运行能力 ---
 
-	cores := make(map[int]bool)
-	threads := 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "model name") {
-			c.Model = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		} else if strings.HasPrefix(line, "processor") {
-			threads++
-		} else if strings.HasPrefix(line, "core id") {
-			id, _ := strconv.Atoi(strings.TrimSpace(strings.SplitN(line, ":", 2)[1]))
-			cores[id] = true
-		} else if strings.Contains(line, "vmx") || strings.Contains(line, "svm") {
-			if strings.Contains(line, "vmx") {
-				c.Virtualization = "vmx"
-			} else if strings.Contains(line, "svm") {
-				c.Virtualization = "svm"
-			}
-		}
+func probeRuntime(env []EnvCheck) RuntimeProbe {
+	devKVM := fileExists("/dev/kvm")
+	nested, detail := probeNestedVirtualization()
+	incusOK := commandExists("incus")
+	return RuntimeProbe{
+		LXCAvailable:         incusOK,
+		KVMAvailable:         devKVM,
+		DevKVM:               devKVM,
+		NestedVirtualization: nested,
+		NestedDetail:         detail,
 	}
-	c.Cores = len(cores)
-	c.Threads = threads
-	if c.Cores == 0 {
-		c.Cores = threads
-	}
-
-	// 检测 nested KVM
-	if data, err := os.ReadFile("/sys/module/kvm_intel/parameters/nested"); err == nil {
-		c.NestedKVM = strings.TrimSpace(string(data)) == "Y"
-	} else if data, err := os.ReadFile("/sys/module/kvm_amd/parameters/nested"); err == nil {
-		c.NestedKVM = strings.TrimSpace(string(data)) == "1"
-	}
-
-	// 检测显卡
-	if _, err := os.Stat("/dev/dri"); err == nil {
-		c.HasGPU = true
-	}
-
-	return c
 }
 
-func probeMemory() MemoryInfo {
-	m := MemoryInfo{}
-	f, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return m
+func probeNestedVirtualization() (bool, string) {
+	paths := []string{
+		"/sys/module/kvm_intel/parameters/nested",
+		"/sys/module/kvm_amd/parameters/nested",
 	}
-	defer f.Close()
-
-	var total, available int64
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 {
+	for _, path := range paths {
+		value := strings.TrimSpace(readFirstExistingFile(path))
+		if value == "" {
 			continue
 		}
-		switch fields[0] {
-		case "MemTotal:":
-			v, _ := strconv.ParseInt(fields[1], 10, 64)
-			total = v * 1024
-		case "MemAvailable:":
-			v, _ := strconv.ParseInt(fields[1], 10, 64)
-			available = v * 1024
-		}
+		enabled := strings.EqualFold(value, "Y") || value == "1"
+		return enabled, filepath.Base(filepath.Dir(filepath.Dir(path))) + "=" + value
 	}
-	m.Total = total
-	m.Used = total - available
-	return m
+	if fileExists("/dev/kvm") {
+		return true, "/dev/kvm present"
+	}
+	return false, "no kvm nested parameter or /dev/kvm"
 }
 
-func probeDisks() []DiskInfo {
-	var disks []DiskInfo
-	entries, err := os.ReadDir("/sys/block")
-	if err != nil {
-		return disks
+func envCheckOK(checks []EnvCheck, key string) bool {
+	for _, c := range checks {
+		if c.Key == key {
+			return c.OK
+		}
 	}
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") {
-			continue
-		}
-		d := DiskInfo{Device: "/dev/" + name}
-
-		// 型号
-		if data, err := os.ReadFile(filepath.Join("/sys/block", name, "device/model")); err == nil {
-			d.Model = strings.TrimSpace(string(data))
-		}
-		// 大小
-		if data, err := os.ReadFile(filepath.Join("/sys/block", name, "size")); err == nil {
-			sectors, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-			gb := float64(sectors) * 512 / 1024 / 1024 / 1024
-			d.Size = fmt.Sprintf("%.1f GB", gb)
-		}
-		// 类型
-		rotational, _ := os.ReadFile(filepath.Join("/sys/block", name, "queue/rotational"))
-		if strings.TrimSpace(string(rotational)) == "0" {
-			d.Type = "ssd"
-		} else {
-			d.Type = "hdd"
-		}
-		// 挂载点
-		if out, err := exec.Command("findmnt", "-n", "-o", "TARGET", "-S", "/dev/"+name).Output(); err == nil {
-			d.MountPoint = strings.TrimSpace(string(out))
-		}
-		// SMART 健康（简化）
-		if out, err := exec.Command("smartctl", "-H", "/dev/"+name).Output(); err == nil {
-			if strings.Contains(string(out), "PASSED") {
-				d.Health = "PASSED"
-			} else {
-				d.Health = "UNKNOWN"
-			}
-		}
-
-		disks = append(disks, d)
-	}
-	return disks
+	return false
 }
 
-func probeNetworks() []NetworkInfo {
-	var nets []NetworkInfo
-	entries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
-		return nets
-	}
-	for _, e := range entries {
-		name := e.Name()
-		n := NetworkInfo{Name: name}
-
-		// 状态
-		if data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "operstate")); err == nil {
-			n.Status = strings.TrimSpace(string(data))
-		}
-		// 驱动
-		if data, err := os.Readlink(filepath.Join("/sys/class/net", name, "device/driver")); err == nil {
-			n.Driver = filepath.Base(data)
-		}
-		// MAC
-		if data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "address")); err == nil {
-			n.MAC = strings.TrimSpace(string(data))
-		}
-		// 速率
-		if data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "speed")); err == nil {
-			speed := strings.TrimSpace(string(data))
-			if speed != "-1" && speed != "" {
-				n.Speed = speed + " Mbps"
-			}
-		}
-		// IP 地址（通过 ip addr）
-		if out, err := exec.Command("ip", "-j", "addr", "show", name).Output(); err == nil {
-			// 简化解析，直接文本解析
-			outText := string(out)
-			// 这里不做复杂 JSON 解析，直接跳过
-			_ = outText
-		}
-		// 简单方式读取 ipv4
-		if data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "device/vendor")); err == nil {
-			_ = data
-		}
-
-		// 用 ip 命令获取地址
-		if out, err := exec.Command("ip", "addr", "show", name).Output(); err == nil {
-			lines := strings.Split(string(out), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "inet ") {
-					fields := strings.Fields(line)
-					if len(fields) >= 2 {
-						n.IPv4 = append(n.IPv4, fields[1])
-					}
-				} else if strings.HasPrefix(line, "inet6 ") {
-					fields := strings.Fields(line)
-					if len(fields) >= 2 {
-						n.IPv6 = append(n.IPv6, fields[1])
-					}
-				}
-			}
-		}
-
-		nets = append(nets, n)
-	}
-	return nets
-}
-
-func probeEnvironment() EnvInfo {
-	e := EnvInfo{}
-
-	// systemd
-	if out, err := exec.Command("systemctl", "--version").Output(); err == nil {
-		fields := strings.Fields(string(out))
-		if len(fields) >= 2 {
-			e.SystemdVersion = fields[1]
-		}
-	}
-
-	// Incus (不是 lxc)
-	if out, err := exec.Command("incus", "version").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "Server version:") {
-				e.LXCVersion = strings.TrimSpace(strings.TrimPrefix(line, "Server version:"))
-				break
-			}
-		}
-	}
-
-	// iproute2
-	if out, err := exec.Command("ip", "-V").Output(); err == nil {
-		e.IPRoute2Version = strings.TrimSpace(string(out))
-	}
-
-	// conntrack
-	if out, err := exec.Command("conntrack", "-V").Output(); err == nil {
-		e.ConntrackVersion = strings.TrimSpace(string(out))
-	}
-
-	// libvirt
-	if out, err := exec.Command("virsh", "--version").Output(); err == nil {
-		e.LibvirtVersion = strings.TrimSpace(string(out))
-	}
-
-	// QEMU
-	if out, err := exec.Command("qemu-system-x86_64", "--version").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		if len(lines) > 0 {
-			e.QEMUVersion = strings.TrimSpace(lines[0])
-		}
-	}
-
-	// smartctl
-	if out, err := exec.Command("smartctl", "-V").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		if len(lines) > 0 {
-			e.SmartctlVersion = strings.TrimSpace(lines[0])
-		}
-	}
-
-	// KVM
-	if _, err := os.Stat("/dev/kvm"); err == nil {
-		e.HasKVM = true
-	}
-
-	// IPv4 forward
-	if data, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err == nil {
-		e.HasIPv4Forward = strings.TrimSpace(string(data)) == "1"
-	}
-
-	// lxcfs
-	if out, err := exec.Command("systemctl", "is-active", "lxcfs").Output(); err == nil {
-		e.LXCFSActive = strings.TrimSpace(string(out)) == "active"
-	}
-
-	// libvirtd
-	if out, err := exec.Command("systemctl", "is-active", "libvirtd").Output(); err == nil {
-		e.LibvirtActive = strings.TrimSpace(string(out)) == "active"
-	}
-
-	return e
-}
+// --- 兼容旧接口 ---
 
 // GetTotalMemory 获取总内存（bytes）
 func GetTotalMemory() int64 {
-	return probeMemory().Total
+	return probeMemory().TotalMB * 1024 * 1024
 }
 
 // GetTotalDisk 获取总磁盘大小（bytes）
 func GetTotalDisk() int64 {
 	var total int64
 	for _, d := range probeDisks() {
-		var val float64
-		fmt.Sscanf(d.Size, "%f", &val)
-		total += int64(val * 1024 * 1024 * 1024)
+		total += int64(d.SizeBytes)
 	}
 	return total
 }
 
 // GetLocalAddress 获取本机第一个非 loopback IPv4
 func GetLocalAddress() string {
-	entries, _ := os.ReadDir("/sys/class/net")
-	for _, e := range entries {
-		name := e.Name()
-		if name == "lo" {
+	nics := probeNICs()
+	for _, nic := range nics {
+		if nic.State != "up" {
 			continue
 		}
-		if data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "operstate")); err == nil {
-			if strings.TrimSpace(string(data)) != "up" {
-				continue
-			}
-		}
-		// 尝试读取地址
-		if out, err := exec.Command("ip", "-4", "addr", "show", name).Output(); err == nil {
-			lines := strings.Split(string(out), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "inet ") {
-					fields := strings.Fields(line)
-					if len(fields) >= 2 {
-						return strings.Split(fields[1], "/")[0]
-					}
-				}
-			}
+		for _, ip := range nic.IPv4 {
+			return ip.Address
 		}
 	}
 	return ""
 }
 
-// GetPublicIPv4 获取公网 IPv4
+// GetPublicIPv4 获取公网 IPv4（通过外部 API）
 func GetPublicIPv4() string {
-	// 尝试通过外部 API 获取
-	// 如果没有网络则返回空
-	return ""
+	req, err := http.NewRequest("GET", "https://api-ipv4.ip.sb/ip", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 Tsukiyo/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(string(data))
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return ""
+	}
+	return ip
+}
+
+// GetPublicIPv6 获取公网 IPv6（通过外部 API）
+func GetPublicIPv6() string {
+	req, err := http.NewRequest("GET", "https://api-ipv6.ip.sb/ip", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 Tsukiyo/1.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(string(data))
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
+		return ""
+	}
+	return ip
 }
 
 // GetInterfaceNames 获取网卡名称列表
 func GetInterfaceNames() []string {
-	var names []string
-	entries, _ := os.ReadDir("/sys/class/net")
-	for _, e := range entries {
-		if e.Name() == "lo" {
-			continue
-		}
-		names = append(names, e.Name())
+	nics := probeNICs()
+	names := make([]string, 0, len(nics))
+	for _, nic := range nics {
+		names = append(names, nic.Name)
 	}
 	return names
 }

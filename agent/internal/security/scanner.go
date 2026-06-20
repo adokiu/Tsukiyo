@@ -17,17 +17,19 @@ import (
 
 	"tsukiyo/agent/internal/config"
 	"tsukiyo/agent/internal/network"
+	"tsukiyo/agent/internal/ws"
 )
 
 // Scanner 安全扫描器
 type Scanner struct {
 	cfg        *config.Config
 	netMgr     *network.Manager
+	wsClient   *ws.Client
 	ctx        context.Context
 	cancel     context.CancelFunc
 	mu         sync.RWMutex
 	alerts     []SecurityAlert
-	history    map[string]TrafficRecord // ip -> record
+	history    map[string]TrafficRecord
 	lastScan   time.Time
 }
 
@@ -59,11 +61,12 @@ type TrafficRecord struct {
 }
 
 // NewScanner 创建安全扫描器
-func NewScanner(cfg *config.Config, netMgr *network.Manager) *Scanner {
+func NewScanner(cfg *config.Config, netMgr *network.Manager, wsClient *ws.Client) *Scanner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scanner{
 		cfg:      cfg,
 		netMgr:   netMgr,
+		wsClient: wsClient,
 		ctx:      ctx,
 		cancel:   cancel,
 		alerts:   make([]SecurityAlert, 0),
@@ -370,12 +373,11 @@ func (s *Scanner) createAlert(alertType, severity, instanceID, details string) S
 	}
 }
 
-// addAlert 添加告警
+// addAlert 添加告警并上报 Master
 func (s *Scanner) addAlert(alert SecurityAlert) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 去重：相同 IP + 类型 + 1小时内的不重复添加
 	for _, existing := range s.alerts {
 		if existing.Type == alert.Type && existing.SourceIP == alert.SourceIP {
 			if time.Since(existing.Timestamp) < time.Hour {
@@ -394,6 +396,22 @@ func (s *Scanner) addAlert(alert SecurityAlert) {
 		zap.String("severity", alert.Severity),
 		zap.String("source_ip", alert.SourceIP),
 		zap.String("details", alert.Details))
+
+	if s.wsClient != nil {
+		payload := ws.SecurityAlertPayload{
+			InstanceID: alert.InstanceID,
+			AlertType:  alert.Type,
+			Severity:   alert.Severity,
+			SourceIP:   alert.SourceIP,
+			Details:    alert.Details,
+			DetectedAt: alert.Timestamp.Unix(),
+		}
+		if err := s.wsClient.SendSecurityAlert(payload); err != nil {
+			zap.L().Error("上报安全告警到 Master 失败",
+				zap.String("alert_id", alert.ID),
+				zap.Error(err))
+		}
+	}
 }
 
 // GetAlerts 获取告警列表

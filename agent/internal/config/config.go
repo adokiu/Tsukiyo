@@ -26,7 +26,8 @@ type Config struct {
 	enableSecurityScan bool
 	scanInterval       time.Duration
 	consoleBindAddr    string
-	defaultStoragePool string
+	agentURL           string
+	imageRemoteURL     string
 	storagePoolType    string
 	storagePoolSource  string
 }
@@ -115,8 +116,11 @@ func (c *Config) UpdateFromMaster(data map[string]interface{}) {
 	if v, ok := data["console_bind_addr"].(string); ok && v != "" {
 		c.consoleBindAddr = v
 	}
-	if v, ok := data["default_storage_pool"].(string); ok && v != "" {
-		c.defaultStoragePool = v
+	if v, ok := data["agent_url"].(string); ok && v != "" {
+		c.agentURL = v
+	}
+	if v, ok := data["image_remote_url"].(string); ok {
+		c.imageRemoteURL = v
 	}
 	if v, ok := data["storage_pool_type"].(string); ok && v != "" {
 		c.storagePoolType = v
@@ -210,11 +214,18 @@ func (c *Config) ConsoleBindAddr() string {
 	return c.consoleBindAddr
 }
 
-// DefaultStoragePool 返回默认存储池名称
-func (c *Config) DefaultStoragePool() string {
+// AgentURL 返回 Agent 外部可访问 URL
+func (c *Config) AgentURL() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.defaultStoragePool
+	return c.agentURL
+}
+
+// ImageRemoteURL 返回节点配置的镜像源 URL
+func (c *Config) ImageRemoteURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.imageRemoteURL
 }
 
 // StoragePoolType 返回存储池类型

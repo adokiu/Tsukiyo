@@ -3,6 +3,7 @@ module tsukiyo/agent
 go 1.24
 
 require (
+	github.com/creack/pty v1.1.21
 	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/viper v1.19.0
 	go.uber.org/zap v1.27.0

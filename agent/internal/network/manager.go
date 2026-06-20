@@ -13,13 +13,13 @@ import (
 
 // Manager 网络管理器
 type Manager struct {
-	mu            sync.RWMutex
-	interfaceName string
-	enableNAT     bool
+	mu             sync.RWMutex
+	interfaceName  string
+	enableNAT      bool
 	enableFirewall bool
-	portMappings  map[string]PortMapping
-	firewallRules map[string]FirewallRule
-	blockedIPs    map[string]bool
+	portMappings   map[string]PortMapping
+	firewallRules  map[string]FirewallRule
+	blockedIPs     map[string]bool
 }
 
 // PortMapping 端口映射
@@ -79,6 +79,18 @@ func detectMainInterface() string {
 func (m *Manager) BindIP(ipAddress string, iface string) error {
 	if iface == "" {
 		iface = m.interfaceName
+	}
+
+	// 检查 IP 是否已在网卡上，避免重复添加导致路由变化
+	ipAddr := ipAddress
+	if idx := strings.Index(ipAddress, "/"); idx > 0 {
+		ipAddr = ipAddress[:idx]
+	}
+	checkCmd := exec.Command("ip", "-o", "addr", "show", "dev", iface)
+	checkOut, err := checkCmd.Output()
+	if err == nil && strings.Contains(string(checkOut), ipAddr) {
+		zap.L().Info("IP 已在网卡上，跳过绑定", zap.String("ip", ipAddress), zap.String("iface", iface))
+		return nil
 	}
 
 	// 先尝试解绑旧的

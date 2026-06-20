@@ -27,6 +27,8 @@ const (
 	MsgTypeResponse         MessageType = "response"
 	MsgTypeImageProgress    MessageType = "image_progress"
 	MsgTypeInstanceProgress MessageType = "instance_progress"
+	MsgTypeSecurityAlert    MessageType = "security_alert"
+	MsgTypeTaskLog          MessageType = "task_log"
 )
 
 // TaskHandler 任务处理回调
@@ -128,15 +130,20 @@ func (c *Client) sendRegister() error {
 	// 探测宿主机信息
 	hostInfo := system.Probe()
 
+	// 获取公网出口 IP
+	publicIPv4 := system.GetPublicIPv4()
+	publicIPv6 := system.GetPublicIPv6()
+
 	payload := map[string]interface{}{
 		"token":         c.cfg.Token,
 		"hostname":      c.hostname,
 		"version":       "1.0.0",
 		"incus_version": incusVersion,
 		"total_cpu":     float64(hostInfo.CPU.Cores),
-		"total_memory":  hostInfo.Memory.Total,
+		"total_memory":  hostInfo.Memory.TotalMB,
 		"total_disk":    getTotalDiskFromDisks(hostInfo.Disks),
-		"local_address": c.localAddress,
+		"public_ipv4":   publicIPv4,
+		"public_ipv6":   publicIPv6,
 		"system_info":   hostInfo,
 	}
 
@@ -146,10 +153,7 @@ func (c *Client) sendRegister() error {
 func getTotalDiskFromDisks(disks []system.DiskInfo) int64 {
 	var total int64
 	for _, d := range disks {
-		// 解析 "100.0 GB" 等格式
-		var val float64
-		fmt.Sscanf(d.Size, "%f", &val)
-		total += int64(val * 1024 * 1024 * 1024)
+		total += int64(d.SizeBytes)
 	}
 	return total
 }
@@ -229,19 +233,23 @@ func (c *Client) SendRequest(reqType string, payload interface{}) ([]byte, error
 }
 
 // SendHeartbeat 发送心跳
-func (c *Client) SendHeartbeat(cpuPercent float64, memUsed, memTotal, diskUsed, diskTotal int64, instances, running int, publicIPv4s, ipv6Prefixes []string) error {
+func (c *Client) SendHeartbeat(cpuPercent float64, memUsed, memTotal, diskUsed, diskTotal, netIn, netOut, uptime int64, instances, running int, publicIPv4s, ipv6Prefixes []string, networkInterfaces json.RawMessage) error {
 	payload := map[string]interface{}{
-		"token":         c.cfg.Token,
-		"cpu_percent":   cpuPercent,
-		"mem_used":      memUsed,
-		"mem_total":     memTotal,
-		"disk_used":     diskUsed,
-		"disk_total":    diskTotal,
-		"instances":     instances,
-		"running":       running,
-		"timestamp":     time.Now().Unix(),
-		"public_ipv4s":  publicIPv4s,
-		"ipv6_prefixes": ipv6Prefixes,
+		"token":              c.cfg.Token,
+		"cpu_percent":        cpuPercent,
+		"mem_used":           memUsed,
+		"mem_total":          memTotal,
+		"disk_used":          diskUsed,
+		"disk_total":         diskTotal,
+		"net_in":             netIn,
+		"net_out":            netOut,
+		"uptime":             uptime,
+		"instances":          instances,
+		"running":            running,
+		"timestamp":          time.Now().Unix(),
+		"public_ipv4s":       publicIPv4s,
+		"ipv6_prefixes":      ipv6Prefixes,
+		"network_interfaces": networkInterfaces,
 	}
 	return c.sendMessage(MsgTypeHeartbeat, payload)
 }
@@ -336,6 +344,47 @@ func (c *Client) SendInstanceProgress(p InstanceProgressPayload) error {
 		"status":      p.Status,
 	}
 	return c.sendMessage(MsgTypeInstanceProgress, payload)
+}
+
+// SendTaskLog 发送任务日志
+func (c *Client) SendTaskLog(taskID string, level string, message string) error {
+	payload := map[string]interface{}{
+		"token":   c.cfg.Token,
+		"task_id": taskID,
+		"level":   level,
+		"message": message,
+	}
+	return c.sendMessage(MsgTypeTaskLog, payload)
+}
+
+// SecurityAlertPayload 安全告警上报载荷
+type SecurityAlertPayload struct {
+	InstanceID string `json:"instance_id"`
+	AlertType  string `json:"alert_type"`
+	Severity   string `json:"severity"`
+	SourceIP   string `json:"source_ip,omitempty"`
+	DestPort   int    `json:"dest_port,omitempty"`
+	Protocol   string `json:"protocol,omitempty"`
+	Details    string `json:"details"`
+	RawData    string `json:"raw_data,omitempty"`
+	DetectedAt int64  `json:"detected_at"`
+}
+
+// SendSecurityAlert 上报安全告警到 Master
+func (c *Client) SendSecurityAlert(p SecurityAlertPayload) error {
+	payload := map[string]interface{}{
+		"token":       c.cfg.Token,
+		"instance_id": p.InstanceID,
+		"alert_type":  p.AlertType,
+		"severity":    p.Severity,
+		"source_ip":   p.SourceIP,
+		"dest_port":   p.DestPort,
+		"protocol":    p.Protocol,
+		"details":     p.Details,
+		"raw_data":    p.RawData,
+		"detected_at": p.DetectedAt,
+	}
+	return c.sendMessage(MsgTypeSecurityAlert, payload)
 }
 
 // readLoop 读取消息循环
