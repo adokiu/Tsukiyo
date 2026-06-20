@@ -77,8 +77,7 @@ func (s *NodeService) UpdateNodeConfig(nodeID uuid.UUID, req map[string]interfac
 	}
 
 	updates := map[string]interface{}{
-		"initialized": true,
-		"status":      models.NodeStatusOnline,
+		"status": models.NodeStatusOnline,
 	}
 	for k, v := range req {
 		updates[k] = v
@@ -134,17 +133,17 @@ func (s *NodeService) GetNodeNetworks(nodeID uuid.UUID) ([]NetworkInfo, error) {
 	}
 
 	type sysInfo struct {
-		Networks []NetworkInfo `json:"networks"`
+		Networks []NetworkInfo `json:"network_interfaces"`
 	}
 	var parsed sysInfo
 	if err := json.Unmarshal([]byte(node.SystemInfo), &parsed); err != nil {
 		return []NetworkInfo{}, nil
 	}
 
-	// 过滤：排除 VPC bridge 和 loopback
-	var filtered []NetworkInfo
+	// 过滤：排除网桥和 loopback
+	filtered := make([]NetworkInfo, 0, len(parsed.Networks))
 	for _, n := range parsed.Networks {
-		if n.Name == "lo" || strings.HasPrefix(n.Name, "vpc-") {
+		if n.Name == "lo" || strings.HasPrefix(n.Name, "br-") {
 			continue
 		}
 		filtered = append(filtered, n)
@@ -166,9 +165,21 @@ func (s *NodeService) IsNodeOnline(node *models.Node) bool {
 
 // NetworkInfo 网卡信息
 type NetworkInfo struct {
-	Name   string   `json:"name"`
-	Status string   `json:"status"`
-	IPv4   []string `json:"ipv4"`
-	IPv6   []string `json:"ipv6"`
-	MAC    string   `json:"mac"`
+	Name      string    `json:"name"`
+	MAC       string    `json:"mac"`
+	State     string    `json:"state"`
+	SpeedMbps int       `json:"speed_mbps"`
+	Driver    string    `json:"driver"`
+	Model     string    `json:"model"`
+	IPv4      []IPProbe `json:"ipv4"`
+	IPv6      []IPProbe `json:"ipv6"`
+}
+
+// IPProbe IP 地址信息
+type IPProbe struct {
+	Interface string `json:"interface"`
+	Address   string `json:"address"`
+	PrefixLen int    `json:"prefix_len"`
+	Scope     string `json:"scope"`
+	Gateway   string `json:"gateway,omitempty"`
 }

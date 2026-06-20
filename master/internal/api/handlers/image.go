@@ -188,3 +188,57 @@ func ListRemoteImages(c *gin.Context) {
 
 	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID.String(), "message": "获取远程镜像列表任务已下发"})
 }
+
+// GetImageSource 获取当前镜像源
+func GetImageSource(c *gin.Context) {
+	source, err := imageService.GetImageSource()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"source": source})
+}
+
+// UpdateImageSource 切换镜像源并刷新缓存
+func UpdateImageSource(c *gin.Context) {
+	var req struct {
+		Source string `json:"source" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "source 必填"})
+		return
+	}
+	if err := imageService.SetImageSource(req.Source); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "镜像源已切换，缓存已刷新"})
+}
+
+// RefreshImageCache 刷新镜像缓存
+func RefreshImageCache(c *gin.Context) {
+	nodeIDStr := c.Query("node_id")
+	if nodeIDStr != "" {
+		nodeID, err := uuid.Parse(nodeIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 node_id"})
+			return
+		}
+		if err := imageService.RefreshImageCacheByNode(nodeID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	} else {
+		source, err := imageService.GetImageSource()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		baseURL := infrastructure.StreamsRemoteToBaseURL(source)
+		if err := imageService.RefreshImageCache(baseURL, ""); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "镜像缓存已刷新"})
+}

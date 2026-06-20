@@ -17,6 +17,7 @@ import (
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/schedule"
 	"tsukiyo/master/internal/security"
+	infra "tsukiyo/master/internal/service/infrastructure"
 	"tsukiyo/master/internal/task"
 	"tsukiyo/master/pkg/logger"
 )
@@ -44,8 +45,8 @@ func main() {
 		zap.L().Fatal("初始化数据库失败", zap.Error(err))
 	}
 
-	// 自动迁移
-	if err := db.AutoMigrate(); err != nil {
+	// 执行数据库迁移（golang-migrate，版本追踪 + advisory lock）
+	if err := db.RunMigrations(&config.AppConfig.Database); err != nil {
 		zap.L().Fatal("数据库迁移失败", zap.Error(err))
 	}
 
@@ -58,8 +59,11 @@ func main() {
 	agentMgr := agent.NewManager()
 	agentMgr.StartHeartbeatChecker()
 
+	// 创建网络服务（供 Scheduler 释放资源使用）
+	networkSvc := infra.NewNetworkService(agentMgr)
+
 	// 启动任务调度器
-	taskScheduler := task.NewScheduler(agentMgr)
+	taskScheduler := task.NewScheduler(agentMgr, networkSvc)
 	taskScheduler.Start()
 
 	// 注入任务结果处理器

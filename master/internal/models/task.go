@@ -39,8 +39,11 @@ const (
 	TaskTypeApplyFirewall       TaskType = "apply_firewall"
 	TaskTypeFormatDisk          TaskType = "format_disk"
 	TaskTypeInitStorage         TaskType = "init_storage"
+	TaskTypeCreatePartition     TaskType = "create_partition"
+	TaskTypeDeletePartition     TaskType = "delete_partition"
 	TaskTypeMigrateInstance     TaskType = "migrate_instance"
-	TaskTypeVPCNetwork          TaskType = "vpc_network"
+	TaskTypeBridgeNetwork       TaskType = "bridge_network"
+	TaskTypeDeleteStorage       TaskType = "delete_storage"
 )
 
 // Task 任务队列表

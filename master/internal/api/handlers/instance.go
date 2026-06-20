@@ -23,9 +23,6 @@ func InitInstanceService(svc *instance.InstanceService) {
 // DataDiskRequest 数据磁盘请求
 type DataDiskRequest = instance.DataDiskRequest
 
-// NATRequest NAT 请求
-type NATRequest = instance.NATRequest
-
 // CreateInstanceRequest 创建实例请求
 type CreateInstanceRequest = instance.CreateInstanceRequest
 
@@ -55,12 +52,12 @@ func CreateInstance(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像未下载，请先下载镜像"})
 			return
 		}
-		if err == service.ErrInvalidVPCID {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 VPC ID"})
+		if err == service.ErrInvalidBridgeID {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的网桥 ID"})
 			return
 		}
-		if err == service.ErrVPCNotFound {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "VPC 不存在或不属于该节点"})
+		if err == service.ErrBridgeNotFound {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "网桥不存在或不属于该节点"})
 			return
 		}
 		if err == service.ErrUserNotFound {
@@ -69,22 +66,6 @@ func CreateInstance(c *gin.Context) {
 		}
 		if err == service.ErrInstanceNameExists {
 			c.JSON(http.StatusConflict, gin.H{"error": "该节点上已存在同名实例"})
-			return
-		}
-		if err == service.ErrInvalidIPv4ID {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的公网 IPv4 ID"})
-			return
-		}
-		if err == service.ErrIPv4NotAvailable {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "公网 IPv4 不可用或已被分配"})
-			return
-		}
-		if err == service.ErrInvalidIPv6ID {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 IPv6 前缀 ID"})
-			return
-		}
-		if err == service.ErrIPv6NotFound {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "IPv6 前缀不存在"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建实例失败"})
@@ -116,14 +97,6 @@ func ListInstances(c *gin.Context) {
 
 	result := make([]gin.H, 0, len(instances))
 	for _, inst := range instances {
-		ipv4 := ""
-		if inst.IPv4Address != nil {
-			ipv4 = *inst.IPv4Address
-		}
-		ipv6 := ""
-		if inst.IPv6Address != nil {
-			ipv6 = *inst.IPv6Address
-		}
 		item := gin.H{
 			"id":              inst.ID.String(),
 			"name":            inst.Name,
@@ -136,8 +109,7 @@ func ListInstances(c *gin.Context) {
 			"disk_gb":         inst.DiskGB,
 			"storage_pool":    inst.StoragePool,
 			"internal_ipv4":   inst.InternalIPv4,
-			"ipv4_address":    ipv4,
-			"ipv6_address":    ipv6,
+			"internal_ipv6":   inst.InternalIPv6,
 			"ssh_port":        inst.SSHPort,
 			"login_method":    inst.LoginMethod,
 			"network_down":    inst.NetworkDownMbps,
@@ -150,8 +122,8 @@ func ListInstances(c *gin.Context) {
 			"expires_at":      inst.ExpiresAt,
 			"created_at":      inst.CreatedAt,
 		}
-		if inst.VPCID != nil {
-			item["vpc_id"] = inst.VPCID.String()
+		if inst.BridgeID != nil {
+			item["bridge_id"] = inst.BridgeID.String()
 		}
 		result = append(result, item)
 	}
@@ -180,15 +152,6 @@ func GetInstance(c *gin.Context) {
 		return
 	}
 
-	ipv4 := ""
-	if instance.IPv4Address != nil {
-		ipv4 = *instance.IPv4Address
-	}
-	ipv6 := ""
-	if instance.IPv6Address != nil {
-		ipv6 = *instance.IPv6Address
-	}
-
 	resp := gin.H{
 		"id":              instance.ID.String(),
 		"name":            instance.Name,
@@ -203,9 +166,8 @@ func GetInstance(c *gin.Context) {
 		"disk_gb":         instance.DiskGB,
 		"storage_pool":    instance.StoragePool,
 		"internal_ipv4":   instance.InternalIPv4,
+		"internal_ipv6":   instance.InternalIPv6,
 		"login_method":    instance.LoginMethod,
-		"ipv4_address":    ipv4,
-		"ipv6_address":    ipv6,
 		"ssh_port":        instance.SSHPort,
 		"ssh_password":    instance.SSHPassword,
 		"ssh_public_key":  instance.SSHPublicKey,
@@ -217,19 +179,18 @@ func GetInstance(c *gin.Context) {
 		"traffic_mode":    instance.TrafficMode,
 		"snapshot_limit":  instance.SnapshotLimit,
 		"data_disks":      instance.DataDisks,
-		"nat_configs":     instance.NATConfigs,
 		"port_mappings":   instance.PortMappings,
 		"expires_at":      instance.ExpiresAt,
 		"created_at":      instance.CreatedAt,
 	}
-	if instance.VPCID != nil {
-		resp["vpc_id"] = instance.VPCID.String()
-		var vpc models.VPCNetwork
-		if err := db.DB.Where("id = ?", *instance.VPCID).First(&vpc).Error; err == nil {
-			resp["vpc_name"] = vpc.Name
-			resp["vpc_bridge"] = vpc.GetBridgeName()
-			resp["vpc_cidr"] = vpc.IPv4CIDR
-			resp["vpc_gateway"] = vpc.DefaultGatewayV4
+	if instance.BridgeID != nil {
+		resp["bridge_id"] = instance.BridgeID.String()
+		var bridge models.Bridge
+		if err := db.DB.Where("id = ?", *instance.BridgeID).First(&bridge).Error; err == nil {
+			resp["bridge_name"] = bridge.Name
+			resp["bridge_iface"] = bridge.BridgeName
+			resp["bridge_cidr"] = bridge.IPv4CIDR
+			resp["bridge_gateway"] = bridge.IPv4Gateway
 		}
 	}
 	c.JSON(http.StatusOK, resp)
@@ -371,11 +332,21 @@ func ReinstallInstance(c *gin.Context) {
 		return
 	}
 
+	var req instance.ReinstallInstanceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+
 	userID, _ := c.Get("user_id")
-	task, err := instanceService.ReinstallInstance(instanceID, userID.(uint))
+	task, err := instanceService.ReinstallInstance(instanceID, userID.(uint), req)
 	if err != nil {
 		if err == service.ErrInstanceNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+			return
+		}
+		if err == service.ErrInstanceBusy {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建任务失败"})
@@ -433,7 +404,15 @@ func ResetInstancePassword(c *gin.Context) {
 	}
 
 	if err := instanceService.ResetInstancePassword(instanceID, req.Password); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新密码失败"})
+		if err == service.ErrNodeNotConnected || err == service.ErrAgentManagerNotInitialized {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		if err == service.ErrOperationTimeout {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置密码失败: " + err.Error()})
 		return
 	}
 
@@ -455,7 +434,11 @@ func GetInstanceConsole(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取控制台失败"})
+		if err == service.ErrNodeNotConnected {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "节点离线"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取控制台失败: " + err.Error()})
 		return
 	}
 

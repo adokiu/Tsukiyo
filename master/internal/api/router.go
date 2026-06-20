@@ -9,7 +9,6 @@ import (
 	"tsukiyo/master/internal/agent"
 	"tsukiyo/master/internal/api/handlers"
 	"tsukiyo/master/internal/api/middleware"
-	"tsukiyo/master/internal/console"
 	infra "tsukiyo/master/internal/service/infrastructure"
 	inst "tsukiyo/master/internal/service/instance"
 	sys "tsukiyo/master/internal/service/system"
@@ -37,6 +36,8 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	r.GET("/ws/images", agentMgr.HandleFrontendWebSocket)
 	// 前端 WebSocket 推送端点（任务状态等实时数据）
 	r.GET("/ws/tasks", agentMgr.HandleFrontendWebSocket)
+	// 前端 WebSocket 推送端点（节点心跳等实时数据）
+	r.GET("/ws/nodes", agentMgr.HandleFrontendWebSocket)
 
 	// 初始化服务层
 	imageService := infra.NewImageService(agentMgr)
@@ -47,7 +48,7 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	handlers.InitUserService(userService)
 	networkService := infra.NewNetworkService(agentMgr)
 	handlers.InitNetworkService(networkService)
-	instanceService := inst.NewInstanceService()
+	instanceService := inst.NewInstanceService(networkService, agentMgr)
 	handlers.InitInstanceService(instanceService)
 	snapshotService := inst.NewSnapshotService()
 	handlers.InitSnapshotService(snapshotService)
@@ -97,9 +98,17 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.DELETE("/nodes/:id", handlers.DeleteNode)
 		authGroup.GET("/nodes/:id/disks", handlers.ListNodeDisks)
 		authGroup.POST("/nodes/:id/disks/format", handlers.FormatNodeDisk)
+		authGroup.POST("/nodes/:id/disks/partitions", handlers.CreatePartition)
+		authGroup.DELETE("/nodes/:id/disks/partitions/:device", handlers.DeletePartition)
 		authGroup.GET("/nodes/:id/storages", handlers.ListNodeStorages)
 		authGroup.POST("/nodes/:id/storages/init", handlers.InitNodeStorage)
+		authGroup.DELETE("/nodes/:id/storages/:name", handlers.DeleteNodeStorage)
+		authGroup.GET("/nodes/:id/storages/:name/volumes", handlers.ListNodeVolumes)
+		authGroup.GET("/nodes/:id/storages/:name/resources", handlers.GetNodeStorageResources)
 		authGroup.GET("/nodes/:id/networks", handlers.GetNodeNetworks)
+		authGroup.GET("/nodes/:id/bridges", handlers.GetNodeBridges)
+		authGroup.GET("/nodes/:id/tasks", handlers.GetNodeTasks)
+		authGroup.GET("/nodes/:id/security-alerts", handlers.GetNodeSecurityAlerts)
 
 		// 实例管理
 		authGroup.GET("/instances", handlers.ListInstances)
@@ -129,19 +138,29 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.GET("/images/progress", handlers.GetImageProgress)
 		authGroup.POST("/images/cancel", handlers.CancelImageDownload)
 		authGroup.DELETE("/images", handlers.DeleteImage)
+		authGroup.GET("/images/source", handlers.GetImageSource)
+		authGroup.PUT("/images/source", handlers.UpdateImageSource)
+		authGroup.POST("/images/refresh", handlers.RefreshImageCache)
 
-		// VPC 网络管理
-		authGroup.GET("/network/vpcs", handlers.ListVPCs)
-		authGroup.POST("/network/vpcs", handlers.CreateVPC)
-		authGroup.GET("/network/vpcs/:id", handlers.GetVPC)
-		authGroup.PUT("/network/vpcs/:id", handlers.UpdateVPC)
-		authGroup.DELETE("/network/vpcs/:id", handlers.DeleteVPC)
+		// 网桥管理
+		authGroup.GET("/network/bridges", handlers.ListBridges)
+		authGroup.POST("/network/bridges", handlers.CreateBridge)
+		authGroup.GET("/network/bridges/:id", handlers.GetBridge)
+		authGroup.PUT("/network/bridges/:id", handlers.UpdateBridge)
+		authGroup.DELETE("/network/bridges/:id", handlers.DeleteBridge)
+		authGroup.POST("/network/bridges/:id/bind-egress", handlers.BindBridgeEgress)
+		authGroup.POST("/network/bridges/:id/unbind-egress", handlers.UnbindBridgeEgress)
 
-		// IP 池管理
-		authGroup.GET("/network/pools", handlers.ListIPPools)
-		authGroup.POST("/network/pools", handlers.AddIPPool)
-		authGroup.DELETE("/network/pools/:id", handlers.DeleteIPPool)
-		authGroup.GET("/network/prefixes", handlers.ListIPv6Prefixes)
+		// EIP 资源池管理
+		authGroup.GET("/network/eip-pools", handlers.ListEIPPools)
+		authGroup.POST("/network/eip-pools", handlers.CreateEIPPool)
+		authGroup.DELETE("/network/eip-pools/:id", handlers.DeleteEIPPool)
+
+		// EIP 分配管理
+		authGroup.GET("/network/eip-allocations", handlers.ListEIPAllocations)
+		authGroup.POST("/network/eip-allocations/allocate", handlers.AllocateEIP)
+		authGroup.POST("/network/eip-allocations/:id/assign", handlers.AssignEIPToInstance)
+		authGroup.POST("/network/eip-allocations/:id/release", handlers.ReleaseEIP)
 
 		// 端口映射
 		authGroup.GET("/network/port-mappings", handlers.ListPortMappings)
@@ -158,9 +177,11 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.POST("/batch/create", handlers.BatchCreate)
 		authGroup.POST("/batch/action", handlers.BatchAction)
 
-		// 安全
+		// 安全告警
 		authGroup.GET("/security/alerts", handlers.ListSecurityAlerts)
 		authGroup.GET("/security/summary", handlers.GetSecuritySummary)
+		authGroup.POST("/security/alerts/:id/resolve", handlers.ResolveSecurityAlert)
+		authGroup.POST("/security/alerts/:id/ignore", handlers.IgnoreSecurityAlert)
 
 		// 审计日志
 		authGroup.GET("/audit-logs", handlers.ListAuditLogs)
@@ -177,9 +198,8 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.GET("/settings/site", handlers.GetSiteConfig)
 		authGroup.PUT("/settings/site", handlers.UpdateSiteConfig)
 
-		// 控制台
-		authGroup.GET("/console/ssh", console.HandleWebSSH(agentMgr))
-		authGroup.GET("/console/vnc", console.HandleWebVNC(agentMgr))
+		// 控制台（前端通过 GetInstanceConsole 获取直连 Agent 的 URL 和 Token）
+		// 不再通过 Master 代理 WebSocket，减少带宽开销
 	}
 
 	// 404 处理

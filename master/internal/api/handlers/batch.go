@@ -26,7 +26,9 @@ type BatchCreateRequest struct {
 	DiskGB           int     `json:"disk_gb" binding:"required,min=1"`
 	StoragePool      string  `json:"storage_pool,omitempty"`
 	LoginMethod      string  `json:"login_method,omitempty"`
-	AssignNAT        *bool   `json:"assign_nat,omitempty"`
+	BridgeID         string  `json:"bridge_id,omitempty"`
+	AssignEIPv4      bool    `json:"assign_eip_ipv4,omitempty"`
+	AssignEIPv6      bool    `json:"assign_eip_ipv6,omitempty"`
 	PortMappingCount int     `json:"port_mapping_count,omitempty"`
 	NetworkDown      int     `json:"network_down_mbps,omitempty"`
 	NetworkUp        int     `json:"network_up_mbps,omitempty"`
@@ -102,16 +104,9 @@ func BatchCreate(c *gin.Context) {
 			continue
 		}
 
-		wantsNAT := true
-		if req.AssignNAT != nil {
-			wantsNAT = *req.AssignNAT
-		}
 		portMappingCount := req.PortMappingCount
-		if wantsNAT && portMappingCount < 1 {
-			portMappingCount = 2
-		}
-		if !wantsNAT {
-			portMappingCount = 0
+		if portMappingCount < 1 {
+			portMappingCount = 1
 		}
 
 		payload := map[string]interface{}{
@@ -128,7 +123,9 @@ func BatchCreate(c *gin.Context) {
 			"network_up":         newInstance.NetworkUpMbps,
 			"io_read":            newInstance.IOReadMBps,
 			"io_write":           newInstance.IOWriteMBps,
-			"assign_nat":         wantsNAT,
+			"bridge_id":          req.BridgeID,
+			"assign_eip_ipv4":    req.AssignEIPv4,
+			"assign_eip_ipv6":    req.AssignEIPv6,
 			"port_mapping_count": portMappingCount,
 			"traffic_mode":       newInstance.TrafficMode,
 			"monthly_traffic":    newInstance.MonthlyTrafficGB,

@@ -13,24 +13,27 @@ import (
 	"tsukiyo/master/internal/agent"
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/models"
+	"tsukiyo/master/internal/service/infrastructure"
 )
 
 // Scheduler 任务调度器
 type Scheduler struct {
-	mgr      *agent.Manager
-	interval time.Duration
-	ctx      context.Context
-	cancel   context.CancelFunc
+	mgr        *agent.Manager
+	networkSvc *infrastructure.NetworkService
+	interval   time.Duration
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewScheduler 创建任务调度器
-func NewScheduler(mgr *agent.Manager) *Scheduler {
+func NewScheduler(mgr *agent.Manager, networkSvc *infrastructure.NetworkService) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
-		mgr:      mgr,
-		interval: 2 * time.Second,
-		ctx:      ctx,
-		cancel:   cancel,
+		mgr:        mgr,
+		networkSvc: networkSvc,
+		interval:   2 * time.Second,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }
 
@@ -157,8 +160,13 @@ func (s *Scheduler) markTaskFailed(task *models.Task, errMsg string) {
 	// 有副作用的操作失败后不再重试，直接标记为 failed
 	nonRetryableTypes := map[models.TaskType]bool{
 		models.TaskTypeCreateInstance:    true,
+		models.TaskTypeDeleteInstance:    true,
 		models.TaskTypeReinstallInstance: true,
 		models.TaskTypeResizeInstance:    true,
+		models.TaskTypeCreatePartition:   true,
+		models.TaskTypeDeletePartition:   true,
+		models.TaskTypeFormatDisk:        true,
+		models.TaskTypeInitStorage:       true,
 	}
 	if nonRetryableTypes[task.Type] || task.RetryCount+1 >= task.MaxRetries {
 		updates["status"] = models.TaskStatusFailed
@@ -186,8 +194,19 @@ func (s *Scheduler) HandleTaskResult(taskID uuid.UUID, result json.RawMessage, e
 		updates["status"] = models.TaskStatusFailed
 		updates["error"] = errMsg
 		updates["retry_count"] = gorm.Expr("retry_count + 1")
-		// 如果还有重试次数，恢复 pending
-		if task.RetryCount+1 < task.MaxRetries {
+		// create_instance 有副作用，失败后不重试
+		nonRetryableTypes := map[models.TaskType]bool{
+			models.TaskTypeCreateInstance:    true,
+			models.TaskTypeDeleteInstance:    true,
+			models.TaskTypeReinstallInstance: true,
+			models.TaskTypeResizeInstance:    true,
+			models.TaskTypeCreatePartition:   true,
+			models.TaskTypeDeletePartition:   true,
+			models.TaskTypeFormatDisk:        true,
+			models.TaskTypeInitStorage:       true,
+			models.TaskTypeDeleteStorage:     true,
+		}
+		if !nonRetryableTypes[task.Type] && task.RetryCount+1 < task.MaxRetries {
 			updates["status"] = models.TaskStatusPending
 			updates["completed_at"] = nil
 		}
@@ -215,48 +234,19 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 			instanceUpdates := map[string]interface{}{
 				"status": models.InstanceStatusRunning,
 			}
-			// 解析 Agent 回传结果：assigned_ports 和 instance_ip
+			// 解析 Agent 回传的 instance_ip（端口映射已由 Master 提前分配，无需 Agent 回传）
 			if len(task.Result) > 0 {
 				var result struct {
-					AssignedPorts []struct {
-						HostPort      int    `json:"host_port"`
-						ContainerPort int    `json:"container_port"`
-						Protocol      string `json:"protocol"`
-						Description   string `json:"description"`
-					} `json:"assigned_ports"`
 					InstanceIP string `json:"instance_ip"`
 				}
 				if err := json.Unmarshal(task.Result, &result); err == nil {
 					if result.InstanceIP != "" {
-						instanceUpdates["ipv4_address"] = &result.InstanceIP
-					}
-					// 保存端口映射到数据库，并提取 SSH 端口
-					if len(result.AssignedPorts) > 0 {
-						var instance models.Instance
-						if db.DB.Where("id = ?", *task.InstanceID).First(&instance).Error == nil {
-							for _, pm := range result.AssignedPorts {
-								mapping := models.PortMapping{
-									ID:            uuid.New(),
-									InstanceID:    *task.InstanceID,
-									NodeID:        instance.NodeID,
-									HostPort:      pm.HostPort,
-									ContainerPort: pm.ContainerPort,
-									Protocol:      pm.Protocol,
-									Description:   pm.Description,
-								}
-								db.DB.Create(&mapping)
-								// 提取 SSH 端口
-								if pm.ContainerPort == 22 {
-									instanceUpdates["ssh_port"] = pm.HostPort
-								}
-							}
-						}
+						instanceUpdates["internal_ipv4"] = &result.InstanceIP
 					}
 				}
 			}
 			db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).Updates(instanceUpdates)
 		} else {
-			// 创建失败，将实例状态标记为 error
 			db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).Updates(map[string]interface{}{
 				"status": models.InstanceStatusError,
 			})
@@ -264,27 +254,10 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 	case models.TaskTypeDeleteInstance:
 		if task.InstanceID != nil {
 			if success {
-				// 删除成功：释放资源并删除记录
-				var instance models.Instance
-				if err := db.DB.Where("id = ?", *task.InstanceID).First(&instance).Error; err == nil {
-					if instance.PublicIPv4ID != nil {
-						db.DB.Model(&models.PublicIPPool{}).Where("id = ?", *instance.PublicIPv4ID).
-							Updates(map[string]interface{}{
-								"status":      models.IPStatusFree,
-								"instance_id": uuid.Nil,
-								"assigned_at": nil,
-							})
-					}
-					if instance.InternalIPv4 != "" && instance.VPCID != nil {
-						db.DB.Where("owner_id = ? AND address = ? AND pool_type = ?", *instance.VPCID, instance.InternalIPv4, "vpc_internal").
-							Delete(&models.IPPoolEntry{})
-					}
-				}
+				// 释放所有网络资源（EIP、端口映射、防火墙规则）
+				s.networkSvc.ReleaseInstanceNetworkResources(*task.InstanceID)
 				db.DB.Delete(&models.Instance{}, *task.InstanceID)
 				db.DB.Where("instance_id = ?", *task.InstanceID).Delete(&models.DataDisk{})
-				db.DB.Where("instance_id = ?", *task.InstanceID).Delete(&models.NATConfig{})
-				db.DB.Where("instance_id = ?", *task.InstanceID).Delete(&models.PortMapping{})
-				db.DB.Where("instance_id = ?", *task.InstanceID).Delete(&models.FirewallRule{})
 			} else {
 				// 删除失败：恢复实例状态，不删除记录
 				oldStatus := models.InstanceStatusError
@@ -297,6 +270,41 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
 					Update("status", oldStatus)
 				zap.L().Warn("实例删除失败，恢复状态", zap.String("task_id", task.ID.String()), zap.String("old_status", string(oldStatus)))
+			}
+		}
+	case models.TaskTypeReinstallInstance:
+		if task.InstanceID != nil {
+			if success {
+				updates := map[string]interface{}{
+					"status": models.InstanceStatusRunning,
+				}
+				var payload struct {
+					TemplateID  string `json:"template_id"`
+					Password    string `json:"password"`
+					LoginMethod string `json:"login_method"`
+				}
+				if err := json.Unmarshal(task.Payload, &payload); err == nil {
+					if payload.TemplateID != "" {
+						updates["template_id"] = payload.TemplateID
+					}
+					if payload.Password != "" {
+						updates["ssh_password"] = payload.Password
+					}
+					if payload.LoginMethod != "" {
+						updates["login_method"] = payload.LoginMethod
+					}
+				}
+				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).Updates(updates)
+			} else {
+				oldStatus := models.InstanceStatusError
+				var payload struct {
+					OldStatus string `json:"old_status"`
+				}
+				if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+					oldStatus = models.InstanceStatus(payload.OldStatus)
+				}
+				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+					Update("status", oldStatus)
 			}
 		}
 	case models.TaskTypeStartInstance:
@@ -318,6 +326,16 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 			if success {
 				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
 					Update("status", models.InstanceStatusRunning)
+			}
+		}
+	case models.TaskTypeDeleteStorage:
+		if success {
+			var payload struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.Name != "" {
+				db.DB.Model(&models.Node{}).Where("id = ? AND default_storage_pool = ?", task.NodeID, payload.Name).
+					Update("default_storage_pool", "")
 			}
 		}
 	}

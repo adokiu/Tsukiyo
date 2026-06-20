@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -77,9 +78,10 @@ func ListNodes(c *gin.Context) {
 			"token":                node.Token,
 			"hostname":             node.Hostname,
 			"ip_address":           node.IPAddress,
+			"ipv6_address":         node.IPv6Address,
+			"country_code":         node.CountryCode,
 			"status":               node.Status,
 			"is_online":            isOnline,
-			"initialized":          node.Initialized,
 			"incus_version":        node.IncusVersion,
 			"total_cpu":            node.TotalCPU,
 			"total_memory":         node.TotalMemory,
@@ -87,6 +89,9 @@ func ListNodes(c *gin.Context) {
 			"used_cpu":             node.UsedCPU,
 			"used_memory":          node.UsedMemory,
 			"used_disk":            node.UsedDisk,
+			"net_in":               node.NetIn,
+			"net_out":              node.NetOut,
+			"uptime":               node.Uptime,
 			"instance_count":       node.InstanceCount,
 			"running_count":        node.RunningCount,
 			"last_seen_at":         node.LastSeenAt,
@@ -101,7 +106,7 @@ func ListNodes(c *gin.Context) {
 			"enable_security_scan": node.EnableSecurityScan,
 			"scan_interval":        node.ScanInterval,
 			"console_bind_addr":    node.ConsoleBindAddr,
-			"default_storage_pool": node.DefaultStoragePool,
+			"agent_url":            node.AgentURL,
 			"storage_pool_type":    node.StoragePoolType,
 			"storage_pool_source":  node.StoragePoolSource,
 			"system_info":          node.SystemInfo,
@@ -140,6 +145,8 @@ func GetNode(c *gin.Context) {
 		"token":                node.Token,
 		"hostname":             node.Hostname,
 		"ip_address":           node.IPAddress,
+		"ipv6_address":         node.IPv6Address,
+		"country_code":         node.CountryCode,
 		"status":               node.Status,
 		"is_online":            isOnline,
 		"incus_version":        node.IncusVersion,
@@ -149,12 +156,14 @@ func GetNode(c *gin.Context) {
 		"used_cpu":             node.UsedCPU,
 		"used_memory":          node.UsedMemory,
 		"used_disk":            node.UsedDisk,
+		"net_in":               node.NetIn,
+		"net_out":              node.NetOut,
+		"uptime":               node.Uptime,
 		"instance_count":       node.InstanceCount,
 		"running_count":        node.RunningCount,
 		"last_seen_at":         node.LastSeenAt,
 		"last_heartbeat":       node.LastHeartbeat,
 		"created_at":           node.CreatedAt,
-		"initialized":          node.Initialized,
 		"incus_socket_path":    node.IncusSocketPath,
 		"metrics_interval":     node.MetricsInterval,
 		"heartbeat_interval":   node.HeartbeatInterval,
@@ -164,7 +173,8 @@ func GetNode(c *gin.Context) {
 		"enable_security_scan": node.EnableSecurityScan,
 		"scan_interval":        node.ScanInterval,
 		"console_bind_addr":    node.ConsoleBindAddr,
-		"default_storage_pool": node.DefaultStoragePool,
+		"agent_url":            node.AgentURL,
+		"image_remote_url":     node.ImageRemoteURL,
 		"storage_pool_type":    node.StoragePoolType,
 		"storage_pool_source":  node.StoragePoolSource,
 		"system_info":          node.SystemInfo,
@@ -182,7 +192,8 @@ type UpdateNodeConfigRequest struct {
 	EnableSecurityScan bool   `json:"enable_security_scan"`
 	ScanInterval       int    `json:"scan_interval"`
 	ConsoleBindAddr    string `json:"console_bind_addr"`
-	DefaultStoragePool string `json:"default_storage_pool"`
+	AgentURL           string `json:"agent_url"`
+	ImageRemoteURL     string `json:"image_remote_url"`
 	StoragePoolType    string `json:"storage_pool_type"`
 	StoragePoolSource  string `json:"storage_pool_source"`
 }
@@ -211,7 +222,8 @@ func UpdateNodeConfig(c *gin.Context) {
 		"enable_security_scan": req.EnableSecurityScan,
 		"scan_interval":        req.ScanInterval,
 		"console_bind_addr":    req.ConsoleBindAddr,
-		"default_storage_pool": req.DefaultStoragePool,
+		"agent_url":            req.AgentURL,
+		"image_remote_url":     req.ImageRemoteURL,
 		"storage_pool_type":    req.StoragePoolType,
 		"storage_pool_source":  req.StoragePoolSource,
 	}
@@ -271,4 +283,85 @@ func GetNodeNetworks(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"networks": networks})
+}
+
+// GetNodeBridges 获取节点的网桥列表
+func GetNodeBridges(c *gin.Context) {
+	nodeID := c.Param("id")
+	if _, err := uuid.Parse(nodeID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
+		return
+	}
+
+	var bridges []models.Bridge
+	if err := db.DB.Where("node_id = ?", nodeID).Order("created_at DESC").Find(&bridges).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询网桥失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": bridges})
+}
+
+// GetNodeTasks 获取节点的任务历史
+func GetNodeTasks(c *gin.Context) {
+	nodeID := c.Param("id")
+	if _, err := uuid.Parse(nodeID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
+		return
+	}
+
+	var tasks []models.Task
+	query := db.DB.Where("node_id = ?", nodeID).Order("created_at DESC")
+
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if v, err := parseIntParam(l); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	query = query.Limit(limit)
+
+	if err := query.Find(&tasks).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询任务失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": tasks})
+}
+
+// GetNodeSecurityAlerts 获取节点的安全告警
+func GetNodeSecurityAlerts(c *gin.Context) {
+	nodeID := c.Param("id")
+	if _, err := uuid.Parse(nodeID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的节点 ID"})
+		return
+	}
+
+	var alerts []models.SecurityAlert
+	query := db.DB.Where("node_id = ?", nodeID).Order("detected_at DESC")
+
+	if status := c.Query("status"); status != "" {
+		query = query.Where("status = ?", status)
+	}
+
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if v, err := parseIntParam(l); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	query = query.Limit(limit)
+
+	if err := query.Find(&alerts).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询安全告警失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": alerts})
+}
+
+func parseIntParam(s string) (int, error) {
+	var v int
+	_, err := fmt.Sscanf(s, "%d", &v)
+	return v, err
 }

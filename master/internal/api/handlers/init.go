@@ -107,7 +107,7 @@ func InitSetup(c *gin.Context) {
 		return
 	}
 
-	// 查找已有的 admin 权限组（由 AutoMigrate 初始化数据创建）
+	// 查找已有的 admin 权限组（由数据库迁移创建）
 	var adminGroup models.UserGroup
 	if err := tx.Where("name = ?", "admin").First(&adminGroup).Error; err != nil {
 		tx.Rollback()
