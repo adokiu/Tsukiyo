@@ -58,11 +58,18 @@ func CreateNode(c *gin.Context) {
 		"status":     node.Status,
 		"created_at": node.CreatedAt,
 	})
+	BroadcastDataRefresh("nodes", "")
 }
 
 // ListNodes 获取节点列表
 func ListNodes(c *gin.Context) {
-	nodes, err := nodeService.ListNodes()
+	q := ParseListQuery(c)
+	nodes, total, err := nodeService.ListNodes(infrastructure.ListNodesRequest{
+		Page:    q.Page,
+		PerPage: q.PerPage,
+		Search:  q.Search,
+		Filters: q.Filters,
+	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
 		return
@@ -113,9 +120,11 @@ func ListNodes(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"data":  result,
-		"total": len(result),
+	c.JSON(http.StatusOK, ListResponse{
+		Data:    result,
+		Total:   total,
+		Page:    q.Page,
+		PerPage: q.PerPage,
 	})
 }
 
@@ -238,6 +247,7 @@ func UpdateNodeConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "配置更新并下发成功"})
+	BroadcastDataRefresh("nodes", nodeID.String())
 }
 
 // DeleteNode 删除节点
@@ -262,6 +272,7 @@ func DeleteNode(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "节点删除成功"})
+	BroadcastDataRefresh("nodes", "")
 }
 
 // GetNodeNetworks 获取节点网卡列表

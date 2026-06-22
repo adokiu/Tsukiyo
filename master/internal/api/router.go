@@ -38,6 +38,11 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	r.GET("/ws/tasks", agentMgr.HandleFrontendWebSocket)
 	// 前端 WebSocket 推送端点（节点心跳等实时数据）
 	r.GET("/ws/nodes", agentMgr.HandleFrontendWebSocket)
+	// 前端 WebSocket 推送端点（实例状态等实时数据）
+	r.GET("/ws/instances", agentMgr.HandleFrontendWebSocket)
+	// 控制台 WebSocket 端点（通过 token 鉴权，Master 代理转发到 Agent）
+	r.GET("/api/v1/console/ssh", agentMgr.HandleConsoleWebSocket)
+	r.GET("/api/v1/console/vnc", agentMgr.HandleVNCWebSocket)
 
 	// 初始化服务层
 	imageService := infra.NewImageService(agentMgr)
@@ -124,6 +129,22 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.POST("/instances/:id/reset-password", handlers.ResetInstancePassword)
 		authGroup.GET("/instances/:id/console", handlers.GetInstanceConsole)
 		authGroup.GET("/instances/:id/metrics", handlers.GetInstanceMetrics)
+		authGroup.GET("/instances/:id/metrics/history", handlers.GetInstanceMetricsHistory)
+
+		// 实例数据盘操作
+		authGroup.POST("/instances/:id/disks", handlers.AddInstanceDisk)
+		authGroup.DELETE("/instances/:id/disks/:disk_id", handlers.DeleteInstanceDisk)
+		authGroup.PUT("/instances/:id/disks/:disk_id", handlers.ResizeInstanceDisk)
+
+		// 实例封禁/解封/续期
+		authGroup.POST("/instances/:id/ban", handlers.BanInstance)
+		authGroup.POST("/instances/:id/unban", handlers.UnbanInstance)
+		authGroup.POST("/instances/:id/renew", handlers.RenewInstance)
+		// 管理员强制修改实例状态
+		authGroup.POST("/instances/:id/status", handlers.SetInstanceStatus)
+
+		// 实例网络配置
+		authGroup.POST("/instances/:id/network", handlers.UpdateInstanceNetwork)
 
 		// 快照
 		authGroup.GET("/instances/:id/snapshots", handlers.ListSnapshots)
@@ -141,6 +162,18 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.GET("/images/source", handlers.GetImageSource)
 		authGroup.PUT("/images/source", handlers.UpdateImageSource)
 		authGroup.POST("/images/refresh", handlers.RefreshImageCache)
+		// 已安装镜像管理（agent上报）
+		authGroup.GET("/images/installed", handlers.ListInstalledImages)
+		authGroup.POST("/images/sync", handlers.SyncNodeImages)
+		// 镜像分类管理
+		authGroup.GET("/images/categories", handlers.ListImageCategories)
+		authGroup.POST("/images/categories", handlers.CreateImageCategory)
+		authGroup.PUT("/images/categories/:id", handlers.UpdateImageCategory)
+		authGroup.DELETE("/images/categories/:id", handlers.DeleteImageCategory)
+		// 镜像别名更新（分类、显示名、install_ssh）
+		authGroup.PUT("/images/alias", handlers.UpdateImageAlias)
+		// 重装系统镜像列表（按分类分组）
+		authGroup.GET("/images/reinstall", handlers.ListReinstallImages)
 
 		// 网桥管理
 		authGroup.GET("/network/bridges", handlers.ListBridges)
@@ -155,6 +188,13 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.GET("/network/eip-pools", handlers.ListEIPPools)
 		authGroup.POST("/network/eip-pools", handlers.CreateEIPPool)
 		authGroup.DELETE("/network/eip-pools/:id", handlers.DeleteEIPPool)
+		authGroup.PUT("/network/eip-pools/:id", handlers.UpdateEIPPool)
+		// 查询节点可用 EIP 数量
+		authGroup.GET("/network/eip-available", handlers.CountAvailableEIP)
+		// 列出池中可用 EIP 地址
+		authGroup.GET("/network/eip-available-list", handlers.ListAvailableEIPs)
+		// 列出 bridge IPv6 CIDR 中可用子段
+		authGroup.GET("/network/bridge-ipv6-available", handlers.ListAvailableIPv6FromBridge)
 
 		// EIP 分配管理
 		authGroup.GET("/network/eip-allocations", handlers.ListEIPAllocations)
@@ -200,6 +240,9 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 
 		// 控制台（前端通过 GetInstanceConsole 获取直连 Agent 的 URL 和 Token）
 		// 不再通过 Master 代理 WebSocket，减少带宽开销
+
+		// 控制台凭据（通过 token 换取实例密码）
+		authGroup.GET("/console/credentials", handlers.GetConsoleCredentials)
 	}
 
 	// 404 处理

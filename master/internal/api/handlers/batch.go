@@ -23,7 +23,8 @@ type BatchCreateRequest struct {
 	AssignToUserID   uint    `json:"assign_to_user_id" binding:"required"`
 	VCPU             float64 `json:"vcpu" binding:"required,min=0.1"`
 	MemoryMB         int     `json:"memory_mb" binding:"required,min=64"`
-	DiskGB           int     `json:"disk_gb" binding:"required,min=1"`
+	SwapMB           int     `json:"swap_mb,omitempty"`
+	DiskMB           int     `json:"disk_mb" binding:"required,min=1"`
 	StoragePool      string  `json:"storage_pool,omitempty"`
 	LoginMethod      string  `json:"login_method,omitempty"`
 	BridgeID         string  `json:"bridge_id,omitempty"`
@@ -32,8 +33,8 @@ type BatchCreateRequest struct {
 	PortMappingCount int     `json:"port_mapping_count,omitempty"`
 	NetworkDown      int     `json:"network_down_mbps,omitempty"`
 	NetworkUp        int     `json:"network_up_mbps,omitempty"`
-	IORead           int     `json:"io_read_mbps,omitempty"`
-	IOWrite          int     `json:"io_write_mbps,omitempty"`
+	IORead           int     `json:"io_read_iops,omitempty"`
+	IOWrite          int     `json:"io_write_iops,omitempty"`
 	MonthlyTraffic   int64   `json:"monthly_traffic_gb,omitempty"`
 	SnapshotLimit    int     `json:"snapshot_limit,omitempty"`
 }
@@ -85,13 +86,14 @@ func BatchCreate(c *gin.Context) {
 			TemplateID:       req.TemplateID,
 			VCPU:             req.VCPU,
 			MemoryMB:         req.MemoryMB,
-			DiskGB:           req.DiskGB,
+			SwapMB:           req.SwapMB,
+			DiskMB:           req.DiskMB,
 			StoragePool:      req.StoragePool,
 			LoginMethod:      models.LoginMethod(req.LoginMethod),
 			NetworkDownMbps:  req.NetworkDown,
 			NetworkUpMbps:    req.NetworkUp,
-			IOReadMBps:       req.IORead,
-			IOWriteMBps:      req.IOWrite,
+			IOReadIops:       req.IORead,
+			IOWriteIops:      req.IOWrite,
 			MonthlyTrafficGB: req.MonthlyTraffic,
 			SnapshotLimit:    req.SnapshotLimit,
 		}
@@ -115,14 +117,15 @@ func BatchCreate(c *gin.Context) {
 			"template_id":        newInstance.TemplateID,
 			"vcpu":               newInstance.VCPU,
 			"memory_mb":          newInstance.MemoryMB,
-			"disk_gb":            newInstance.DiskGB,
+			"swap_mb":            newInstance.SwapMB,
+			"disk_mb":            newInstance.DiskMB,
 			"storage_pool":       newInstance.StoragePool,
 			"login_method":       newInstance.LoginMethod,
 			"ssh_password":       newInstance.SSHPassword,
 			"network_down":       newInstance.NetworkDownMbps,
 			"network_up":         newInstance.NetworkUpMbps,
-			"io_read":            newInstance.IOReadMBps,
-			"io_write":           newInstance.IOWriteMBps,
+			"io_read":            newInstance.IOReadIops,
+			"io_write":           newInstance.IOWriteIops,
 			"bridge_id":          req.BridgeID,
 			"assign_eip_ipv4":    req.AssignEIPv4,
 			"assign_eip_ipv6":    req.AssignEIPv6,

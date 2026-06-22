@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -57,7 +58,73 @@ func ListNodeDisks(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": disks})
+	q := ParseListQuery(c)
+
+	// 搜索
+	filtered := disks
+	if q.Search != "" {
+		search := strings.ToLower(q.Search)
+		filtered = make([]infrastructure.DiskInfo, 0, len(disks))
+		for _, d := range disks {
+			if strings.Contains(strings.ToLower(d.Device), search) ||
+				strings.Contains(strings.ToLower(d.Model), search) ||
+				strings.Contains(strings.ToLower(d.Serial), search) ||
+				strings.Contains(strings.ToLower(d.Type), search) ||
+				strings.Contains(strings.ToLower(d.Filesystem), search) {
+				filtered = append(filtered, d)
+			}
+		}
+	}
+
+	// 筛选
+	if v, ok := q.Filters["type"]; ok && v != "" {
+		tmp := make([]infrastructure.DiskInfo, 0, len(filtered))
+		for _, d := range filtered {
+			if d.Type == v {
+				tmp = append(tmp, d)
+			}
+		}
+		filtered = tmp
+	}
+	if v, ok := q.Filters["is_mounted"]; ok && v != "" {
+		want := v == "true"
+		tmp := make([]infrastructure.DiskInfo, 0, len(filtered))
+		for _, d := range filtered {
+			if d.IsMounted == want {
+				tmp = append(tmp, d)
+			}
+		}
+		filtered = tmp
+	}
+	if v, ok := q.Filters["is_system"]; ok && v != "" {
+		want := v == "true"
+		tmp := make([]infrastructure.DiskInfo, 0, len(filtered))
+		for _, d := range filtered {
+			if d.IsSystem == want {
+				tmp = append(tmp, d)
+			}
+		}
+		filtered = tmp
+	}
+
+	total := len(filtered)
+	offset := (q.Page - 1) * q.PerPage
+	if offset >= total {
+		filtered = []infrastructure.DiskInfo{}
+	} else {
+		end := offset + q.PerPage
+		if end > total {
+			end = total
+		}
+		filtered = filtered[offset:end]
+	}
+
+	c.JSON(http.StatusOK, ListResponse{
+		Data:    filtered,
+		Total:   int64(total),
+		Page:    q.Page,
+		PerPage: q.PerPage,
+	})
 }
 
 // FormatNodeDisk 格式化节点磁盘
@@ -95,6 +162,7 @@ func FormatNodeDisk(c *gin.Context) {
 		"device":  req.Device,
 		"type":    req.Type,
 	})
+	BroadcastDataRefresh("disks", nodeID.String())
 }
 
 // ListNodeStorages 获取节点存储池列表
@@ -119,7 +187,52 @@ func ListNodeStorages(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": storages})
+	q := ParseListQuery(c)
+
+	// 搜索
+	filtered := storages
+	if q.Search != "" {
+		search := strings.ToLower(q.Search)
+		tmp := make([]infrastructure.StoragePoolInfo, 0, len(filtered))
+		for _, s := range filtered {
+			if strings.Contains(strings.ToLower(s.Name), search) ||
+				strings.Contains(strings.ToLower(s.Driver), search) ||
+				strings.Contains(strings.ToLower(s.Source), search) {
+				tmp = append(tmp, s)
+			}
+		}
+		filtered = tmp
+	}
+
+	// 筛选
+	if v, ok := q.Filters["driver"]; ok && v != "" {
+		tmp := make([]infrastructure.StoragePoolInfo, 0, len(filtered))
+		for _, s := range filtered {
+			if s.Driver == v {
+				tmp = append(tmp, s)
+			}
+		}
+		filtered = tmp
+	}
+
+	total := len(filtered)
+	offset := (q.Page - 1) * q.PerPage
+	if offset >= total {
+		filtered = []infrastructure.StoragePoolInfo{}
+	} else {
+		end := offset + q.PerPage
+		if end > total {
+			end = total
+		}
+		filtered = filtered[offset:end]
+	}
+
+	c.JSON(http.StatusOK, ListResponse{
+		Data:    filtered,
+		Total:   int64(total),
+		Page:    q.Page,
+		PerPage: q.PerPage,
+	})
 }
 
 // InitNodeStorage 初始化节点存储池
@@ -155,6 +268,7 @@ func InitNodeStorage(c *gin.Context) {
 		"message": "存储池初始化任务已创建",
 		"task_id": task.ID.String(),
 	})
+	BroadcastDataRefresh("storages", nodeID.String())
 }
 
 // DeleteNodeStorage 删除节点存储池
@@ -191,6 +305,7 @@ func DeleteNodeStorage(c *gin.Context) {
 		"task_id": task.ID.String(),
 		"name":    poolName,
 	})
+	BroadcastDataRefresh("storages", nodeID.String())
 }
 
 // ListNodeVolumes 获取存储池 Volume 列表
@@ -282,6 +397,7 @@ func CreatePartition(c *gin.Context) {
 		"device":  req.Device,
 		"size_gb": req.SizeGB,
 	})
+	BroadcastDataRefresh("disks", nodeID.String())
 }
 
 // DeletePartition 删除磁盘分区
@@ -319,4 +435,5 @@ func DeletePartition(c *gin.Context) {
 		"task_id": task.ID.String(),
 		"device":  device,
 	})
+	BroadcastDataRefresh("disks", nodeID.String())
 }

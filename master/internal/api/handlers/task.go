@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -20,18 +19,7 @@ func InitTaskService(svc *instance.TaskService) {
 
 // ListTasks 获取任务列表
 func ListTasks(c *gin.Context) {
-	page := 1
-	perPage := 20
-	if p := c.Query("page"); p != "" {
-		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
-			page = parsed
-		}
-	}
-	if pp := c.Query("per_page"); pp != "" {
-		if parsed, err := strconv.Atoi(pp); err == nil && parsed > 0 && parsed <= 100 {
-			perPage = parsed
-		}
-	}
+	q := ParseListQuery(c)
 
 	status := c.Query("status")
 	nodeIDStr := c.Query("node_id")
@@ -43,10 +31,12 @@ func ListTasks(c *gin.Context) {
 	}
 
 	tasks, total, err := taskService.ListTasks(instance.ListTasksRequest{
-		Page:    page,
-		PerPage: perPage,
+		Page:    q.Page,
+		PerPage: q.PerPage,
+		Search:  q.Search,
 		Status:  status,
 		NodeID:  nodeID,
+		Filters: q.Filters,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败"})
@@ -81,11 +71,11 @@ func ListTasks(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"data":     result,
-		"total":    total,
-		"page":     page,
-		"per_page": perPage,
+	c.JSON(http.StatusOK, ListResponse{
+		Data:    result,
+		Total:   total,
+		Page:    q.Page,
+		PerPage: q.PerPage,
 	})
 }
 
