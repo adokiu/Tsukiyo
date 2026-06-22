@@ -29,7 +29,7 @@ type Bridge struct {
 	IPv6Gateway     string          `gorm:"type:varchar(64);not null;default:''" json:"ipv6_gateway"`
 	DNSServers      json.RawMessage `gorm:"type:jsonb;not null;default:'[]'" json:"dns_servers"`
 	NATEgressIPv4ID *uuid.UUID      `gorm:"type:uuid;index" json:"nat_egress_ipv4_id,omitempty"`
-	NATEgressIPv6ID *uuid.UUID      `gorm:"type:uuid;index" json:"nat_egress_ipv6_id,omitempty"`
+	IPv6EIPPoolID   *uuid.UUID      `gorm:"type:uuid;index" json:"ipv6_eip_pool_id,omitempty"`
 	PortRangeStart  int             `gorm:"type:int;not null;default:20000" json:"port_range_start"`
 	PortRangeEnd    int             `gorm:"type:int;not null;default:65535" json:"port_range_end"`
 	Status          BridgeStatus    `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
@@ -39,7 +39,12 @@ type Bridge struct {
 	// 关联
 	Node          Node           `gorm:"foreignKey:NodeID" json:"node,omitempty"`
 	NATEgressIPv4 *EIPAllocation `gorm:"foreignKey:NATEgressIPv4ID" json:"nat_egress_ipv4,omitempty"`
-	NATEgressIPv6 *EIPAllocation `gorm:"foreignKey:NATEgressIPv6ID" json:"nat_egress_ipv6,omitempty"`
+
+	// 计算字段（非数据库列，由后端查询填充）
+	NATEgressIPv4Addr string `gorm:"-" json:"nat_egress_ipv4_addr"`
+	PortUsed          int    `gorm:"-" json:"port_used"`
+	PortTotal         int    `gorm:"-" json:"port_total"`
+	InstanceCount     int    `gorm:"-" json:"instance_count"`
 }
 
 func (Bridge) TableName() string {

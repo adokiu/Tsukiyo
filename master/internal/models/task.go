@@ -32,6 +32,10 @@ const (
 	TaskTypeCreateSnapshot      TaskType = "create_snapshot"
 	TaskTypeRestoreSnapshot     TaskType = "restore_snapshot"
 	TaskTypeDeleteSnapshot      TaskType = "delete_snapshot"
+	TaskTypeResetPassword       TaskType = "reset_password"
+	TaskTypeAddDisk             TaskType = "add_disk"
+	TaskTypeDeleteDisk          TaskType = "delete_disk"
+	TaskTypeResizeDisk          TaskType = "resize_disk"
 	TaskTypeDownloadImage       TaskType = "download_image"
 	TaskTypeDeleteImage         TaskType = "delete_image"
 	TaskTypeCancelImageDownload TaskType = "cancel_image_download"
@@ -44,6 +48,8 @@ const (
 	TaskTypeMigrateInstance     TaskType = "migrate_instance"
 	TaskTypeBridgeNetwork       TaskType = "bridge_network"
 	TaskTypeDeleteStorage       TaskType = "delete_storage"
+	TaskTypeLimitNetwork        TaskType = "limit_network"
+	TaskTypeLimitIOPS           TaskType = "limit_iops"
 )
 
 // Task 任务队列表

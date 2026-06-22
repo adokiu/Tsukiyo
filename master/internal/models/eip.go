@@ -24,18 +24,23 @@ const (
 
 // EIPPool EIP 资源池
 type EIPPool struct {
-	ID        uuid.UUID     `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	NodeID    uuid.UUID     `gorm:"type:uuid;not null;index" json:"node_id"`
-	IPVersion string        `gorm:"type:varchar(8);not null" json:"ip_version"`
-	CIDR      string        `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
-	Interface string        `gorm:"type:varchar(32);not null;default:''" json:"interface"`
-	Gateway   string        `gorm:"type:varchar(64);not null;default:''" json:"gateway"`
-	PrefixLen int           `gorm:"type:int;not null" json:"prefix_len"`
-	Alias     string        `gorm:"type:varchar(128);not null;default:''" json:"alias"`
-	PoolType  EIPPoolType   `gorm:"type:varchar(8);not null;default:'eip'" json:"pool_type"`
-	Status    EIPPoolStatus `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
-	CreatedAt time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
-	UpdatedAt time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
+	ID            uuid.UUID     `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	NodeID        uuid.UUID     `gorm:"type:uuid;not null;index" json:"node_id"`
+	IPVersion     string        `gorm:"type:varchar(8);not null" json:"ip_version"`
+	CIDR          string        `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
+	Interface     string        `gorm:"type:varchar(32);not null;default:''" json:"interface"`
+	Gateway       string        `gorm:"type:varchar(64);not null;default:''" json:"gateway"`
+	PrefixLen     int           `gorm:"type:int;not null" json:"prefix_len"`
+	NetmaskPrefix int           `gorm:"column:netmask_prefix;type:int;not null;default:0" json:"netmask_prefix"`
+	Alias         string        `gorm:"type:varchar(128);not null;default:''" json:"alias"`
+	PoolType      EIPPoolType   `gorm:"type:varchar(8);not null;default:'eip'" json:"pool_type"`
+	Status        EIPPoolStatus `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
+	CreatedAt     time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
+	UpdatedAt     time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
+
+	// 非持久化字段：使用统计
+	UsedCount int64 `gorm:"-" json:"used_count"`
+	TotalIPs  int64 `gorm:"-" json:"total_ips"`
 
 	// 关联
 	Node        Node            `gorm:"foreignKey:NodeID" json:"node,omitempty"`
@@ -50,8 +55,9 @@ func (EIPPool) TableName() string {
 type EIPAllocationUsage string
 
 const (
-	EIPUsageBridgeNATEgress EIPAllocationUsage = "bridge_nat_egress"
-	EIPUsageInstanceEIP     EIPAllocationUsage = "instance_eip"
+	EIPUsageBridgeNATEgress  EIPAllocationUsage = "bridge_nat_egress"
+	EIPUsageInstanceEIP      EIPAllocationUsage = "instance_eip"
+	EIPUsageBridgeIPv6Subnet EIPAllocationUsage = "bridge_ipv6_subnet"
 )
 
 // EIPAllocationStatus 分配状态
@@ -64,18 +70,20 @@ const (
 
 // EIPAllocation EIP 分配记录
 type EIPAllocation struct {
-	ID          uuid.UUID           `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	PoolID      uuid.UUID           `gorm:"type:uuid;not null;index" json:"pool_id"`
-	NodeID      uuid.UUID           `gorm:"type:uuid;not null;index" json:"node_id"`
-	CIDR        string              `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
-	PrefixLen   int                 `gorm:"type:int;not null" json:"prefix_len"`
-	IPVersion   string              `gorm:"type:varchar(8);not null" json:"ip_version"`
-	Usage       EIPAllocationUsage  `gorm:"type:varchar(20);not null" json:"usage"`
-	BridgeID    *uuid.UUID          `gorm:"type:uuid;index" json:"bridge_id,omitempty"`
-	InstanceID  *uuid.UUID          `gorm:"type:uuid;index" json:"instance_id,omitempty"`
-	Status      EIPAllocationStatus `gorm:"type:varchar(16);not null;default:'assigned'" json:"status"`
-	AllocatedAt time.Time           `gorm:"type:timestamptz;not null;default:now()" json:"allocated_at"`
-	ReleasedAt  *time.Time          `gorm:"type:timestamptz" json:"released_at,omitempty"`
+	ID               uuid.UUID           `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	PoolID           uuid.UUID           `gorm:"type:uuid;not null;index" json:"pool_id"`
+	NodeID           uuid.UUID           `gorm:"type:uuid;not null;index" json:"node_id"`
+	CIDR             string              `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
+	PrefixLen        int                 `gorm:"type:int;not null" json:"prefix_len"`
+	IPVersion        string              `gorm:"type:varchar(8);not null" json:"ip_version"`
+	Alias            string              `gorm:"type:varchar(64);not null;default:''" json:"alias"`
+	Usage            EIPAllocationUsage  `gorm:"type:varchar(20);not null" json:"usage"`
+	BridgeID         *uuid.UUID          `gorm:"type:uuid;index" json:"bridge_id,omitempty"`
+	InstanceID       *uuid.UUID          `gorm:"type:uuid;index" json:"instance_id,omitempty"`
+	MappedInternalIP string              `gorm:"column:mapped_internal_ip;type:varchar(64);default:''" json:"mapped_internal_ip,omitempty"`
+	Status           EIPAllocationStatus `gorm:"type:varchar(16);not null;default:'assigned'" json:"status"`
+	AllocatedAt      time.Time           `gorm:"type:timestamptz;not null;default:now()" json:"allocated_at"`
+	ReleasedAt       *time.Time          `gorm:"type:timestamptz" json:"released_at,omitempty"`
 
 	// 关联
 	Pool     EIPPool   `gorm:"foreignKey:PoolID" json:"pool,omitempty"`
