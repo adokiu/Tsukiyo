@@ -50,8 +50,13 @@ func RunMigrations(cfg *config.DatabaseConfig) error {
 	zap.L().Info("当前数据库迁移版本", zap.Uint("version", version), zap.Bool("dirty", dirty))
 
 	if dirty {
-		zap.L().Warn("数据库迁移状态为 dirty，尝试强制修复", zap.Uint("version", version))
-		if err := m.Force(int(version)); err != nil {
+		// force 到 version-1，这样 m.Up() 会重新执行失败的迁移
+		forceVersion := int(version) - 1
+		if forceVersion < 0 {
+			forceVersion = 0
+		}
+		zap.L().Warn("数据库迁移状态为 dirty，尝试强制修复", zap.Uint("version", version), zap.Int("force_to", forceVersion))
+		if err := m.Force(forceVersion); err != nil {
 			return fmt.Errorf("修复 dirty 状态失败: %w", err)
 		}
 	}

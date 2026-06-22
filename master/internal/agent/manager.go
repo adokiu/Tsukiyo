@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -13,9 +15,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"tsukiyo/master/internal/console"
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/geoip"
 	"tsukiyo/master/internal/models"
@@ -24,6 +28,15 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  8192,
 	WriteBufferSize: 8192,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+var vncUpgrader = websocket.Upgrader{
+	ReadBufferSize:  8192,
+	WriteBufferSize: 8192,
+	Subprotocols:    []string{"binary"},
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -73,6 +86,8 @@ type Manager struct {
 	imageMu         sync.RWMutex
 	frontendConns   []*FrontendConn
 	frontendMu      sync.RWMutex
+	consoleSessions map[string]*websocket.Conn // sessionID -> 前端 WS 连接
+	consoleMu       sync.RWMutex
 }
 
 // Connection Agent 连接
@@ -176,14 +191,20 @@ type MetricsPayload struct {
 
 // InstanceMetric 单个实例监控指标
 type InstanceMetric struct {
-	InstanceID string  `json:"instance_id"`
-	CPUPercent float64 `json:"cpu_percent"`
-	MemUsed    int64   `json:"mem_used"`
-	MemTotal   int64   `json:"mem_total"`
-	DiskRead   int64   `json:"disk_read"`
-	DiskWrite  int64   `json:"disk_write"`
-	NetIn      int64   `json:"net_in"`
-	NetOut     int64   `json:"net_out"`
+	InstanceID    string  `json:"instance_id"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	MemUsed       int64   `json:"mem_used"`
+	MemTotal      int64   `json:"mem_total"`
+	DiskUsed      int64   `json:"disk_used"`
+	DiskTotal     int64   `json:"disk_total"`
+	DiskReadBps   int64   `json:"disk_read_bps"`
+	DiskWriteBps  int64   `json:"disk_write_bps"`
+	DiskReadIops  int64   `json:"disk_read_iops"`
+	DiskWriteIops int64   `json:"disk_write_iops"`
+	NetIn         int64   `json:"net_in"`
+	NetOut        int64   `json:"net_out"`
+	NetInTotal    int64   `json:"net_in_total"`
+	NetOutTotal   int64   `json:"net_out_total"`
 }
 
 // NewManager 创建 Agent 管理器
@@ -195,6 +216,7 @@ func NewManager() *Manager {
 		pendingRequests: make(map[string]chan agentResponse),
 		imageProgress:   make(map[uuid.UUID]map[string]*NodeImageStatus),
 		frontendConns:   make([]*FrontendConn, 0),
+		consoleSessions: make(map[string]*websocket.Conn),
 	}
 }
 
@@ -242,6 +264,31 @@ func (m *Manager) BroadcastInstanceProgress(nodeID uuid.UUID, payload InstancePr
 	for _, fc := range m.frontendConns {
 		select {
 		case fc.SendCh <- data:
+			alive = append(alive, fc)
+		default:
+			zap.L().Warn("发送缓冲区满，丢弃连接")
+		}
+	}
+	m.frontendConns = alive
+}
+
+// BroadcastInstanceMetrics 向前端广播实例实时监控指标
+func (m *Manager) BroadcastInstanceMetrics(instanceID uuid.UUID, data map[string]interface{}) {
+	msg, err := json.Marshal(map[string]interface{}{
+		"type":        "instance_metrics",
+		"instance_id": instanceID.String(),
+		"data":        data,
+	})
+	if err != nil {
+		return
+	}
+
+	m.frontendMu.Lock()
+	defer m.frontendMu.Unlock()
+	alive := make([]*FrontendConn, 0, len(m.frontendConns))
+	for _, fc := range m.frontendConns {
+		select {
+		case fc.SendCh <- msg:
 			alive = append(alive, fc)
 		default:
 			zap.L().Warn("发送缓冲区满，丢弃连接")
@@ -502,6 +549,315 @@ func (m *Manager) handleVerifyConsoleToken(c *Connection, msgID string, payload 
 	m.sendResponseToAgent(c, msgID, map[string]interface{}{"valid": valid})
 }
 
+// handleConsoleData 处理 Agent 发来的控制台数据，转发到前端 WS
+func (m *Manager) handleConsoleData(msgType string, payload json.RawMessage) {
+	var msg struct {
+		SessionID string `json:"session_id"`
+		Stream    string `json:"stream"`
+		Data      string `json:"data"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		zap.L().Warn("解析控制台数据失败", zap.Error(err))
+		return
+	}
+
+	m.consoleMu.RLock()
+	conn, ok := m.consoleSessions[msg.SessionID]
+	m.consoleMu.RUnlock()
+	if !ok || conn == nil {
+		return
+	}
+
+	// 转发到前端 WS
+	var wsMsg []byte
+	if msgType == "console_error" {
+		wsMsg, _ = json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"message": msg.Error,
+		})
+	} else if msg.Stream == "exit" {
+		wsMsg, _ = json.Marshal(map[string]interface{}{
+			"type": "exit",
+		})
+	} else {
+		wsMsg, _ = json.Marshal(map[string]interface{}{
+			"type":   "data",
+			"stream": msg.Stream,
+			"data":   msg.Data,
+		})
+	}
+	conn.WriteMessage(websocket.TextMessage, wsMsg)
+}
+
+// handleVNCData 处理 Agent 发来的 VNC 数据，转发到前端 WS
+func (m *Manager) handleVNCData(msgType string, payload json.RawMessage) {
+	var msg struct {
+		SessionID string `json:"session_id"`
+		Data      string `json:"data"`
+		Error     string `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		zap.L().Warn("解析 VNC 数据失败", zap.Error(err))
+		return
+	}
+
+	m.consoleMu.RLock()
+	conn, ok := m.consoleSessions[msg.SessionID]
+	m.consoleMu.RUnlock()
+	if !ok || conn == nil {
+		zap.L().Warn("VNC 数据找不到前端 session", zap.String("session_id", msg.SessionID))
+		return
+	}
+
+	if msgType == "console_vnc_error" {
+		wsMsg, _ := json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"message": msg.Error,
+		})
+		conn.WriteMessage(websocket.TextMessage, wsMsg)
+		return
+	}
+
+	// VNC 数据是 base64 编码的二进制数据，解码后以二进制 WS 消息发送给前端
+	decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		zap.L().Warn("VNC 数据 base64 解码失败", zap.String("session_id", msg.SessionID), zap.Error(err))
+		return
+	}
+	if err := conn.WriteMessage(websocket.BinaryMessage, decoded); err != nil {
+		zap.L().Warn("写入前端 VNC WebSocket 失败", zap.String("session_id", msg.SessionID), zap.Error(err))
+	}
+}
+
+// HandleVNCWebSocket 处理前端 VNC WebSocket 连接
+func (m *Manager) HandleVNCWebSocket(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
+		return
+	}
+
+	// 验证 token（不消费删除）。
+	// SPICE 协议会为 main、display、cursor、inputs 等每个通道各发起一条
+	// WebSocket 连接到同一个 URI（同一个 token），因此 token 必须在其 TTL 内
+	// 支持多次连接，否则除 main 外的通道会全部 401，导致画面纯黑。
+	// 安全性由 5 分钟 TTL + 每次打开控制台生成新 token 保证。
+	session, err := console.ValidateConsoleToken(token)
+	if err != nil {
+		zap.L().Warn("VNC token 验证失败", zap.String("token", token), zap.Error(err))
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "token 无效或已过期"})
+		return
+	}
+
+	// 升级为 WebSocket（支持 binary 子协议）
+	conn, err := vncUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		zap.L().Error("VNC WebSocket 升级失败", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	nodeID, err := uuid.Parse(session.NodeID)
+	if err != nil {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"无效的节点ID"}`))
+		return
+	}
+
+	// 检查 Agent 是否在线
+	m.mu.RLock()
+	agentConn, exists := m.connections[nodeID]
+	m.mu.RUnlock()
+	if !exists {
+		zap.L().Warn("VNC 请求节点离线", zap.String("node_id", nodeID.String()))
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"节点离线"}`))
+		return
+	}
+
+	sessionID := uuid.New().String()
+
+	// 注册前端 WS 连接
+	m.consoleMu.Lock()
+	m.consoleSessions[sessionID] = conn
+	m.consoleMu.Unlock()
+	defer func() {
+		m.consoleMu.Lock()
+		delete(m.consoleSessions, sessionID)
+		m.consoleMu.Unlock()
+	}()
+
+	// 向 Agent 发送 console_vnc_start
+	if err := agentConn.Send(struct {
+		Type    string      `json:"type"`
+		Payload interface{} `json:"payload"`
+	}{
+		Type: "console_vnc_start",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+			"container":  session.IncusName,
+		},
+	}); err != nil {
+		zap.L().Error("发送 console_vnc_start 到 Agent 失败", zap.String("session_id", sessionID), zap.Error(err))
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"发送 VNC 请求失败"}`))
+		return
+	}
+
+	// 读取前端输入（SPICE 协议数据），base64 编码后转发到 Agent
+	for {
+		msgType, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		if msgType == websocket.BinaryMessage || msgType == websocket.TextMessage {
+			encoded := base64.StdEncoding.EncodeToString(msgBytes)
+			agentConn.Send(struct {
+				Type    string      `json:"type"`
+				Payload interface{} `json:"payload"`
+			}{
+				Type: "console_vnc_input",
+				Payload: map[string]interface{}{
+					"session_id": sessionID,
+					"data":       encoded,
+				},
+			})
+		}
+	}
+
+	// 前端断开，通知 Agent 关闭 VNC 会话
+	agentConn.Send(struct {
+		Type    string      `json:"type"`
+		Payload interface{} `json:"payload"`
+	}{
+		Type: "console_vnc_close",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+		},
+	})
+}
+
+// HandleConsoleWebSocket 处理前端控制台 WebSocket 连接
+func (m *Manager) HandleConsoleWebSocket(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
+		return
+	}
+
+	// 验证并消费 token（一次性，30秒有效）
+	session, err := console.ConsumeConsoleToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "token 无效或已过期"})
+		return
+	}
+
+	// 升级为 WebSocket
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		zap.L().Error("控制台 WebSocket 升级失败", zap.Error(err))
+		return
+	}
+	defer conn.Close()
+
+	nodeID, err := uuid.Parse(session.NodeID)
+	if err != nil {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"无效的节点ID"}`))
+		return
+	}
+
+	// 检查 Agent 是否在线
+	m.mu.RLock()
+	agentConn, exists := m.connections[nodeID]
+	m.mu.RUnlock()
+	if !exists {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"节点离线"}`))
+		return
+	}
+
+	sessionID := uuid.New().String()
+
+	// 注册前端 WS 连接
+	m.consoleMu.Lock()
+	m.consoleSessions[sessionID] = conn
+	m.consoleMu.Unlock()
+	defer func() {
+		m.consoleMu.Lock()
+		delete(m.consoleSessions, sessionID)
+		m.consoleMu.Unlock()
+	}()
+
+	// 向 Agent 发送 console_ssh_start
+	if err := agentConn.Send(struct {
+		Type    string      `json:"type"`
+		Payload interface{} `json:"payload"`
+	}{
+		Type: "console_ssh_start",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+			"container":  session.IncusName,
+		},
+	}); err != nil {
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"发送控制台请求失败"}`))
+		return
+	}
+
+	// 读取前端输入，转发到 Agent
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		var input struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+			Cols int    `json:"cols"`
+			Rows int    `json:"rows"`
+		}
+		if err := json.Unmarshal(msgBytes, &input); err != nil {
+			// 直接当作原始输入
+			input.Type = "input"
+			input.Data = string(msgBytes)
+		}
+
+		if input.Type == "input" {
+			agentConn.Send(struct {
+				Type    string      `json:"type"`
+				Payload interface{} `json:"payload"`
+			}{
+				Type: "console_ssh_input",
+				Payload: map[string]interface{}{
+					"session_id": sessionID,
+					"data":       input.Data,
+				},
+			})
+		} else if input.Type == "resize" {
+			agentConn.Send(struct {
+				Type    string      `json:"type"`
+				Payload interface{} `json:"payload"`
+			}{
+				Type: "console_ssh_resize",
+				Payload: map[string]interface{}{
+					"session_id": sessionID,
+					"cols":       input.Cols,
+					"rows":       input.Rows,
+				},
+			})
+		}
+	}
+
+	// 前端断开，通知 Agent 关闭会话
+	agentConn.Send(struct {
+		Type    string      `json:"type"`
+		Payload interface{} `json:"payload"`
+	}{
+		Type: "console_ssh_close",
+		Payload: map[string]interface{}{
+			"session_id": sessionID,
+		},
+	})
+}
+
 // sendResponseToAgent 向 Agent 连接发送 response 消息
 func (m *Manager) sendResponseToAgent(c *Connection, msgID string, data interface{}) {
 	respPayload, _ := json.Marshal(data)
@@ -691,7 +1047,6 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 					"port_range_end":   b.PortRangeEnd,
 					"status":           string(b.Status),
 					"nat_egress_ipv4":  getEIPAllocCIDR(b.NATEgressIPv4ID),
-					"nat_egress_ipv6":  getEIPAllocCIDR(b.NATEgressIPv6ID),
 				})
 			}
 			cfg["bridges"] = bridgeConfigs
@@ -741,6 +1096,45 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 			}
 			cfg["port_mappings"] = pmConfigs
 			zap.L().Info("下发端口映射到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(pmConfigs)))
+		}
+
+		// 查询该节点所有已分配的实例 EIP 并下发（Agent 重启后重建 nftables 规则）
+		var eipAllocs []models.EIPAllocation
+		if err := db.DB.Where("node_id = ? AND status = ? AND usage = ?",
+			nodeID, models.EIPAllocationAssigned, models.EIPUsageInstanceEIP).Find(&eipAllocs).Error; err == nil && len(eipAllocs) > 0 {
+			eipConfigs := make([]map[string]interface{}, 0, len(eipAllocs))
+			for _, alloc := range eipAllocs {
+				var instance models.Instance
+				var bridge models.Bridge
+				var pool models.EIPPool
+				db.DB.Where("id = ?", alloc.InstanceID).First(&instance)
+				if instance.BridgeID != nil {
+					db.DB.Where("id = ?", *instance.BridgeID).First(&bridge)
+				}
+				db.DB.Where("id = ?", alloc.PoolID).First(&pool)
+
+				internalIP := instance.InternalIPv4
+				if alloc.IPVersion == "ipv6" {
+					internalIP = instance.InternalIPv6
+				}
+
+				eipConfigs = append(eipConfigs, map[string]interface{}{
+					"instance_name":      instance.IncusName,
+					"instance_ip":        internalIP,
+					"eip_cidr":           alloc.CIDR,
+					"interface":          pool.Interface,
+					"ip_version":         alloc.IPVersion,
+					"bridge_name":        bridge.BridgeName,
+					"mapped_internal_ip": alloc.MappedInternalIP,
+					"ipv4_cidr":          bridge.IPv4CIDR,
+					"ipv6_cidr":          bridge.IPv6CIDR,
+					"ipv4_gateway":       bridge.IPv4Gateway,
+					"ipv6_gateway":       bridge.IPv6Gateway,
+					"eip_gateway":        pool.Gateway,
+				})
+			}
+			cfg["eip_allocations"] = eipConfigs
+			zap.L().Info("下发 EIP 分配信息到 Agent", zap.String("node_id", nodeID.String()), zap.Int("count", len(eipConfigs)))
 		}
 
 		if err := m.SendConfig(nodeID, cfg); err != nil {
@@ -826,6 +1220,10 @@ func (c *Connection) readPump(m *Manager) {
 			m.handleSecurityAlert(c.NodeID, msg.Payload)
 		case "verify_console_token":
 			m.handleVerifyConsoleToken(c, msg.ID, msg.Payload)
+		case "console_data", "console_error":
+			m.handleConsoleData(msg.Type, msg.Payload)
+		case "console_vnc_data", "console_vnc_error":
+			m.handleVNCData(msg.Type, msg.Payload)
 		default:
 			zap.L().Debug("收到未处理的 Agent 消息", zap.String("type", msg.Type), zap.String("node_id", c.NodeID.String()))
 		}
@@ -878,6 +1276,25 @@ func (c *Connection) Close() {
 		c.Conn.Close()
 	}
 	c.mu.Unlock()
+}
+
+// CloseAll 关闭所有 Agent 和前端 WebSocket 连接
+func (m *Manager) CloseAll() {
+	m.mu.Lock()
+	for _, conn := range m.connections {
+		conn.Close()
+	}
+	m.connections = make(map[uuid.UUID]*Connection)
+	m.mu.Unlock()
+
+	m.frontendMu.Lock()
+	for _, fc := range m.frontendConns {
+		if fc.Conn != nil {
+			fc.Conn.Close()
+		}
+	}
+	m.frontendConns = nil
+	m.frontendMu.Unlock()
 }
 
 // Send 发送消息给 Agent
@@ -935,6 +1352,102 @@ func (m *Manager) removeConnection(nodeID uuid.UUID) {
 	db.RedisClient.Del(ctx, nodeKey)
 
 	zap.L().Info("Agent 断开连接", zap.String("node_id", nodeID.String()))
+
+	// 处理该节点上运行中的任务：标记为失败
+	now := time.Now()
+	var runningTasks []models.Task
+	db.DB.Where("node_id = ? AND status = ?", nodeID, models.TaskStatusRunning).Find(&runningTasks)
+	for _, task := range runningTasks {
+		errMsg := "Agent 断开连接，任务中断"
+		updates := map[string]interface{}{
+			"status":       models.TaskStatusFailed,
+			"error":        errMsg,
+			"completed_at": &now,
+		}
+		db.DB.Model(&task).Updates(updates)
+
+		// 广播任务失败状态到前端
+		m.broadcastTaskStatus(task.ID, task.Type, nodeID, models.TaskStatusFailed, errMsg)
+
+		// 处理实例状态恢复
+		if task.InstanceID != nil {
+			var inst models.Instance
+			if err := db.DB.Where("id = ?", *task.InstanceID).First(&inst).Error; err == nil {
+				if inst.IsBusy() {
+					switch task.Type {
+					case models.TaskTypeCreateInstance:
+						db.DB.Model(&inst).Update("status", models.InstanceStatusError)
+					case models.TaskTypeDeleteInstance:
+						// 删除中断，恢复到之前的状态（从 payload 读取 old_status）
+						oldStatus := models.InstanceStatusError
+						var payload struct {
+							OldStatus string `json:"old_status"`
+						}
+						if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+							oldStatus = models.InstanceStatus(payload.OldStatus)
+						}
+						db.DB.Model(&inst).Update("status", oldStatus)
+					case models.TaskTypeStartInstance:
+						db.DB.Model(&inst).Update("status", models.InstanceStatusStopped)
+					case models.TaskTypeStopInstance:
+						db.DB.Model(&inst).Update("status", models.InstanceStatusRunning)
+					case models.TaskTypeRestartInstance:
+						db.DB.Model(&inst).Update("status", models.InstanceStatusRunning)
+					case models.TaskTypeReinstallInstance:
+						oldStatus := models.InstanceStatusError
+						var payload struct {
+							OldStatus string `json:"old_status"`
+						}
+						if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+							oldStatus = models.InstanceStatus(payload.OldStatus)
+						}
+						db.DB.Model(&inst).Update("status", oldStatus)
+					case models.TaskTypeResizeInstance:
+						oldStatus := models.InstanceStatusError
+						var payload struct {
+							OldStatus string `json:"old_status"`
+						}
+						if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+							oldStatus = models.InstanceStatus(payload.OldStatus)
+						}
+						db.DB.Model(&inst).Update("status", oldStatus)
+					case models.TaskTypeResizeDisk, models.TaskTypeLimitNetwork, models.TaskTypeLimitIOPS:
+						oldStatus := models.InstanceStatusError
+						var payload struct {
+							OldStatus string `json:"old_status"`
+						}
+						if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+							oldStatus = models.InstanceStatus(payload.OldStatus)
+						}
+						db.DB.Model(&inst).Update("status", oldStatus)
+					default:
+						db.DB.Model(&inst).Update("status", models.InstanceStatusError)
+					}
+					zap.L().Warn("Agent 断开，实例状态恢复",
+						zap.String("instance_id", inst.ID.String()),
+						zap.String("task_type", string(task.Type)))
+				}
+			}
+		}
+	}
+
+	// 将该节点上所有非中间状态的实例标记为 offline
+	// busy 状态的实例已经在上面通过任务恢复处理了
+	var instances []models.Instance
+	db.DB.Where("node_id = ? AND status NOT IN ?",
+		nodeID, []models.InstanceStatus{
+			models.InstanceStatusCreating, models.InstanceStatusStarting,
+			models.InstanceStatusStopping, models.InstanceStatusRestarting,
+			models.InstanceStatusReinstalling, models.InstanceStatusResizing,
+			models.InstanceStatusDeleting, models.InstanceStatusOffline,
+			models.InstanceStatusMissing, models.InstanceStatusBanned, models.InstanceStatusExpired,
+		}).Find(&instances)
+	for _, inst := range instances {
+		db.DB.Model(&inst).Update("status", models.InstanceStatusOffline)
+		zap.L().Info("Agent 离线，实例标记为 offline",
+			zap.String("instance_id", inst.ID.String()),
+			zap.String("incus_name", inst.IncusName))
+	}
 
 	// 广播节点离线到前端
 	m.broadcastNodeOffline(nodeID)
@@ -1100,37 +1613,78 @@ func (m *Manager) broadcastNodeOffline(nodeID uuid.UUID) {
 	}
 }
 
-// handleInstanceStatus 处理实例状态上报
+// handleInstanceStatus 处理实例状态上报（批量）
 func (m *Manager) handleInstanceStatus(nodeID uuid.UUID, payload json.RawMessage) {
-	var status InstanceStatusPayload
-	if err := json.Unmarshal(payload, &status); err != nil {
+	var msg struct {
+		Instances []InstanceStatusPayload `json:"instances"`
+	}
+	if err := json.Unmarshal(payload, &msg); err != nil {
 		return
 	}
 
-	// Agent 上报的 instance_id 是 incus_name（如 tsukiyo-xxx），不是 UUID
-	var instance models.Instance
-	if err := db.DB.Where("incus_name = ? AND node_id = ?", status.InstanceID, nodeID).First(&instance).Error; err != nil {
-		return
-	}
-
-	// 映射 Incus 状态到系统状态
-	mappedStatus := mapIncusStatus(status.Status)
-	updates := map[string]interface{}{
-		"status": mappedStatus,
-	}
-	if status.IPv4 != "" {
-		updates["ipv4_address"] = status.IPv4
-	}
-	if status.IPv6 != "" {
-		updates["ipv6_address"] = status.IPv6
-	}
-
-	db.DB.Model(&instance).Updates(updates)
-
-	// 更新缓存
+	reportedNames := make(map[string]bool, len(msg.Instances))
 	ctx := context.Background()
-	statusKey := fmt.Sprintf("instance:%s:status", instance.ID)
-	db.RedisClient.Set(ctx, statusKey, string(mappedStatus), 30*time.Second)
+
+	for _, st := range msg.Instances {
+		reportedNames[st.InstanceID] = true
+
+		var instance models.Instance
+		if err := db.DB.Where("incus_name = ? AND node_id = ?", st.InstanceID, nodeID).First(&instance).Error; err != nil {
+			continue
+		}
+
+		// 如果实例处于中间状态、封禁或过期，不覆盖状态
+		// offline/missing 状态允许被 Agent 上报覆盖
+		if (instance.IsBusy() && !instance.IsOffline() && instance.Status != models.InstanceStatusMissing) || instance.IsBanned() || instance.IsExpiredStatus() {
+			updates := map[string]interface{}{}
+			if st.IPv4 != "" {
+				updates["ipv4_address"] = st.IPv4
+			}
+			if st.IPv6 != "" {
+				updates["ipv6_address"] = st.IPv6
+			}
+			if len(updates) > 0 {
+				db.DB.Model(&instance).Updates(updates)
+			}
+			continue
+		}
+
+		mappedStatus := mapIncusStatus(st.Status)
+		updates := map[string]interface{}{
+			"status": mappedStatus,
+		}
+		if st.IPv4 != "" {
+			updates["ipv4_address"] = st.IPv4
+		}
+		if st.IPv6 != "" {
+			updates["ipv6_address"] = st.IPv6
+		}
+
+		db.DB.Model(&instance).Updates(updates)
+
+		statusKey := fmt.Sprintf("instance:%s:status", instance.ID)
+		db.RedisClient.Set(ctx, statusKey, string(mappedStatus), 30*time.Second)
+	}
+
+	// 数据库中有但 agent 上报没有的实例，标记为 missing
+	// 排除中间状态、封禁、过期、删除中、正在创建的实例
+	var dbInstances []models.Instance
+	db.DB.Where("node_id = ? AND status NOT IN ?",
+		nodeID, []models.InstanceStatus{
+			models.InstanceStatusCreating, models.InstanceStatusStarting,
+			models.InstanceStatusStopping, models.InstanceStatusRestarting,
+			models.InstanceStatusReinstalling, models.InstanceStatusResizing,
+			models.InstanceStatusDeleting, models.InstanceStatusMissing,
+			models.InstanceStatusBanned, models.InstanceStatusExpired,
+		}).Find(&dbInstances)
+	for _, inst := range dbInstances {
+		if !reportedNames[inst.IncusName] {
+			db.DB.Model(&inst).Update("status", models.InstanceStatusMissing)
+			zap.L().Warn("实例在 Agent 上报列表中缺失，标记为 missing",
+				zap.String("instance_id", inst.ID.String()),
+				zap.String("incus_name", inst.IncusName))
+		}
+	}
 }
 
 // mapIncusStatus 将 Incus 状态映射到系统状态
@@ -1161,39 +1715,196 @@ func (m *Manager) handleMetrics(nodeID uuid.UUID, payload json.RawMessage) {
 		// Agent 上报的 instance_id 是 incus_name，不是 UUID
 		var instance models.Instance
 		if err := db.DB.Where("incus_name = ? AND node_id = ?", im.InstanceID, nodeID).
-			Select("id").First(&instance).Error; err != nil {
+			First(&instance).Error; err != nil {
 			continue
 		}
 
 		metric := models.InstanceMetric{
-			InstanceID:   instance.ID,
-			NodeID:       nodeID,
-			Timestamp:    now,
-			CPUPercent:   im.CPUPercent,
-			MemUsed:      im.MemUsed,
-			MemTotal:     im.MemTotal,
-			DiskReadBps:  im.DiskRead,
-			DiskWriteBps: im.DiskWrite,
-			NetInBps:     im.NetIn,
-			NetOutBps:    im.NetOut,
+			InstanceID:    instance.ID,
+			NodeID:        nodeID,
+			Timestamp:     now,
+			CPUPercent:    im.CPUPercent,
+			MemUsed:       im.MemUsed,
+			MemTotal:      im.MemTotal,
+			DiskUsed:      im.DiskUsed,
+			DiskTotal:     im.DiskTotal,
+			DiskReadBps:   im.DiskReadBps,
+			DiskWriteBps:  im.DiskWriteBps,
+			DiskReadIops:  im.DiskReadIops,
+			DiskWriteIops: im.DiskWriteIops,
+			NetInBps:      im.NetIn,
+			NetOutBps:     im.NetOut,
+			NetInTotal:    im.NetInTotal,
+			NetOutTotal:   im.NetOutTotal,
 		}
 
-		db.DB.Create(&metric)
+		// 每秒原始数据写入 Redis sorted set，保留15分钟
+		ctx := context.Background()
+		rawKey := fmt.Sprintf("instance:%s:metrics_raw", instance.ID)
+		metricJSON, _ := json.Marshal(metric)
+		db.RedisClient.ZAdd(ctx, rawKey, redis.Z{
+			Score:  float64(now.Unix()),
+			Member: string(metricJSON),
+		})
+		// 设置过期时间15分钟
+		db.RedisClient.Expire(ctx, rawKey, 15*time.Minute)
+		// 清除15分钟前的旧数据
+		cutoff := float64(now.Add(-15 * time.Minute).Unix())
+		db.RedisClient.ZRemRangeByScore(ctx, rawKey, "-inf", fmt.Sprintf("%.0f", cutoff))
+
+		// 流量累加逻辑（参考 YaoNet/Old 方案）
+		// current < last → delta = current（计数器重置后当前值就是本次增量）
+		// current >= last → delta = current - last
+		var deltaIn, deltaOut int64
+		if im.NetInTotal >= instance.LastNetInTotal {
+			deltaIn = im.NetInTotal - instance.LastNetInTotal
+		} else {
+			deltaIn = im.NetInTotal
+		}
+		if im.NetOutTotal >= instance.LastNetOutTotal {
+			deltaOut = im.NetOutTotal - instance.LastNetOutTotal
+		} else {
+			deltaOut = im.NetOutTotal
+		}
+
+		monthlyInBytes := instance.MonthlyTrafficInBytes + deltaIn
+		monthlyOutBytes := instance.MonthlyTrafficOutBytes + deltaOut
+
+		// 按 TrafficMode 计算已用流量（GB）
+		var usedBytes int64
+		switch instance.TrafficMode {
+		case models.TrafficModeOutbound:
+			usedBytes = monthlyOutBytes
+		case models.TrafficModeInbound:
+			usedBytes = monthlyInBytes
+		case models.TrafficModeMax:
+			if monthlyInBytes > monthlyOutBytes {
+				usedBytes = monthlyInBytes
+			} else {
+				usedBytes = monthlyOutBytes
+			}
+		default: // total
+			usedBytes = monthlyInBytes + monthlyOutBytes
+		}
+		usedGB := float64(usedBytes) / (1024 * 1024 * 1024)
+
+		// 更新实例流量字段
+		db.DB.Model(&instance).Updates(map[string]interface{}{
+			"last_net_in_total":         im.NetInTotal,
+			"last_net_out_total":        im.NetOutTotal,
+			"monthly_traffic_in_bytes":  monthlyInBytes,
+			"monthly_traffic_out_bytes": monthlyOutBytes,
+			"traffic_used_gb":           math.Round(usedGB*100) / 100,
+		})
+
+		// 实时检测流量超额
+		if instance.MonthlyTrafficGB > 0 && usedGB >= float64(instance.MonthlyTrafficGB) && !instance.IsOverLimit {
+			m.handleTrafficOverLimit(&instance, usedGB)
+		}
 
 		// 缓存最新指标
-		ctx := context.Background()
 		metricKey := fmt.Sprintf("instance:%s:metrics", instance.ID)
 		metricData, _ := json.Marshal(map[string]interface{}{
-			"cpu_percent": im.CPUPercent,
-			"mem_used":    im.MemUsed,
-			"mem_total":   im.MemTotal,
-			"disk_read":   im.DiskRead,
-			"disk_write":  im.DiskWrite,
-			"net_in":      im.NetIn,
-			"net_out":     im.NetOut,
-			"timestamp":   now.Unix(),
+			"cpu_percent":     im.CPUPercent,
+			"mem_used":        im.MemUsed * 1024 * 1024,   // MB -> bytes
+			"mem_total":       im.MemTotal * 1024 * 1024,  // MB -> bytes
+			"disk_used":       im.DiskUsed * 1024 * 1024,  // MB -> bytes
+			"disk_total":      im.DiskTotal * 1024 * 1024, // MB -> bytes
+			"disk_read_bps":   im.DiskReadBps,
+			"disk_write_bps":  im.DiskWriteBps,
+			"disk_read_iops":  im.DiskReadIops,
+			"disk_write_iops": im.DiskWriteIops,
+			"net_in":          im.NetIn,
+			"net_out":         im.NetOut,
+			"net_in_total":    im.NetInTotal,
+			"net_out_total":   im.NetOutTotal,
+			"timestamp":       now.Unix(),
 		})
 		db.RedisClient.Set(ctx, metricKey, metricData, 10*time.Second)
+
+		// 通过 WebSocket 推送实时监控指标给前端
+		m.BroadcastInstanceMetrics(instance.ID, map[string]interface{}{
+			"cpu_usage":       im.CPUPercent,
+			"memory_usage":    im.MemUsed * 1024 * 1024,
+			"memory_total":    im.MemTotal * 1024 * 1024,
+			"disk_used":       im.DiskUsed * 1024 * 1024,
+			"disk_total":      im.DiskTotal * 1024 * 1024,
+			"disk_read_bps":   im.DiskReadBps,
+			"disk_write_bps":  im.DiskWriteBps,
+			"disk_read_iops":  im.DiskReadIops,
+			"disk_write_iops": im.DiskWriteIops,
+			"network_rx":      im.NetIn,
+			"network_tx":      im.NetOut,
+			"traffic_used_gb": math.Round(usedGB*100) / 100,
+			"monthly_traffic": instance.MonthlyTrafficGB,
+			"timestamp":       now.Unix(),
+		})
+	}
+}
+
+// handleTrafficOverLimit 处理流量超额
+func (m *Manager) handleTrafficOverLimit(instance *models.Instance, usedGB float64) {
+	zap.L().Info("实例流量超额",
+		zap.String("instance_id", instance.ID.String()),
+		zap.Float64("used", usedGB),
+		zap.Int64("limit", instance.MonthlyTrafficGB),
+		zap.String("action", string(instance.OverLimitAction)))
+
+	updates := map[string]interface{}{
+		"is_over_limit": true,
+	}
+
+	switch instance.OverLimitAction {
+	case models.OverLimitActionShutdown:
+		updates["status"] = models.InstanceStatusStopped
+		db.DB.Model(instance).Updates(updates)
+		// 下发停止任务
+		task := models.Task{
+			ID:         uuid.New(),
+			Type:       models.TaskTypeStopInstance,
+			NodeID:     instance.NodeID,
+			InstanceID: &instance.ID,
+			UserID:     instance.UserID,
+			Status:     models.TaskStatusPending,
+		}
+		db.DB.Create(&task)
+
+	case models.OverLimitActionThrottle:
+		db.DB.Model(instance).Updates(updates)
+		// 下发限速任务
+		throttleMbps := instance.ThrottleMbps
+		if throttleMbps <= 0 {
+			throttleMbps = 1
+		}
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"instance_id":  instance.IncusName,
+			"network_down": throttleMbps,
+			"network_up":   throttleMbps,
+		})
+		task := models.Task{
+			ID:         uuid.New(),
+			Type:       models.TaskTypeLimitNetwork,
+			NodeID:     instance.NodeID,
+			InstanceID: &instance.ID,
+			UserID:     instance.UserID,
+			Status:     models.TaskStatusPending,
+			Payload:    payloadBytes,
+		}
+		db.DB.Create(&task)
+
+	default:
+		// 默认 shutdown
+		updates["status"] = models.InstanceStatusStopped
+		db.DB.Model(instance).Updates(updates)
+		task := models.Task{
+			ID:         uuid.New(),
+			Type:       models.TaskTypeStopInstance,
+			NodeID:     instance.NodeID,
+			InstanceID: &instance.ID,
+			UserID:     instance.UserID,
+			Status:     models.TaskStatusPending,
+		}
+		db.DB.Create(&task)
 	}
 }
 
@@ -1254,6 +1965,15 @@ func (m *Manager) handleTaskResult(nodeID uuid.UUID, payload json.RawMessage) {
 			errMsg = result.Error
 		}
 		m.OnTaskResult(taskID, result.Payload, errMsg)
+
+		// 广播任务状态到前端（OnTaskResult 路径也需要广播）
+		var finalStatus models.TaskStatus
+		if result.Success {
+			finalStatus = models.TaskStatusCompleted
+		} else {
+			finalStatus = models.TaskStatusFailed
+		}
+		m.broadcastTaskStatus(taskID, task.Type, nodeID, finalStatus, result.Error)
 		return
 	}
 
@@ -1459,8 +2179,9 @@ func (m *Manager) StartHeartbeatChecker() {
 // handleImageProgress 处理 Agent 上报的镜像下载进度或本地镜像列表
 func (m *Manager) handleImageProgress(nodeID uuid.UUID, payload json.RawMessage) {
 	// 先尝试解析为镜像列表上报（Agent 启动时 / 定期同步）
+	// agent 现在上报完整镜像信息结构体列表
 	var imageList struct {
-		Images []string `json:"images"`
+		Images []AgentLocalImage `json:"images"`
 	}
 	if err := json.Unmarshal(payload, &imageList); err == nil && imageList.Images != nil {
 		m.handleImageListSync(nodeID, imageList.Images)
@@ -1506,20 +2227,9 @@ func (m *Manager) handleImageProgress(nodeID uuid.UUID, payload json.RawMessage)
 		m.BroadcastImageProgress(nodeID, p)
 	}
 
-	// 下载完成 → 持久化到 NodeImage 表
+	// 下载完成 → 清除 Redis 中的中间进度（NodeImage 持久化由 handleImageListSync 处理）
 	if p.Stage == "done" {
 		nodeStr := nodeID.String()
-		var ni models.NodeImage
-		if err := db.DB.Where("node_id = ? AND image_id = ?", nodeStr, p.ImageID).First(&ni).Error; err != nil {
-			db.DB.Create(&models.NodeImage{
-				NodeID:  nodeStr,
-				ImageID: p.ImageID,
-				Status:  "downloaded",
-			})
-		} else {
-			db.DB.Model(&ni).Updates(map[string]interface{}{"status": "downloaded", "updated_at": now})
-		}
-		// 下载完成清除 Redis 中的中间进度
 		ctx := context.Background()
 		progressKey := fmt.Sprintf("image_progress:%s:%s", nodeStr, p.ImageID)
 		db.RedisClient.Del(ctx, progressKey)
@@ -1552,49 +2262,114 @@ func (m *Manager) handleInstanceProgress(nodeID uuid.UUID, payload json.RawMessa
 	m.BroadcastInstanceProgress(nodeID, p)
 }
 
+// AgentLocalImage agent 上报的本地镜像完整信息
+type AgentLocalImage struct {
+	Fingerprint  string   `json:"fingerprint"`
+	Aliases      []string `json:"aliases"`
+	Type         string   `json:"type"`
+	Architecture string   `json:"architecture"`
+	Size         int64    `json:"size"`
+	Description  string   `json:"description"`
+	UploadDate   string   `json:"upload_date"`
+	ImageSource  string   `json:"image_source"`
+}
+
 // handleImageListSync 处理 Agent 全量镜像列表上报，执行增量同步 + 清理已删除
-// agent 上报的是 image_key 列表 (alias|type|arch)，与 DB 中格式一致，直接精确匹配
-func (m *Manager) handleImageListSync(nodeID uuid.UUID, imageKeys []string) {
+// agent 上报完整镜像信息，master 按 (node_id, fingerprint, image_type) 做增量同步
+func (m *Manager) handleImageListSync(nodeID uuid.UUID, images []AgentLocalImage) {
 	now := time.Now()
 	nodeStr := nodeID.String()
 
-	zap.L().Info("Agent 上报镜像列表", zap.String("node_id", nodeStr), zap.Int("count", len(imageKeys)))
+	zap.L().Info("Agent 上报镜像列表", zap.String("node_id", nodeStr), zap.Int("count", len(images)))
 
-	// 构建上报集合
-	reported := make(map[string]struct{}, len(imageKeys))
-	for _, key := range imageKeys {
+	// 构建上报集合（fingerprint|image_type 作为唯一键）
+	reported := make(map[string]struct{}, len(images))
+	for _, img := range images {
+		key := img.Fingerprint + "|" + img.Type
 		reported[key] = struct{}{}
 	}
 
 	// Upsert 上报的镜像
-	for _, key := range imageKeys {
-		var ni models.NodeImage
-		if err := db.DB.Where("node_id = ? AND image_id = ?", nodeStr, key).First(&ni).Error; err != nil {
-			db.DB.Create(&models.NodeImage{NodeID: nodeStr, ImageID: key, Status: "downloaded"})
-		} else if ni.Status != "downloaded" {
-			db.DB.Model(&ni).Updates(map[string]interface{}{"status": "downloaded", "updated_at": now})
+	for _, img := range images {
+		// 取第一个 alias 作为主别名
+		alias := ""
+		if len(img.Aliases) > 0 {
+			alias = img.Aliases[0]
 		}
+
+		// upsert node_images
+		var ni models.NodeImage
+		if err := db.DB.Where("node_id = ? AND fingerprint = ? AND image_type = ?", nodeStr, img.Fingerprint, img.Type).First(&ni).Error; err != nil {
+			// 新镜像，创建记录
+			db.DB.Create(&models.NodeImage{
+				NodeID:       nodeStr,
+				Fingerprint:  img.Fingerprint,
+				Alias:        alias,
+				ImageType:    img.Type,
+				Architecture: img.Architecture,
+				SizeBytes:    img.Size,
+				Description:  img.Description,
+				UploadDate:   img.UploadDate,
+				ImageSource:  img.ImageSource,
+				Status:       "downloaded",
+				UpdatedAt:    now,
+			})
+		} else {
+			// 更新已有记录
+			updates := map[string]interface{}{
+				"alias":        alias,
+				"architecture": img.Architecture,
+				"size_bytes":   img.Size,
+				"description":  img.Description,
+				"upload_date":  img.UploadDate,
+				"status":       "downloaded",
+				"updated_at":   now,
+			}
+			// 仅在上报的 image_source 非 manual 时才更新，避免属性丢失后覆盖原值
+			if img.ImageSource != "" && img.ImageSource != "manual" {
+				updates["image_source"] = img.ImageSource
+			}
+			db.DB.Model(&ni).Updates(updates)
+		}
+
+		// upsert node_image_aliases（ON CONFLICT 时不覆盖用户已设置的 display_name 和 install_ssh）
+		installSSH := defaultInstallSSH(img.ImageSource, img.Type)
+		db.DB.Exec(`INSERT INTO node_image_aliases (node_id, fingerprint, image_type, category_id, display_name, install_ssh)
+			VALUES (?, ?, ?, NULL, ?, ?)
+			ON CONFLICT (node_id, fingerprint, image_type) DO NOTHING`,
+			nodeStr, img.Fingerprint, img.Type, alias, installSSH)
 	}
 
 	// 清理 DB 中该节点已不存在的镜像
 	var existing []models.NodeImage
 	db.DB.Where("node_id = ?", nodeStr).Find(&existing)
+	cleaned := 0
 	for _, ni := range existing {
-		if _, ok := reported[ni.ImageID]; !ok {
-			zap.L().Info("删除节点镜像记录", zap.String("node_id", nodeStr), zap.String("image_id", ni.ImageID))
-			db.DB.Where("node_id = ? AND image_id = ?", nodeStr, ni.ImageID).Delete(&models.NodeImage{})
+		key := ni.Fingerprint + "|" + ni.ImageType
+		if _, ok := reported[key]; !ok {
+			zap.L().Info("删除节点镜像记录", zap.String("node_id", nodeStr), zap.String("fingerprint", ni.Fingerprint), zap.String("image_type", ni.ImageType))
+			db.DB.Where("node_id = ? AND fingerprint = ? AND image_type = ?", nodeStr, ni.Fingerprint, ni.ImageType).Delete(&models.NodeImage{})
+			// 同时删除别名映射
+			db.DB.Where("node_id = ? AND fingerprint = ? AND image_type = ?", nodeStr, ni.Fingerprint, ni.ImageType).Delete(&models.NodeImageAlias{})
 			m.BroadcastImageProgress(nodeID, ImageProgressPayload{
-				ImageID: ni.ImageID, Stage: "deleted", Progress: 0,
+				ImageID: ni.Alias, Stage: "deleted", Progress: 0,
 			})
+			cleaned++
 		}
 	}
 
-	// 同步更新内存缓存
+	// 同步更新内存缓存（用于下载进度追踪）
 	m.imageMu.Lock()
-	nodeMap := make(map[string]*NodeImageStatus, len(imageKeys))
-	for _, key := range imageKeys {
-		nodeMap[key] = &NodeImageStatus{
-			ImageID: key, Stage: "done", Progress: 100, UpdatedAt: now,
+	nodeMap := make(map[string]*NodeImageStatus, len(images))
+	for _, img := range images {
+		imageKey := ""
+		if len(img.Aliases) > 0 {
+			imageKey = img.Aliases[0] + "|" + img.Type + "|" + img.Architecture
+		}
+		if imageKey != "" {
+			nodeMap[imageKey] = &NodeImageStatus{
+				ImageID: imageKey, Stage: "done", Progress: 100, UpdatedAt: now,
+			}
 		}
 	}
 	// 保留正在下载中的条目
@@ -1610,8 +2385,8 @@ func (m *Manager) handleImageListSync(nodeID uuid.UUID, imageKeys []string) {
 
 	zap.L().Info("节点镜像列表已同步",
 		zap.String("node_id", nodeStr),
-		zap.Int("reported", len(imageKeys)),
-		zap.Int("cleaned", len(existing)-len(imageKeys)))
+		zap.Int("reported", len(images)),
+		zap.Int("cleaned", cleaned))
 
 	// 广播镜像列表更新给前端
 	m.BroadcastImageProgress(nodeID, ImageProgressPayload{
@@ -1619,6 +2394,19 @@ func (m *Manager) handleImageListSync(nodeID uuid.UUID, imageKeys []string) {
 		Stage:    "sync",
 		Progress: 100,
 	})
+}
+
+// defaultInstallSSH 根据镜像来源和类型判断默认是否安装 SSH
+func defaultInstallSSH(imageSource, imageType string) bool {
+	if imageType == "virtual-machine" {
+		return false
+	}
+	// 容器类型
+	if imageSource == "images" {
+		return true
+	}
+	// spiritlhl 和 manual 默认不安装
+	return false
 }
 
 // GetImageProgress 获取指定节点的所有镜像下载状态
@@ -1635,8 +2423,9 @@ func (m *Manager) GetImageProgress(nodeID uuid.UUID) map[string]*NodeImageStatus
 			nodeMap = make(map[string]*NodeImageStatus)
 			m.imageProgress[nodeID] = nodeMap
 			for _, ni := range nodeImages {
-				nodeMap[ni.ImageID] = &NodeImageStatus{
-					ImageID:   ni.ImageID,
+				imageKey := ni.Alias + "|" + ni.ImageType + "|" + ni.Architecture
+				nodeMap[imageKey] = &NodeImageStatus{
+					ImageID:   imageKey,
 					Stage:     "done",
 					Progress:  100,
 					UpdatedAt: ni.UpdatedAt,

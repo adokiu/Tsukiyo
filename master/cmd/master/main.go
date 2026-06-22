@@ -1,18 +1,17 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"go.uber.org/zap"
 
 	"tsukiyo/master/internal/agent"
 	"tsukiyo/master/internal/api"
+	"tsukiyo/master/internal/api/handlers"
 	"tsukiyo/master/internal/config"
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/schedule"
@@ -80,6 +79,14 @@ func main() {
 	// 配置路由
 	router := api.SetupRouter(agentMgr)
 
+	// 注入全局广播函数，handler 变更数据后通知前端刷新
+	handlers.SetBroadcastFn(func(msgType string, payload interface{}) {
+		agentMgr.BroadcastToFrontend(map[string]interface{}{
+			"type":    msgType,
+			"payload": payload,
+		})
+	})
+
 	// HTTP 服务器 (同时处理 WebSocket)
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", config.AppConfig.Server.Host, config.AppConfig.Server.Port),
@@ -108,11 +115,11 @@ func main() {
 	cronScheduler.Stop()
 	secScanner.Stop()
 
-	// 优雅关闭
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// 先关闭所有 WebSocket 连接
+	agentMgr.CloseAll()
 
-	if err := httpServer.Shutdown(ctx); err != nil {
+	// 直接关闭 HTTP listener，不等待残留连接
+	if err := httpServer.Close(); err != nil {
 		zap.L().Error("HTTP 服务器关闭失败", zap.Error(err))
 	}
 

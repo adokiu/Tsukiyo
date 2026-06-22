@@ -1,10 +1,13 @@
 package monitor
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
@@ -14,61 +17,178 @@ import (
 
 // MetricPoint 指标数据点
 type MetricPoint struct {
-	Timestamp   time.Time `json:"timestamp"`
-	CPU         float64   `json:"cpu"`
-	MemUsed     int64     `json:"mem_used"`
-	MemTotal    int64     `json:"mem_total"`
-	DiskRead    int64     `json:"disk_read"`
-	DiskWrite   int64     `json:"disk_write"`
-	NetIn       int64     `json:"net_in"`
-	NetOut      int64     `json:"net_out"`
-	NetInTotal  int64     `json:"net_in_total"`
-	NetOutTotal int64     `json:"net_out_total"`
+	Timestamp     time.Time `json:"timestamp"`
+	CPU           float64   `json:"cpu"`
+	CPUMax        float64   `json:"cpu_max"`
+	CPUMin        float64   `json:"cpu_min"`
+	MemUsed       int64     `json:"mem_used"`
+	MemUsedMax    int64     `json:"mem_used_max"`
+	MemUsedMin    int64     `json:"mem_used_min"`
+	MemTotal      int64     `json:"mem_total"`
+	DiskUsed      int64     `json:"disk_used"`
+	DiskUsedMax   int64     `json:"disk_used_max"`
+	DiskUsedMin   int64     `json:"disk_used_min"`
+	DiskTotal     int64     `json:"disk_total"`
+	DiskReadBps   int64     `json:"disk_read_bps"`
+	DiskReadMax   int64     `json:"disk_read_max"`
+	DiskWriteBps  int64     `json:"disk_write_bps"`
+	DiskWriteMax  int64     `json:"disk_write_max"`
+	DiskReadIops  int64     `json:"disk_read_iops"`
+	DiskWriteIops int64     `json:"disk_write_iops"`
+	NetIn         int64     `json:"net_in"`
+	NetInMax      int64     `json:"net_in_max"`
+	NetInMin      int64     `json:"net_in_min"`
+	NetOut        int64     `json:"net_out"`
+	NetOutMax     int64     `json:"net_out_max"`
+	NetOutMin     int64     `json:"net_out_min"`
+	NetInTotal    int64     `json:"net_in_total"`
+	NetOutTotal   int64     `json:"net_out_total"`
 }
 
 // GetInstanceMetrics 获取实例监控数据
+// 15分钟内从 Redis 读原始数据，超过15分钟从 DB 读降采样数据
 func GetInstanceMetrics(instanceID uuid.UUID, from, to time.Time, interval string) ([]MetricPoint, error) {
-	query := db.DB.Where("instance_id = ? AND timestamp >= ? AND timestamp <= ?",
-		instanceID, from, to).Order("timestamp ASC")
+	now := time.Now()
+	fifteenMinAgo := now.Add(-15 * time.Minute)
 
-	// 根据 interval 进行降采样
-	var rawMetrics []models.InstanceMetric
-	if err := query.Find(&rawMetrics).Error; err != nil {
-		return nil, fmt.Errorf("查询监控数据失败: %w", err)
+	var points []MetricPoint
+
+	// 从 Redis 读取15分钟内的原始数据
+	if to.After(fifteenMinAgo) {
+		redisFrom := from
+		if redisFrom.Before(fifteenMinAgo) {
+			redisFrom = fifteenMinAgo
+		}
+		redisPoints, err := readMetricsFromRedis(instanceID, redisFrom, to)
+		if err != nil {
+			zap.L().Warn("从Redis读取监控数据失败", zap.Error(err))
+		} else {
+			points = append(points, redisPoints...)
+		}
 	}
 
-	if len(rawMetrics) == 0 {
+	// 从 DB 读取15分钟前的降采样数据
+	if from.Before(fifteenMinAgo) {
+		dbTo := to
+		if dbTo.After(fifteenMinAgo) {
+			dbTo = fifteenMinAgo
+		}
+		dbPoints, err := readMetricsFromDB(instanceID, from, dbTo, interval)
+		if err != nil {
+			return nil, fmt.Errorf("查询监控数据失败: %w", err)
+		}
+		// DB 数据在前（时间更早），Redis 数据在后
+		points = append(dbPoints, points...)
+	}
+
+	if len(points) == 0 {
 		return []MetricPoint{}, nil
 	}
 
-	// 根据间隔降采样
-	points := downsample(rawMetrics, interval)
 	return points, nil
 }
 
-// GetInstanceLatestMetrics 获取实例最新监控指标
-func GetInstanceLatestMetrics(instanceID uuid.UUID) (*MetricPoint, error) {
-	var metric models.InstanceMetric
-	if err := db.DB.Where("instance_id = ?", instanceID).
-		Order("timestamp DESC").First(&metric).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return nil, nil
-		}
+// readMetricsFromRedis 从 Redis sorted set 读取原始监控数据
+func readMetricsFromRedis(instanceID uuid.UUID, from, to time.Time) ([]MetricPoint, error) {
+	ctx := context.Background()
+	rawKey := fmt.Sprintf("instance:%s:metrics_raw", instanceID)
+
+	results, err := db.RedisClient.ZRangeByScore(ctx, rawKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", from.Unix()),
+		Max: fmt.Sprintf("%d", to.Unix()),
+	}).Result()
+	if err != nil {
 		return nil, err
 	}
 
-	return &MetricPoint{
-		Timestamp:   metric.Timestamp,
-		CPU:         metric.CPUPercent,
-		MemUsed:     metric.MemUsed,
-		MemTotal:    metric.MemTotal,
-		DiskRead:    metric.DiskReadBps,
-		DiskWrite:   metric.DiskWriteBps,
-		NetIn:       metric.NetInBps,
-		NetOut:      metric.NetOutBps,
-		NetInTotal:  metric.NetInTotal,
-		NetOutTotal: metric.NetOutTotal,
-	}, nil
+	points := make([]MetricPoint, 0, len(results))
+	for _, s := range results {
+		var m models.InstanceMetric
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			continue
+		}
+		points = append(points, metricToPoint(m))
+	}
+	return points, nil
+}
+
+// readMetricsFromDB 从数据库读取降采样后的监控数据
+func readMetricsFromDB(instanceID uuid.UUID, from, to time.Time, interval string) ([]MetricPoint, error) {
+	var rawMetrics []models.InstanceMetric
+	if err := db.DB.Where("instance_id = ? AND timestamp >= ? AND timestamp <= ?",
+		instanceID, from, to).Order("timestamp ASC").Find(&rawMetrics).Error; err != nil {
+		return nil, err
+	}
+
+	points := make([]MetricPoint, 0, len(rawMetrics))
+	for _, m := range rawMetrics {
+		points = append(points, metricToPoint(m))
+	}
+	return points, nil
+}
+
+// metricToPoint 将 InstanceMetric 转换为 MetricPoint
+func metricToPoint(m models.InstanceMetric) MetricPoint {
+	return MetricPoint{
+		Timestamp:     m.Timestamp,
+		CPU:           m.CPUPercent,
+		CPUMax:        m.CPUMax,
+		CPUMin:        m.CPUMin,
+		MemUsed:       m.MemUsed,
+		MemUsedMax:    m.MemUsedMax,
+		MemUsedMin:    m.MemUsedMin,
+		MemTotal:      m.MemTotal,
+		DiskUsed:      m.DiskUsed,
+		DiskUsedMax:   m.DiskUsedMax,
+		DiskUsedMin:   m.DiskUsedMin,
+		DiskTotal:     m.DiskTotal,
+		DiskReadBps:   m.DiskReadBps,
+		DiskReadMax:   m.DiskReadMax,
+		DiskWriteBps:  m.DiskWriteBps,
+		DiskWriteMax:  m.DiskWriteMax,
+		DiskReadIops:  m.DiskReadIops,
+		DiskWriteIops: m.DiskWriteIops,
+		NetIn:         m.NetInBps,
+		NetInMax:      m.NetInMax,
+		NetInMin:      m.NetInMin,
+		NetOut:        m.NetOutBps,
+		NetOutMax:     m.NetOutMax,
+		NetOutMin:     m.NetOutMin,
+		NetInTotal:    m.NetInTotal,
+		NetOutTotal:   m.NetOutTotal,
+	}
+}
+
+// GetInstanceLatestMetrics 获取实例最新监控指标（从 Redis 读取）
+func GetInstanceLatestMetrics(instanceID uuid.UUID) (*MetricPoint, error) {
+	ctx := context.Background()
+	rawKey := fmt.Sprintf("instance:%s:metrics_raw", instanceID)
+
+	// 从 Redis sorted set 取最后一条
+	results, err := db.RedisClient.ZRevRange(ctx, rawKey, 0, 0).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		// Redis 没有，回退到 DB
+		var metric models.InstanceMetric
+		if err := db.DB.Where("instance_id = ?", instanceID).
+			Order("timestamp DESC").First(&metric).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil, nil
+			}
+			return nil, err
+		}
+		p := metricToPoint(metric)
+		return &p, nil
+	}
+
+	var m models.InstanceMetric
+	if err := json.Unmarshal([]byte(results[0]), &m); err != nil {
+		return nil, err
+	}
+	p := metricToPoint(m)
+	return &p, nil
 }
 
 // GetNodeMetricsSummary 获取节点监控汇总
@@ -97,69 +217,193 @@ func GetNodeMetricsSummary(nodeID uuid.UUID) (map[string]interface{}, error) {
 	return summary, nil
 }
 
-// downsample 降采样
-func downsample(metrics []models.InstanceMetric, interval string) []MetricPoint {
-	if len(metrics) == 0 {
-		return []MetricPoint{}
+// DownsampleMetrics 降采样任务：把 Redis 中超过15分钟的数据按1分钟窗口聚合后写入 DB
+// 保留均值、峰值、谷值，聚合后从 Redis 删除原始数据
+func DownsampleMetrics() {
+	ctx := context.Background()
+
+	// 获取所有有原始数据的实例
+	// 遍历所有实例的 metrics_raw key
+	keys, err := db.RedisClient.Keys(ctx, "instance:*:metrics_raw").Result()
+	if err != nil {
+		zap.L().Error("扫描 Redis metrics_raw key 失败", zap.Error(err))
+		return
 	}
 
-	// 根据 interval 确定聚合窗口
-	var window time.Duration
-	switch interval {
-	case "1m":
-		window = time.Minute
-	case "5m":
-		window = 5 * time.Minute
-	case "15m":
-		window = 15 * time.Minute
-	case "1h":
-		window = time.Hour
-	default:
-		window = time.Minute
+	now := time.Now()
+	cutoff := now.Add(-15 * time.Minute)
+
+	for _, key := range keys {
+		// 从 key 解析 instance_id: instance:{id}:metrics_raw
+		parts := splitKey(key)
+		if len(parts) < 3 {
+			continue
+		}
+		instanceID, err := uuid.Parse(parts[1])
+		if err != nil {
+			continue
+		}
+
+		// 取出15分钟前的所有数据
+		results, err := db.RedisClient.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+			Min: "-inf",
+			Max: fmt.Sprintf("%d", cutoff.Unix()),
+		}).Result()
+		if err != nil || len(results) == 0 {
+			continue
+		}
+
+		// 按1分钟窗口聚合
+		buckets := make(map[int64][]models.InstanceMetric)
+		for _, s := range results {
+			var m models.InstanceMetric
+			if err := json.Unmarshal([]byte(s), &m); err != nil {
+				continue
+			}
+			// 按分钟对齐
+			bucketKey := m.Timestamp.Unix() / 60 * 60
+			buckets[bucketKey] = append(buckets[bucketKey], m)
+		}
+
+		// 聚合每个窗口
+		for bucketTime, samples := range buckets {
+			agg := aggregateSamples(samples)
+			agg.InstanceID = instanceID
+			agg.Timestamp = time.Unix(bucketTime, 0)
+			agg.SampleCount = len(samples)
+			if err := db.DB.Create(&agg).Error; err != nil {
+				zap.L().Error("写入降采样数据失败", zap.Error(err))
+			}
+		}
+
+		// 从 Redis 删除已聚合的数据
+		db.RedisClient.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", cutoff.Unix()))
 	}
 
-	points := make([]MetricPoint, 0)
-	var current *MetricPoint
-	var count int
+	zap.L().Info("降采样任务完成", zap.Int("keys", len(keys)))
+}
 
-	for _, m := range metrics {
-		if current == nil || m.Timestamp.Sub(current.Timestamp) >= window {
-			if current != nil {
-				current.CPU /= float64(count)
-				current.MemUsed /= int64(count)
-				points = append(points, *current)
-			}
-			current = &MetricPoint{
-				Timestamp:   m.Timestamp,
-				CPU:         m.CPUPercent,
-				MemUsed:     m.MemUsed,
-				MemTotal:    m.MemTotal,
-				DiskRead:    m.DiskReadBps,
-				DiskWrite:   m.DiskWriteBps,
-				NetIn:       m.NetInBps,
-				NetOut:      m.NetOutBps,
-				NetInTotal:  m.NetInTotal,
-				NetOutTotal: m.NetOutTotal,
-			}
-			count = 1
-		} else {
-			current.CPU += m.CPUPercent
-			current.MemUsed += m.MemUsed
-			current.DiskRead += m.DiskReadBps
-			current.DiskWrite += m.DiskWriteBps
-			current.NetIn += m.NetInBps
-			current.NetOut += m.NetOutBps
-			count++
+// aggregateSamples 聚合一组样本：计算均值、峰值、谷值
+func aggregateSamples(samples []models.InstanceMetric) models.InstanceMetric {
+	if len(samples) == 0 {
+		return models.InstanceMetric{}
+	}
+
+	var cpuSum float64
+	var memSum, diskSum, diskReadSum, diskWriteSum, diskReadIopsSum, diskWriteIopsSum, netInSum, netOutSum int64
+	var memTotal, diskTotal, netInTotal, netOutTotal int64
+
+	cpuMax := samples[0].CPUPercent
+	cpuMin := samples[0].CPUPercent
+	memMax := samples[0].MemUsed
+	memMin := samples[0].MemUsed
+	diskMax := samples[0].DiskUsed
+	diskMin := samples[0].DiskUsed
+	diskReadMax := samples[0].DiskReadBps
+	diskWriteMax := samples[0].DiskWriteBps
+	netInMax := samples[0].NetInBps
+	netInMin := samples[0].NetInBps
+	netOutMax := samples[0].NetOutBps
+	netOutMin := samples[0].NetOutBps
+
+	for _, s := range samples {
+		cpuSum += s.CPUPercent
+		memSum += s.MemUsed
+		diskSum += s.DiskUsed
+		diskReadSum += s.DiskReadBps
+		diskWriteSum += s.DiskWriteBps
+		diskReadIopsSum += s.DiskReadIops
+		diskWriteIopsSum += s.DiskWriteIops
+		netInSum += s.NetInBps
+		netOutSum += s.NetOutBps
+		memTotal = s.MemTotal
+		diskTotal = s.DiskTotal
+		netInTotal = s.NetInTotal
+		netOutTotal = s.NetOutTotal
+
+		if s.CPUPercent > cpuMax {
+			cpuMax = s.CPUPercent
+		}
+		if s.CPUPercent < cpuMin {
+			cpuMin = s.CPUPercent
+		}
+		if s.MemUsed > memMax {
+			memMax = s.MemUsed
+		}
+		if s.MemUsed < memMin {
+			memMin = s.MemUsed
+		}
+		if s.DiskUsed > diskMax {
+			diskMax = s.DiskUsed
+		}
+		if s.DiskUsed < diskMin {
+			diskMin = s.DiskUsed
+		}
+		if s.DiskReadBps > diskReadMax {
+			diskReadMax = s.DiskReadBps
+		}
+		if s.DiskWriteBps > diskWriteMax {
+			diskWriteMax = s.DiskWriteBps
+		}
+		if s.NetInBps > netInMax {
+			netInMax = s.NetInBps
+		}
+		if s.NetInBps < netInMin {
+			netInMin = s.NetInBps
+		}
+		if s.NetOutBps > netOutMax {
+			netOutMax = s.NetOutBps
+		}
+		if s.NetOutBps < netOutMin {
+			netOutMin = s.NetOutBps
 		}
 	}
 
-	if current != nil {
-		current.CPU /= float64(count)
-		current.MemUsed /= int64(count)
-		points = append(points, *current)
+	n := int64(len(samples))
+	return models.InstanceMetric{
+		NodeID:        samples[0].NodeID,
+		CPUPercent:    cpuSum / float64(n),
+		CPUMax:        cpuMax,
+		CPUMin:        cpuMin,
+		MemUsed:       memSum / n,
+		MemUsedMax:    memMax,
+		MemUsedMin:    memMin,
+		MemTotal:      memTotal,
+		DiskUsed:      diskSum / n,
+		DiskUsedMax:   diskMax,
+		DiskUsedMin:   diskMin,
+		DiskTotal:     diskTotal,
+		DiskReadBps:   diskReadSum / n,
+		DiskReadMax:   diskReadMax,
+		DiskWriteBps:  diskWriteSum / n,
+		DiskWriteMax:  diskWriteMax,
+		DiskReadIops:  diskReadIopsSum / n,
+		DiskWriteIops: diskWriteIopsSum / n,
+		NetInBps:      netInSum / n,
+		NetInMax:      netInMax,
+		NetInMin:      netInMin,
+		NetOutBps:     netOutSum / n,
+		NetOutMax:     netOutMax,
+		NetOutMin:     netOutMin,
+		NetInTotal:    netInTotal,
+		NetOutTotal:   netOutTotal,
 	}
+}
 
-	return points
+// splitKey 分割 Redis key，返回各部分
+func splitKey(key string) []string {
+	var parts []string
+	current := ""
+	for _, c := range key {
+		if c == ':' {
+			parts = append(parts, current)
+			current = ""
+		} else {
+			current += string(c)
+		}
+	}
+	parts = append(parts, current)
+	return parts
 }
 
 // AggregateNodeResources 聚合节点资源使用情况

@@ -82,7 +82,10 @@ func (s *Scheduler) dispatchPendingTasks() error {
 				zap.String("task_id", task.ID.String()),
 				zap.String("task_type", string(task.Type)),
 				zap.Error(err))
-			s.markTaskFailed(&task, err.Error())
+			if s.markTaskFailed(&task, err.Error()) {
+				// 最终失败才恢复实例状态，重试中不恢复
+				s.handlePostTask(&task, false)
+			}
 		}
 	}
 
@@ -148,8 +151,8 @@ func (s *Scheduler) processTask(task *models.Task) error {
 	return nil
 }
 
-// markTaskFailed 标记任务失败
-func (s *Scheduler) markTaskFailed(task *models.Task, errMsg string) {
+// markTaskFailed 标记任务失败，返回 true 表示最终失败（不再重试）
+func (s *Scheduler) markTaskFailed(task *models.Task, errMsg string) bool {
 	now := time.Now()
 	updates := map[string]interface{}{
 		"error":        errMsg,
@@ -167,14 +170,18 @@ func (s *Scheduler) markTaskFailed(task *models.Task, errMsg string) {
 		models.TaskTypeDeletePartition:   true,
 		models.TaskTypeFormatDisk:        true,
 		models.TaskTypeInitStorage:       true,
+		models.TaskTypeDeleteDisk:        true,
 	}
-	if nonRetryableTypes[task.Type] || task.RetryCount+1 >= task.MaxRetries {
+	finalFail := nonRetryableTypes[task.Type] || task.RetryCount+1 >= task.MaxRetries
+	if finalFail {
 		updates["status"] = models.TaskStatusFailed
 	} else {
 		updates["status"] = models.TaskStatusPending
+		updates["completed_at"] = nil
 	}
 
 	db.DB.Model(task).Updates(updates)
+	return finalFail
 }
 
 // HandleTaskResult 处理 Agent 返回的任务结果 (由 agent manager 调用)
@@ -194,7 +201,7 @@ func (s *Scheduler) HandleTaskResult(taskID uuid.UUID, result json.RawMessage, e
 		updates["status"] = models.TaskStatusFailed
 		updates["error"] = errMsg
 		updates["retry_count"] = gorm.Expr("retry_count + 1")
-		// create_instance 有副作用，失败后不重试
+		// 有副作用的操作失败后不重试
 		nonRetryableTypes := map[models.TaskType]bool{
 			models.TaskTypeCreateInstance:    true,
 			models.TaskTypeDeleteInstance:    true,
@@ -205,6 +212,7 @@ func (s *Scheduler) HandleTaskResult(taskID uuid.UUID, result json.RawMessage, e
 			models.TaskTypeFormatDisk:        true,
 			models.TaskTypeInitStorage:       true,
 			models.TaskTypeDeleteStorage:     true,
+			models.TaskTypeDeleteDisk:        true,
 		}
 		if !nonRetryableTypes[task.Type] && task.RetryCount+1 < task.MaxRetries {
 			updates["status"] = models.TaskStatusPending
@@ -217,10 +225,16 @@ func (s *Scheduler) HandleTaskResult(taskID uuid.UUID, result json.RawMessage, e
 
 	if err := db.DB.Model(&task).Updates(updates).Error; err != nil {
 		zap.L().Error("更新任务结果失败", zap.String("task_id", taskID.String()), zap.Error(err))
+		return
 	}
 
-	// 根据任务类型执行后续操作
-	s.handlePostTask(&task, errMsg == "")
+	// 只有任务最终完成或最终失败才执行后续处理，重试中不恢复实例状态
+	finalStatus := updates["status"].(models.TaskStatus)
+	if finalStatus == models.TaskStatusCompleted || finalStatus == models.TaskStatusFailed {
+		// 重新查询 task 获取最新 Result
+		db.DB.Where("id = ?", taskID).First(&task)
+		s.handlePostTask(&task, errMsg == "")
+	}
 }
 
 // handlePostTask 任务完成后的后续处理
@@ -258,6 +272,13 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 				s.networkSvc.ReleaseInstanceNetworkResources(*task.InstanceID)
 				db.DB.Delete(&models.Instance{}, *task.InstanceID)
 				db.DB.Where("instance_id = ?", *task.InstanceID).Delete(&models.DataDisk{})
+				// 广播实例删除通知到前端
+				s.mgr.BroadcastToFrontend(map[string]interface{}{
+					"type":        "instance_status",
+					"instance_id": task.InstanceID.String(),
+					"status":      "deleted",
+					"timestamp":   time.Now().Unix(),
+				})
 			} else {
 				// 删除失败：恢复实例状态，不删除记录
 				oldStatus := models.InstanceStatusError
@@ -312,13 +333,25 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 			if success {
 				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
 					Update("status", models.InstanceStatusRunning)
+			} else {
+				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+					Update("status", models.InstanceStatusError)
 			}
 		}
 	case models.TaskTypeStopInstance:
 		if task.InstanceID != nil {
 			if success {
+				// 检查实例是否处于 banned 状态，如果是则不覆盖
+				var inst models.Instance
+				if err := db.DB.Where("id = ?", *task.InstanceID).First(&inst).Error; err == nil {
+					if inst.Status != models.InstanceStatusBanned && inst.Status != models.InstanceStatusExpired {
+						db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+							Update("status", models.InstanceStatusStopped)
+					}
+				}
+			} else {
 				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
-					Update("status", models.InstanceStatusStopped)
+					Update("status", models.InstanceStatusError)
 			}
 		}
 	case models.TaskTypeRestartInstance:
@@ -326,7 +359,95 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 			if success {
 				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
 					Update("status", models.InstanceStatusRunning)
+			} else {
+				db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+					Update("status", models.InstanceStatusError)
 			}
+		}
+	case models.TaskTypeResetPassword:
+		// 重置密码不改变实例状态，仅记录任务结果
+	case models.TaskTypeResizeInstance:
+		if task.InstanceID != nil {
+			oldStatus := models.InstanceStatusError
+			var payload struct {
+				OldStatus string `json:"old_status"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+				oldStatus = models.InstanceStatus(payload.OldStatus)
+			}
+			db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+				Update("status", oldStatus)
+		}
+	case models.TaskTypeAddDisk:
+		if task.InstanceID != nil && success {
+			var payload struct {
+				DiskID string `json:"disk_id"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.DiskID != "" {
+				diskID, _ := uuid.Parse(payload.DiskID)
+				db.DB.Model(&models.DataDisk{}).Where("id = ?", diskID).
+					Update("status", "attached")
+			}
+		} else if task.InstanceID != nil && !success {
+			var payload struct {
+				DiskID string `json:"disk_id"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.DiskID != "" {
+				diskID, _ := uuid.Parse(payload.DiskID)
+				db.DB.Model(&models.DataDisk{}).Where("id = ?", diskID).
+					Update("status", "error")
+			}
+		}
+	case models.TaskTypeDeleteDisk:
+		if task.InstanceID != nil && success {
+			var payload struct {
+				DiskID string `json:"disk_id"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.DiskID != "" {
+				diskID, _ := uuid.Parse(payload.DiskID)
+				db.DB.Where("id = ?", diskID).Delete(&models.DataDisk{})
+			}
+		} else if task.InstanceID != nil && !success {
+			var payload struct {
+				DiskID string `json:"disk_id"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.DiskID != "" {
+				diskID, _ := uuid.Parse(payload.DiskID)
+				db.DB.Model(&models.DataDisk{}).Where("id = ?", diskID).
+					Update("status", "attached")
+			}
+		}
+	case models.TaskTypeResizeDisk:
+		// 扩容磁盘（root盘或数据盘），恢复实例状态
+		if task.InstanceID != nil {
+			oldStatus := models.InstanceStatusError
+			var payload struct {
+				OldStatus string `json:"old_status"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+				oldStatus = models.InstanceStatus(payload.OldStatus)
+			}
+			if !success {
+				oldStatus = models.InstanceStatusError
+			}
+			db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+				Update("status", oldStatus)
+		}
+	case models.TaskTypeLimitNetwork, models.TaskTypeLimitIOPS:
+		// 网络限速/IOPS 限制，恢复实例状态
+		if task.InstanceID != nil {
+			oldStatus := models.InstanceStatusError
+			var payload struct {
+				OldStatus string `json:"old_status"`
+			}
+			if err := json.Unmarshal(task.Payload, &payload); err == nil && payload.OldStatus != "" {
+				oldStatus = models.InstanceStatus(payload.OldStatus)
+			}
+			if !success {
+				oldStatus = models.InstanceStatusError
+			}
+			db.DB.Model(&models.Instance{}).Where("id = ?", *task.InstanceID).
+				Update("status", oldStatus)
 		}
 	case models.TaskTypeDeleteStorage:
 		if success {
@@ -337,6 +458,19 @@ func (s *Scheduler) handlePostTask(task *models.Task, success bool) {
 				db.DB.Model(&models.Node{}).Where("id = ? AND default_storage_pool = ?", task.NodeID, payload.Name).
 					Update("default_storage_pool", "")
 			}
+		}
+	}
+
+	// 统一广播实例状态到前端（删除任务已在上面单独广播）
+	if task.InstanceID != nil && task.Type != models.TaskTypeDeleteInstance {
+		var inst models.Instance
+		if err := db.DB.Where("id = ?", *task.InstanceID).First(&inst).Error; err == nil {
+			s.mgr.BroadcastToFrontend(map[string]interface{}{
+				"type":        "instance_status",
+				"instance_id": task.InstanceID.String(),
+				"status":      string(inst.Status),
+				"timestamp":   time.Now().Unix(),
+			})
 		}
 	}
 }
