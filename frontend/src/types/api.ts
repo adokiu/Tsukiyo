@@ -51,21 +51,24 @@ export interface Instance {
   template_name?: string
   vcpu: number
   memory_mb: number
-  disk_gb: number
+  swap_mb: number
+  disk_mb: number
   storage_pool: string
   public_ipv4: string
   public_ipv6: string
   network_down_mbps: number
   network_up_mbps: number
-  io_read_mbps: number
-  io_write_mbps: number
+  io_read_iops: number
+  io_write_iops: number
   monthly_traffic_gb: number
   current_traffic_gb: number
   traffic_mode: string
   snapshot_limit: number
+  port_mapping_limit?: number
   ssh_password: string
   ssh_public_key: string
   expires_at: string
+  expired_at?: string
   created_at: string
   data_disks?: DataDisk[]
   port_mappings?: PortMapping[]
@@ -80,9 +83,11 @@ export interface Instance {
 export interface DataDisk {
   id: string
   name: string
-  size_gb: number
+  size_mb: number
   storage_pool: string
   mount_point: string
+  status?: string
+  updated_at?: string
 }
 
 export interface PortMapping {
@@ -110,7 +115,7 @@ export interface Bridge {
   ipv6_gateway: string
   dns_servers: string[]
   nat_egress_ipv4_id?: string
-  nat_egress_ipv6_id?: string
+  ipv6_eip_pool_id?: string
   port_range_start: number
   port_range_end: number
   status: string
@@ -126,6 +131,7 @@ export interface EIPPool {
   interface: string
   gateway: string
   prefix_len: number
+  netmask_prefix: number
   alias: string
   pool_type: string
   status: string

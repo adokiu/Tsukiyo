@@ -14,10 +14,11 @@ interface SelectProps {
   placeholder?: string
   disabled?: boolean
   editable?: boolean
+  emptyText?: string
   onChange: (value: string | number) => void
 }
 
-export function Select({ value, options, placeholder = '请选择', disabled = false, editable = false, onChange }: SelectProps) {
+export function Select({ value, options, placeholder = '请选择', disabled = false, editable = false, emptyText, onChange }: SelectProps) {
   const [open, setOpen] = useState(false)
   const [inputValue, setInputValue] = useState<string>('')
   const ref = useRef<HTMLDivElement>(null)
@@ -117,22 +118,26 @@ export function Select({ value, options, placeholder = '请选择', disabled = f
       {open && createPortal(
         <div ref={dropdownRef} className="select__dropdown" role="listbox" style={dropdownStyle}>
           <div className="select__list">
-            {options.map((opt) => (
-              <div
-                key={opt.value}
-                role="option"
-                aria-selected={value === opt.value}
-                className={`select__option ${value === opt.value ? 'select__option--active' : ''}`}
-                onClick={() => {
-                  onChange(opt.value)
-                  setInputValue(String(opt.label))
-                  setOpen(false)
-                }}
-              >
-                <span>{opt.label}</span>
-                {value === opt.value && <Check size={16} />}
-              </div>
-            ))}
+            {options.length === 0 ? (
+              <div className="select__empty">{emptyText || '无选项'}</div>
+            ) : (
+              options.map((opt) => (
+                <div
+                  key={opt.value}
+                  role="option"
+                  aria-selected={value === opt.value}
+                  className={`select__option ${value === opt.value ? 'select__option--active' : ''}`}
+                  onClick={() => {
+                    onChange(opt.value)
+                    setInputValue(String(opt.label))
+                    setOpen(false)
+                  }}
+                >
+                  <span>{opt.label}</span>
+                  {value === opt.value && <Check size={16} />}
+                </div>
+              ))
+            )}
           </div>
         </div>,
         document.body

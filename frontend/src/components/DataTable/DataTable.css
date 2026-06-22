@@ -33,7 +33,7 @@
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  table-layout: auto;
+  table-layout: fixed;
 }
 
 .data-table th {
@@ -50,6 +50,8 @@
   position: sticky;
   top: 0;
   z-index: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .data-table td {
@@ -63,6 +65,13 @@
   height: 48px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.data-table td > * {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .data-table tbody tr {
@@ -122,15 +131,15 @@
 }
 
 .data-table-tag--online {
-  background: #e6f7ed;
+  background: rgba(22, 163, 74, 0.12);
   color: #16a34a;
-  border-color: #bbf7d0;
+  border-color: rgba(22, 163, 74, 0.25);
 }
 
 .data-table-tag--offline {
-  background: #fef2f2;
+  background: rgba(220, 38, 38, 0.12);
   color: #dc2626;
-  border-color: #fecaca;
+  border-color: rgba(220, 38, 38, 0.25);
 }
 
 .ip-cell {
@@ -296,7 +305,6 @@
   align-items: center;
   justify-content: space-between;
   padding: 12px 24px;
-  border-top: 1px solid var(--color-gray-200);
   gap: 16px;
   flex-wrap: wrap;
 }
@@ -420,4 +428,20 @@
 
 .data-table tbody tr:hover .data-table__td--sticky-right {
   background: var(--color-gray-50);
+}
+
+.action-menu {
+  transform-origin: top right;
+  animation: action-menu-in 0.15s ease-out;
+}
+
+@keyframes action-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.92) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }

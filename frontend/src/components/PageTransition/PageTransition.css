@@ -1,0 +1,50 @@
+.page-transition__content {
+  animation: page-fade-in 0.25s ease;
+}
+
+.page-transition__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 64px 16px;
+  color: var(--color-gray-400);
+  font-size: 14px;
+  animation: page-fade-in 0.2s ease;
+}
+
+.page-transition__spinner {
+  animation: dt-spin 0.8s linear infinite;
+}
+
+.page-transition__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 64px 16px;
+  color: var(--color-gray-400);
+  animation: page-fade-in 0.2s ease;
+}
+
+.page-transition__empty-text {
+  font-size: 14px;
+  margin-top: 12px;
+}
+
+@keyframes page-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes dt-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

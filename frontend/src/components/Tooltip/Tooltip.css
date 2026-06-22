@@ -1,0 +1,50 @@
+.tooltip-trigger {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 9999;
+  transform: translate(-50%, -100%);
+  padding: 6px 10px;
+  background: var(--color-gray-900);
+  color: var(--color-gray-50);
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: 6px;
+  white-space: nowrap;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  animation: tooltip-fade 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.tooltip--top {
+  transform: translate(-50%, -100%);
+}
+
+.tooltip--bottom {
+  transform: translate(-50%, 0);
+}
+
+.tooltip--left {
+  transform: translate(-100%, -50%);
+}
+
+.tooltip--right {
+  transform: translate(0, -50%);
+}
+
+@keyframes tooltip-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

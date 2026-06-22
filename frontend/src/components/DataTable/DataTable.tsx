@@ -111,7 +111,7 @@ export function DataTable<T>({
               {columns.map((col) => (
                 <th
                   key={col.key}
-                  style={col.width ? { minWidth: col.width } : undefined}
+                  style={col.width ? { width: col.width, minWidth: col.width } : undefined}
                   className={`${col.sortable ? 'data-table__th--sortable' : ''} ${col.key === 'action' ? 'data-table__th--sticky-right' : ''}`}
                   onClick={col.sortable && onSortChange ? () => {
                     if (sort?.field === col.key) {

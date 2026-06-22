@@ -8,8 +8,13 @@
   font-family: inherit;
   font-weight: 500;
   white-space: nowrap;
+  flex-shrink: 0;
   transition: all 0.15s ease;
   user-select: none;
+}
+
+.btn > * {
+  flex-shrink: 0;
 }
 
 .btn:disabled {
@@ -17,9 +22,9 @@
   cursor: not-allowed;
 }
 
-.btn--sm { padding: 5px 12px; font-size: 13px; border-radius: 6px; }
-.btn--md { padding: 8px 16px; font-size: 14px; }
-.btn--lg { padding: 10px 20px; font-size: 15px; border-radius: 10px; }
+.btn--sm { padding: 5px 12px; font-size: 13px; border-radius: 6px; min-height: 30px; }
+.btn--md { padding: 8px 16px; font-size: 14px; min-height: 38px; }
+.btn--lg { padding: 10px 20px; font-size: 15px; border-radius: 10px; min-height: 42px; }
 
 .btn--primary {
   background: var(--color-black);

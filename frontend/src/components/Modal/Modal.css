@@ -80,3 +80,70 @@
   padding: 16px 24px;
   border-top: 1px solid var(--color-gray-200);
 }
+
+.modal-confirm__body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 16px;
+}
+
+.modal-confirm__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.modal-confirm__icon--danger {
+  background: var(--color-red-50);
+  color: #dc2626;
+}
+
+.modal-confirm__icon--primary {
+  background: var(--color-blue-50);
+  color: #2563eb;
+}
+
+.modal-confirm__message {
+  font-size: 14px;
+  color: var(--color-black);
+  line-height: 1.6;
+}
+
+.modal-confirm__input-section {
+  width: 100%;
+  text-align: left;
+}
+
+.modal-confirm__label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-black);
+  margin-bottom: 8px;
+}
+
+.modal-confirm__required {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.modal-confirm__input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--color-gray-300);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.modal-confirm__input:focus {
+  border-color: var(--color-black);
+}

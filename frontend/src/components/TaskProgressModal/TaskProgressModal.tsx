@@ -69,29 +69,47 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
     fetchTaskStatus()
     fetchExistingLogs()
 
-    // 连接 WebSocket
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${proto}//${window.location.host}/ws/tasks`
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
+    // 连接 WebSocket（带自动重连）
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let manualClose = false
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg.type === 'task_log' && msg.task_id === taskId) {
-          setLogs((prev) => [...prev, {
-            level: msg.level,
-            message: msg.message,
-            timestamp: msg.timestamp,
-          }])
-        } else if (msg.type === 'task_status' && msg.task_id === taskId) {
-          setStatus(msg.status)
-          if (msg.error) setError(msg.error)
+    const connectWS = () => {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const wsUrl = `${proto}//${window.location.host}/ws/tasks`
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'task_log' && msg.task_id === taskId) {
+            setLogs((prev) => [...prev, {
+              level: msg.level,
+              message: msg.message,
+              timestamp: msg.timestamp,
+            }])
+          } else if (msg.type === 'task_status' && msg.task_id === taskId) {
+            setStatus(msg.status)
+            if (msg.error) setError(msg.error)
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
+      }
+
+      ws.onclose = () => {
+        wsRef.current = null
+        if (!manualClose) {
+          reconnectTimer = setTimeout(connectWS, 3000)
+        }
+      }
+
+      ws.onerror = () => {
+        ws.close()
       }
     }
+
+    connectWS()
 
     // 如果任务还在运行，定时轮询状态作为兜底
     const pollInterval = setInterval(async () => {
@@ -106,6 +124,8 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
     }, 3000)
 
     return () => {
+      manualClose = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -126,32 +146,32 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-lg shadow-xl w-[600px] max-h-[80vh] flex flex-col">
+      <div className="bg-surface rounded-lg shadow-xl w-[600px] max-h-[80vh] flex flex-col">
         {/* 头部 */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-surface">
           <div className="flex items-center gap-2">
             {isRunning && <Loader2 size={18} className="text-blue-500 animate-spin" />}
             {isSuccess && <CheckCircle size={18} className="text-green-500" />}
             {isFailed && <XCircle size={18} className="text-red-500" />}
-            <h3 className="text-sm font-semibold text-black">
+            <h3 className="text-sm font-semibold text-primary">
               {typeLabels[taskType] || taskType} - 任务进度
             </h3>
           </div>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-600"
+            className="text-muted hover:text-secondary"
           >
             <X size={18} />
           </button>
         </div>
 
         {/* 状态信息 */}
-        <div className="px-5 py-3 border-b border-gray-100">
+        <div className="px-5 py-3 border-b border-surface-light">
           <div className="flex items-center gap-3 text-xs">
-            <span className="text-gray-500">任务 ID:</span>
-            <span className="font-mono text-gray-700">{taskId.substring(0, 8)}</span>
-            <span className="text-gray-300">|</span>
-            <span className="text-gray-500">状态:</span>
+            <span className="text-tertiary">任务 ID:</span>
+            <span className="font-mono text-secondary">{taskId.substring(0, 8)}</span>
+            <span className="text-muted">|</span>
+            <span className="text-tertiary">状态:</span>
             {isRunning && <span className="text-blue-600 font-medium">执行中</span>}
             {isSuccess && <span className="text-green-600 font-medium">已完成</span>}
             {isFailed && <span className="text-red-600 font-medium">失败</span>}
@@ -164,7 +184,7 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
         {/* 日志区域 */}
         <div className="flex-1 overflow-y-auto bg-gray-900 px-4 py-3" style={{ maxHeight: '400px' }}>
           {logs.length === 0 ? (
-            <div className="text-gray-500 text-xs">等待日志输出...</div>
+            <div className="text-tertiary text-xs">等待日志输出...</div>
           ) : (
             logs.map((log, i) => (
               <div
@@ -175,7 +195,7 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
                   'text-green-400'
                 }`}
               >
-                <span className="text-gray-500">
+                <span className="text-tertiary">
                   [{new Date(log.timestamp * 1000).toLocaleTimeString('zh-CN')}]
                 </span>
                 <span className="ml-2">{log.message}</span>
@@ -186,10 +206,10 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
         </div>
 
         {/* 底部 */}
-        <div className="flex justify-end px-5 py-3 border-t border-gray-200">
+        <div className="flex justify-end px-5 py-3 border-t border-surface">
           <button
             onClick={onClose}
-            className="text-sm px-4 py-1.5 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+            className="text-sm px-4 py-1.5 border border-surface-strong rounded-lg text-secondary hover:bg-surface-secondary"
           >
             {isRunning ? '关闭（任务继续执行）' : '关闭'}
           </button>
