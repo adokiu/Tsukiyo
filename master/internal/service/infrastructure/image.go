@@ -83,7 +83,7 @@ func (s *ImageService) RefreshImageCacheByNode(nodeID uuid.UUID) error {
 	return s.RefreshImageCache(baseURL, nodeArch)
 }
 
-// ImageInfo 镜像信息（含节点下载状态）
+// ImageInfo 镜像信息（含节点下载状态）- 用于远程镜像下载 tab
 type ImageInfo struct {
 	ID              string `json:"id"`    // image_key: alias|type|arch
 	Alias           string `json:"alias"` // 镜像别名, e.g. debian/forky/cloud
@@ -100,6 +100,31 @@ type ImageInfo struct {
 	TotalBytes      int64  `json:"total_bytes"`
 	SpeedBps        int64  `json:"speed_bps"`
 	Error           string `json:"download_error,omitempty"`
+}
+
+// InstalledImage 已安装镜像信息（agent上报，合并用户分类和别名）
+type InstalledImage struct {
+	ID           string  `json:"id"` // fingerprint|type
+	Fingerprint  string  `json:"fingerprint"`
+	Alias        string  `json:"alias"`        // incus alias
+	DisplayName  string  `json:"display_name"` // 用户自定义别名
+	Type         string  `json:"type"`         // container / virtual-machine
+	Architecture string  `json:"architecture"`
+	Size         int64   `json:"size"`
+	Description  string  `json:"description"`
+	ImageSource  string  `json:"image_source"` // spiritlhl / images / manual
+	UploadDate   string  `json:"upload_date"`
+	CategoryID   *string `json:"category_id"`
+	CategoryName string  `json:"category_name"`
+	InstallSSH   bool    `json:"install_ssh"`
+}
+
+// CategoryInfo 分类信息
+type CategoryInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ImageType string `json:"image_type"`
+	SortOrder int    `json:"sort_order"`
 }
 
 // streamsAPIResponse Incus streams API 响应结构
@@ -425,8 +450,8 @@ func (s *ImageService) RefreshImageCache(baseURL, nodeArch string) error {
 	return nil
 }
 
-// ListImages 获取镜像列表（从数据库缓存读取）
-func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filterDistro string, downloadedOnly bool) ([]ImageInfo, error) {
+// ListImages 获取远程镜像列表（用于下载 tab，从数据库缓存读取，支持搜索和分页）
+func (s *ImageService) ListImages(nodeID uuid.UUID, search string, filterType, filterArch, filterDistro string, downloadedOnly bool, page, perPage int) ([]ImageInfo, error) {
 	// 查询节点信息
 	var node models.Node
 	if err := db.DB.First(&node, "id = ?", nodeID).Error; err != nil {
@@ -448,9 +473,9 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 	// 获取镜像源 URL
 	baseURL := getStreamsBaseURL(&node, &siteConfig)
 
-	// 从数据库缓存读取镜像列表
+	// 从数据库缓存读取镜像列表（按 alias 排序确保顺序稳定）
 	var cached []models.ImageCache
-	if err := db.DB.Where("source_url = ?", baseURL).Find(&cached).Error; err != nil {
+	if err := db.DB.Where("source_url = ?", baseURL).Order("alias ASC, type ASC").Find(&cached).Error; err != nil {
 		return nil, fmt.Errorf("读取镜像缓存失败: %w", err)
 	}
 
@@ -459,7 +484,7 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 		if err := s.RefreshImageCache(baseURL, nodeArch); err != nil {
 			return nil, fmt.Errorf("刷新镜像缓存失败: %w", err)
 		}
-		if err := db.DB.Where("source_url = ?", baseURL).Find(&cached).Error; err != nil {
+		if err := db.DB.Where("source_url = ?", baseURL).Order("alias ASC, type ASC").Find(&cached).Error; err != nil {
 			return nil, fmt.Errorf("读取镜像缓存失败: %w", err)
 		}
 	}
@@ -494,17 +519,18 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 	}
 	statusMap := make(map[string]*mergedStatus)
 
-	// 从 DB 加载
+	// 从 DB 加载已安装镜像（按 image_key 格式匹配）
 	var nodeImages []models.NodeImage
 	db.DB.Where("node_id = ?", nodeID.String()).Find(&nodeImages)
 	for _, ni := range nodeImages {
+		imageKey := ni.Alias + "|" + ni.ImageType + "|" + ni.Architecture
 		switch ni.Status {
 		case "downloaded":
-			statusMap[ni.ImageID] = &mergedStatus{Downloaded: true, Stage: "done", Progress: 100}
+			statusMap[imageKey] = &mergedStatus{Downloaded: true, Stage: "done", Progress: 100}
 		case "downloading":
-			statusMap[ni.ImageID] = &mergedStatus{Stage: "downloading", Progress: 0}
+			statusMap[imageKey] = &mergedStatus{Stage: "downloading", Progress: 0}
 		case "error":
-			statusMap[ni.ImageID] = &mergedStatus{Stage: "error", Error: ni.Status}
+			statusMap[imageKey] = &mergedStatus{Stage: "error", Error: ni.Status}
 		}
 	}
 
@@ -529,12 +555,13 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 		if ni.Status != "downloaded" {
 			continue
 		}
-		if imageMap[ni.ImageID] {
+		imageKey := ni.Alias + "|" + ni.ImageType + "|" + ni.Architecture
+		if imageMap[imageKey] {
 			continue
 		}
 		// 从所有源的缓存中查找该镜像的元数据
 		var otherCache models.ImageCache
-		if err := db.DB.Where("image_key = ?", ni.ImageID).First(&otherCache).Error; err == nil {
+		if err := db.DB.Where("image_key = ?", imageKey).First(&otherCache).Error; err == nil {
 			images = append(images, ImageInfo{
 				ID:          otherCache.ImageKey,
 				Alias:       otherCache.Alias,
@@ -546,13 +573,27 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 				Description: otherCache.Description,
 				TotalBytes:  otherCache.TotalBytes,
 			})
-			imageMap[ni.ImageID] = true
+			imageMap[imageKey] = true
 		}
 	}
 
 	// 合并 + 过滤
 	result := make([]ImageInfo, 0, len(images))
 	for _, img := range images {
+		// 搜索：匹配 alias、name、distro、release、description
+		if search != "" {
+			matched := false
+			if strings.Contains(strings.ToLower(img.Alias), strings.ToLower(search)) ||
+				strings.Contains(strings.ToLower(img.Name), strings.ToLower(search)) ||
+				strings.Contains(strings.ToLower(img.Distro), strings.ToLower(search)) ||
+				strings.Contains(strings.ToLower(img.Release), strings.ToLower(search)) ||
+				strings.Contains(strings.ToLower(img.Description), strings.ToLower(search)) {
+				matched = true
+			}
+			if !matched {
+				continue
+			}
+		}
 		// 类型过滤
 		if filterType != "" {
 			ft := filterType
@@ -597,6 +638,248 @@ func (s *ImageService) ListImages(nodeID uuid.UUID, filterType, filterArch, filt
 		result = append(result, info)
 	}
 
+	// 分页（perPage <= 0 时返回全部）
+	if perPage > 0 {
+		offset := (page - 1) * perPage
+		if offset >= len(result) {
+			return []ImageInfo{}, nil
+		}
+		end := offset + perPage
+		if end > len(result) {
+			end = len(result)
+		}
+		result = result[offset:end]
+	}
+
+	return result, nil
+}
+
+// ListInstalledImages 获取节点已安装镜像列表（agent上报，合并用户分类和别名）
+func (s *ImageService) ListInstalledImages(nodeID uuid.UUID, imageType string) ([]InstalledImage, error) {
+	nodeStr := nodeID.String()
+
+	// 查询 node_images
+	var nodeImages []models.NodeImage
+	query := db.DB.Where("node_id = ?", nodeStr)
+	if imageType != "" {
+		query = query.Where("image_type = ?", imageType)
+	}
+	query.Order("alias ASC").Find(&nodeImages)
+
+	// 查询 node_image_aliases
+	var aliases []models.NodeImageAlias
+	aliasQuery := db.DB.Where("node_id = ?", nodeStr)
+	if imageType != "" {
+		aliasQuery = aliasQuery.Where("image_type = ?", imageType)
+	}
+	aliasQuery.Find(&aliases)
+
+	// 构建 alias map: fingerprint|type -> NodeImageAlias
+	aliasMap := make(map[string]*models.NodeImageAlias)
+	for i := range aliases {
+		key := aliases[i].Fingerprint + "|" + aliases[i].ImageType
+		aliasMap[key] = &aliases[i]
+	}
+
+	// 查询所有分类
+	var categories []models.NodeImageCategory
+	catQuery := db.DB.Where("node_id = ?", nodeStr)
+	if imageType != "" {
+		catQuery = catQuery.Where("image_type = ?", imageType)
+	}
+	catQuery.Order("sort_order ASC, name ASC").Find(&categories)
+
+	catMap := make(map[string]*models.NodeImageCategory)
+	for i := range categories {
+		catMap[categories[i].ID.String()] = &categories[i]
+	}
+
+	// 合并
+	result := make([]InstalledImage, 0, len(nodeImages))
+	for _, ni := range nodeImages {
+		img := InstalledImage{
+			ID:           ni.Fingerprint + "|" + ni.ImageType,
+			Fingerprint:  ni.Fingerprint,
+			Alias:        ni.Alias,
+			DisplayName:  ni.Alias,
+			Type:         ni.ImageType,
+			Architecture: ni.Architecture,
+			Size:         ni.SizeBytes,
+			Description:  ni.Description,
+			ImageSource:  ni.ImageSource,
+			UploadDate:   ni.UploadDate,
+		}
+
+		// 合并用户别名
+		key := ni.Fingerprint + "|" + ni.ImageType
+		if a, ok := aliasMap[key]; ok {
+			img.DisplayName = a.DisplayName
+			img.InstallSSH = a.InstallSSH
+			if a.CategoryID != nil {
+				catID := a.CategoryID.String()
+				img.CategoryID = &catID
+				if cat, ok := catMap[catID]; ok {
+					img.CategoryName = cat.Name
+				}
+			}
+		}
+
+		result = append(result, img)
+	}
+
+	return result, nil
+}
+
+// ListCategories 获取节点镜像分类列表
+func (s *ImageService) ListCategories(nodeID uuid.UUID, imageType string) ([]CategoryInfo, error) {
+	nodeStr := nodeID.String()
+
+	var categories []models.NodeImageCategory
+	query := db.DB.Where("node_id = ?", nodeStr)
+	if imageType != "" {
+		query = query.Where("image_type = ?", imageType)
+	}
+	query.Order("sort_order ASC, name ASC").Find(&categories)
+
+	result := make([]CategoryInfo, 0, len(categories))
+	for _, c := range categories {
+		result = append(result, CategoryInfo{
+			ID:        c.ID.String(),
+			Name:      c.Name,
+			ImageType: c.ImageType,
+			SortOrder: c.SortOrder,
+		})
+	}
+	return result, nil
+}
+
+// CreateCategory 创建镜像分类
+func (s *ImageService) CreateCategory(nodeID uuid.UUID, name, imageType string) (*CategoryInfo, error) {
+	nodeStr := nodeID.String()
+
+	cat := models.NodeImageCategory{
+		NodeID:    nodeStr,
+		Name:      name,
+		ImageType: imageType,
+	}
+	if err := db.DB.Create(&cat).Error; err != nil {
+		return nil, fmt.Errorf("创建分类失败: %w", err)
+	}
+
+	return &CategoryInfo{
+		ID:        cat.ID.String(),
+		Name:      cat.Name,
+		ImageType: cat.ImageType,
+		SortOrder: cat.SortOrder,
+	}, nil
+}
+
+// UpdateCategory 更新镜像分类
+func (s *ImageService) UpdateCategory(categoryID uuid.UUID, name string, sortOrder int) error {
+	updates := map[string]interface{}{}
+	if name != "" {
+		updates["name"] = name
+	}
+	updates["sort_order"] = sortOrder
+	return db.DB.Model(&models.NodeImageCategory{}).Where("id = ?", categoryID).Updates(updates).Error
+}
+
+// DeleteCategory 删除镜像分类
+func (s *ImageService) DeleteCategory(categoryID uuid.UUID) error {
+	return db.DB.Where("id = ?", categoryID).Delete(&models.NodeImageCategory{}).Error
+}
+
+// UpdateImageAlias 更新镜像别名（分类、显示名、install_ssh）
+// categoryName 非空时按名称查找或创建分类，categoryName 为空字符串时清除分类
+func (s *ImageService) UpdateImageAlias(nodeID uuid.UUID, fingerprint, imageType string, categoryID *uuid.UUID, categoryName *string, displayName string, installSSH *bool) error {
+	nodeStr := nodeID.String()
+
+	// 如果传了分类名称，查找或创建分类
+	if categoryName != nil && *categoryName != "" {
+		var cat models.NodeImageCategory
+		err := db.DB.Where("node_id = ? AND name = ? AND image_type = ?", nodeStr, *categoryName, imageType).First(&cat).Error
+		if err != nil {
+			// 创建新分类
+			cat = models.NodeImageCategory{
+				NodeID:    nodeStr,
+				Name:      *categoryName,
+				ImageType: imageType,
+			}
+			if err := db.DB.Create(&cat).Error; err != nil {
+				return fmt.Errorf("创建分类失败: %w", err)
+			}
+		}
+		catID := cat.ID
+		categoryID = &catID
+	} else if categoryName != nil && *categoryName == "" {
+		categoryID = nil
+	}
+
+	updates := map[string]interface{}{}
+	if categoryID != nil {
+		updates["category_id"] = *categoryID
+	} else {
+		updates["category_id"] = nil
+	}
+	if displayName != "" {
+		updates["display_name"] = displayName
+	}
+	if installSSH != nil {
+		updates["install_ssh"] = *installSSH
+	}
+
+	result := db.DB.Model(&models.NodeImageAlias{}).Where("node_id = ? AND fingerprint = ? AND image_type = ?", nodeStr, fingerprint, imageType).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		// 记录不存在，创建
+		alias := models.NodeImageAlias{
+			NodeID:      nodeStr,
+			Fingerprint: fingerprint,
+			ImageType:   imageType,
+			DisplayName: displayName,
+		}
+		if categoryID != nil {
+			alias.CategoryID = categoryID
+		}
+		if installSSH != nil {
+			alias.InstallSSH = *installSSH
+		}
+		return db.DB.Create(&alias).Error
+	}
+	return nil
+}
+
+// SyncNodeImages 触发 agent 同步镜像列表
+func (s *ImageService) SyncNodeImages(nodeID uuid.UUID) error {
+	if s.agentMgr == nil || !s.agentMgr.IsNodeConnected(nodeID) {
+		return service.ErrNodeNotConnected
+	}
+	taskID := uuid.New()
+	return s.agentMgr.SendTask(agent.TaskMessage{
+		NodeID: nodeID,
+		TaskID: taskID,
+		Type:   "sync_images",
+	})
+}
+
+// ListReinstallImages 获取重装系统可选镜像列表（按分类分组）
+func (s *ImageService) ListReinstallImages(nodeID uuid.UUID, imageType string) (map[string][]InstalledImage, error) {
+	images, err := s.ListInstalledImages(nodeID, imageType)
+	if err != nil {
+		return nil, err
+	}
+
+	// 按分类分组
+	result := make(map[string][]InstalledImage)
+	for _, img := range images {
+		catName := img.CategoryName
+		if catName == "" {
+			catName = "未分类"
+		}
+		result[catName] = append(result[catName], img)
+	}
 	return result, nil
 }
 
@@ -665,11 +948,11 @@ func (s *ImageService) DownloadImage(nodeID uuid.UUID, imageKey string, userID u
 	}
 	payloadBytes, _ := json.Marshal(taskPayload)
 
-	// DB 状态记录
+	// DB 状态记录（使用 image_key 作为临时标识，agent 同步后会更新为完整记录）
 	nodeIDStr := nodeID.String()
 	var ni models.NodeImage
-	if dbErr := db.DB.Where("node_id = ? AND image_id = ?", nodeIDStr, imageKey).First(&ni).Error; dbErr != nil {
-		db.DB.Create(&models.NodeImage{NodeID: nodeIDStr, ImageID: imageKey, Status: "downloading"})
+	if dbErr := db.DB.Where("node_id = ? AND alias = ? AND image_type = ?", nodeIDStr, alias, imageType).First(&ni).Error; dbErr != nil {
+		db.DB.Create(&models.NodeImage{NodeID: nodeIDStr, Alias: alias, ImageType: imageType, Status: "downloading"})
 	} else if ni.Status != "downloaded" {
 		db.DB.Model(&ni).Updates(map[string]interface{}{"status": "downloading", "updated_at": gorm.Expr("NOW()")})
 	}
@@ -697,8 +980,18 @@ func (s *ImageService) DownloadImage(nodeID uuid.UUID, imageKey string, userID u
 func (s *ImageService) GetImageProgress(nodeID uuid.UUID, imageKey string) (downloaded bool, stage string, progress int, downloadedBytes, totalBytes, speedBps int64, errMsg string) {
 	nodeIDStr := nodeID.String()
 
+	parts := strings.SplitN(imageKey, "|", 3)
+	alias := ""
+	if len(parts) > 0 {
+		alias = parts[0]
+	}
+	imgType := ""
+	if len(parts) > 1 {
+		imgType = parts[1]
+	}
+
 	var ni models.NodeImage
-	dbErr := db.DB.Where("node_id = ? AND image_id = ?", nodeIDStr, imageKey).First(&ni).Error
+	dbErr := db.DB.Where("node_id = ? AND alias = ? AND image_type = ?", nodeIDStr, alias, imgType).First(&ni).Error
 	downloaded = dbErr == nil && ni.Status == "downloaded"
 
 	if s.agentMgr != nil {
@@ -775,7 +1068,17 @@ func (s *ImageService) DeleteImage(nodeID uuid.UUID, imageKey string, userID uin
 	}
 
 	// 删除 DB 记录
-	db.DB.Where("node_id = ? AND image_id = ?", nodeID.String(), imageKey).Delete(&models.NodeImage{})
+	parts := strings.SplitN(imageKey, "|", 3)
+	alias := ""
+	if len(parts) > 0 {
+		alias = parts[0]
+	}
+	imgType := ""
+	if len(parts) > 1 {
+		imgType = parts[1]
+	}
+	db.DB.Where("node_id = ? AND alias = ? AND image_type = ?", nodeID.String(), alias, imgType).Delete(&models.NodeImage{})
+	db.DB.Where("node_id = ? AND alias = ? AND image_type = ?", nodeID.String(), alias, imgType).Delete(&models.NodeImageAlias{})
 
 	return &taskID, nil
 }

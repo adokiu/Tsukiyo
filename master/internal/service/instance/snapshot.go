@@ -76,6 +76,20 @@ func (s *SnapshotService) CreateSnapshot(instanceID uuid.UUID, req CreateSnapsho
 		return nil, err
 	}
 
+	// 状态检查
+	if instance.IsBusy() {
+		return nil, service.ErrInstanceBusy
+	}
+	if instance.IsBanned() {
+		return nil, service.ErrInstanceBanned
+	}
+	if instance.IsExpiredStatus() {
+		return nil, service.ErrInstanceExpired
+	}
+	if instance.Status != models.InstanceStatusRunning && instance.Status != models.InstanceStatusStopped {
+		return nil, service.ErrInstanceBusy
+	}
+
 	// 检查快照配额
 	var snapshotCount int64
 	db.DB.Model(&models.Snapshot{}).Where("instance_id = ?", instanceID).Count(&snapshotCount)
@@ -114,6 +128,20 @@ func (s *SnapshotService) RestoreSnapshot(instanceID uuid.UUID, snapshotName str
 			return nil, service.ErrInstanceNotFound
 		}
 		return nil, err
+	}
+
+	// 状态检查：恢复快照需要实例处于 stopped 状态
+	if instance.IsBusy() {
+		return nil, service.ErrInstanceBusy
+	}
+	if instance.IsBanned() {
+		return nil, service.ErrInstanceBanned
+	}
+	if instance.IsExpiredStatus() {
+		return nil, service.ErrInstanceExpired
+	}
+	if instance.Status != models.InstanceStatusStopped {
+		return nil, service.ErrInstanceBusy
 	}
 
 	var snapshot models.Snapshot
@@ -155,6 +183,20 @@ func (s *SnapshotService) DeleteSnapshot(instanceID uuid.UUID, snapshotName stri
 			return nil, service.ErrInstanceNotFound
 		}
 		return nil, err
+	}
+
+	// 状态检查
+	if instance.IsBusy() {
+		return nil, service.ErrInstanceBusy
+	}
+	if instance.IsBanned() {
+		return nil, service.ErrInstanceBanned
+	}
+	if instance.IsExpiredStatus() {
+		return nil, service.ErrInstanceExpired
+	}
+	if instance.Status != models.InstanceStatusRunning && instance.Status != models.InstanceStatusStopped {
+		return nil, service.ErrInstanceBusy
 	}
 
 	var snapshot models.Snapshot

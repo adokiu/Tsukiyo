@@ -44,14 +44,49 @@ func (s *NodeService) CreateNode(name string) (*models.Node, error) {
 	return &node, nil
 }
 
-// ListNodes 获取节点列表
-func (s *NodeService) ListNodes() ([]models.Node, error) {
-	var nodes []models.Node
-	if err := db.DB.Order("created_at DESC").Find(&nodes).Error; err != nil {
-		zap.L().Error("查询节点列表失败", zap.Error(err))
-		return nil, err
+// ListNodesRequest 获取节点列表请求
+type ListNodesRequest struct {
+	Page    int
+	PerPage int
+	Search  string
+	Filters map[string]string
+}
+
+// ListNodes 获取节点列表（支持分页/搜索/筛选）
+func (s *NodeService) ListNodes(req ListNodesRequest) ([]models.Node, int64, error) {
+	query := db.DB.Model(&models.Node{})
+
+	// 搜索：匹配 name、hostname、ip_address
+	if req.Search != "" {
+		search := "%" + req.Search + "%"
+		query = query.Where("name ILIKE ? OR hostname ILIKE ? OR ip_address ILIKE ?", search, search, search)
 	}
-	return nodes, nil
+
+	// 筛选
+	if v, ok := req.Filters["status"]; ok && v != "" {
+		query = query.Where("status = ?", v)
+	}
+	if v, ok := req.Filters["is_online"]; ok && v != "" {
+		if v == "true" {
+			query = query.Where("last_heartbeat > ?", time.Now().Add(-1*time.Minute))
+		} else if v == "false" {
+			query = query.Where("last_heartbeat <= ? OR last_heartbeat IS NULL", time.Now().Add(-1*time.Minute))
+		}
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		zap.L().Error("查询节点总数失败", zap.Error(err))
+		return nil, 0, err
+	}
+
+	var nodes []models.Node
+	offset := (req.Page - 1) * req.PerPage
+	if err := query.Order("created_at DESC").Limit(req.PerPage).Offset(offset).Find(&nodes).Error; err != nil {
+		zap.L().Error("查询节点列表失败", zap.Error(err))
+		return nil, 0, err
+	}
+	return nodes, total, nil
 }
 
 // GetNode 获取节点详情

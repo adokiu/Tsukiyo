@@ -21,8 +21,10 @@ func NewTaskService() *TaskService {
 type ListTasksRequest struct {
 	Page    int
 	PerPage int
+	Search  string
 	Status  string
 	NodeID  uuid.UUID
+	Filters map[string]string
 }
 
 // ListTasks 获取任务列表
@@ -33,6 +35,17 @@ func (s *TaskService) ListTasks(req ListTasksRequest) ([]models.Task, int64, err
 	}
 	if req.NodeID != uuid.Nil {
 		query = query.Where("node_id = ?", req.NodeID)
+	}
+
+	// 搜索：匹配 type
+	if req.Search != "" {
+		searchPattern := "%" + req.Search + "%"
+		query = query.Where("type ILIKE ? OR CAST(id AS TEXT) ILIKE ?", searchPattern, searchPattern)
+	}
+
+	// 筛选
+	if v, ok := req.Filters["type"]; ok && v != "" {
+		query = query.Where("type = ?", v)
 	}
 
 	var total int64

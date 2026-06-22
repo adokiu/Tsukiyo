@@ -50,4 +50,11 @@ var (
 	ErrStoragePoolNotFound        = &ServiceError{Message: "存储池不存在"}
 	ErrBridgeCIDROverlap          = &ServiceError{Message: "网桥 CIDR 与同节点其他网桥重叠"}
 	ErrEIPPoolCIDROverlap         = &ServiceError{Message: "EIP 池 CIDR 与同节点同 IP 版本其他池重叠"}
+	ErrDiskNotFound               = &ServiceError{Message: "数据盘不存在"}
+	ErrDiskShrinkNotSupported     = &ServiceError{Message: "磁盘不支持缩容"}
+	ErrInvalidResizeConfig        = &ServiceError{Message: "无效的配置调整参数"}
+	ErrDiskNameExists             = &ServiceError{Message: "实例下已存在同名数据盘"}
+	ErrInstanceBanned             = &ServiceError{Message: "实例已被封禁"}
+	ErrInstanceExpired            = &ServiceError{Message: "实例已过期"}
+	ErrVMResizeRequiresStop       = &ServiceError{Message: "虚拟机运行时无法调整内存，请先关机再操作"}
 )
