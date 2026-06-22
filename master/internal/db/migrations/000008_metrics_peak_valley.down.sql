@@ -1,0 +1,14 @@
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS cpu_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS cpu_min;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS mem_used_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS mem_used_min;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS disk_used_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS disk_used_min;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS disk_read_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS disk_write_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS net_in_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS net_in_min;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS net_out_max;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS net_out_min;
+ALTER TABLE instance_metrics DROP COLUMN IF EXISTS sample_count;
+DROP INDEX IF EXISTS idx_instance_metrics_instance_time;
