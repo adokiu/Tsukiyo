@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,21 +24,47 @@ import (
 
 // Collector 监控采集器
 type Collector struct {
-	cfg         *config.Config
-	wsClient    *ws.Client
-	incusClient *incus.Client
-	ctx         context.Context
-	cancel      context.CancelFunc
-	prevCPU     *cpuTimes
-	prevNet     map[string]netCounters
-	prevNetIO   *netIOCounters
-	prevNetTime time.Time
+	cfg                *config.Config
+	wsClient           *ws.Client
+	incusClient        *incus.Client
+	ctx                context.Context
+	cancel             context.CancelFunc
+	prevCPU            *cpuTimes
+	prevNet            map[string]netCounters
+	prevNetIO          *netIOCounters
+	prevNetTime        time.Time
+	prevInstanceNet    map[string]instanceNetCounters
+	prevInstanceCPU    map[string]instanceCPUCounters
+	prevInstanceDiskIO map[string]instanceDiskIOCounters
+	prevCollectTime    time.Time
+}
+
+// instanceCPUCounters 实例CPU计数器（用于计算CPU使用率）
+type instanceCPUCounters struct {
+	cpuNanos int64
+	time     time.Time
+}
+
+// instanceDiskIOCounters 实例磁盘IO计数器（用于计算速率和IOPS）
+type instanceDiskIOCounters struct {
+	readBytes  int64
+	writeBytes int64
+	readOps    int64
+	writeOps   int64
+	time       time.Time
 }
 
 // netIOCounters 网络IO总计数器
 type netIOCounters struct {
 	rxBytes uint64
 	txBytes uint64
+}
+
+// instanceNetCounters 实例网络计数器（用于计算速率）
+type instanceNetCounters struct {
+	rxBytes int64
+	txBytes int64
+	time    time.Time
 }
 
 // cpuTimes CPU 时间统计
@@ -57,12 +84,15 @@ type netCounters struct {
 func NewCollector(cfg *config.Config, wsClient *ws.Client, incusClient *incus.Client) *Collector {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Collector{
-		cfg:         cfg,
-		wsClient:    wsClient,
-		incusClient: incusClient,
-		ctx:         ctx,
-		cancel:      cancel,
-		prevNet:     make(map[string]netCounters),
+		cfg:                cfg,
+		wsClient:           wsClient,
+		incusClient:        incusClient,
+		ctx:                ctx,
+		cancel:             cancel,
+		prevNet:            make(map[string]netCounters),
+		prevInstanceNet:    make(map[string]instanceNetCounters),
+		prevInstanceCPU:    make(map[string]instanceCPUCounters),
+		prevInstanceDiskIO: make(map[string]instanceDiskIOCounters),
 	}
 }
 
@@ -163,7 +193,20 @@ func (c *Collector) collectAndReport() {
 	runningCount := 0
 
 	for _, inst := range instances {
-		metric := c.collectInstanceMetrics(inst.Name)
+		// 从实例配置或设备配置解析磁盘总量
+		// Incus 磁盘限制可能在 config["limits.disk"] 或 devices["root"]["size"] 中
+		var diskTotalMB int64
+		if diskLimit, ok := inst.Config["limits.disk"]; ok && diskLimit != "" {
+			diskTotalMB = parseDiskLimitMB(diskLimit)
+		}
+		if diskTotalMB == 0 {
+			if rootDev, ok := inst.Devices["root"].(map[string]interface{}); ok {
+				if size, ok := rootDev["size"].(string); ok && size != "" {
+					diskTotalMB = parseDiskLimitMB(size)
+				}
+			}
+		}
+		metric := c.collectInstanceMetrics(inst.Name, diskTotalMB)
 		if metric != nil {
 			metrics = append(metrics, *metric)
 		}
@@ -198,30 +241,360 @@ func (c *Collector) collectAndReport() {
 }
 
 // collectInstanceMetrics 采集单个实例指标
-func (c *Collector) collectInstanceMetrics(name string) *ws.InstanceMetricPayload {
+func (c *Collector) collectInstanceMetrics(name string, diskTotalMB int64) *ws.InstanceMetricPayload {
 	m, err := c.incusClient.GetInstanceMetrics(name)
 	if err != nil {
 		return nil
 	}
 
+	// CPU 使用率：基于两次采集的 CPU 纳秒差值 / 经过时间(纳秒) * 100
+	now := time.Now()
 	var cpuPercent float64
-	if m.MemTotal > 0 {
-		cpuPercent = float64(m.CPUUsage) / float64(m.MemTotal) * 100
-		if cpuPercent > 100 {
-			cpuPercent = 100
+	if prev, exists := c.prevInstanceCPU[name]; exists {
+		elapsed := now.Sub(prev.time).Nanoseconds()
+		if elapsed > 0 {
+			cpuDelta := m.CPUUsage - prev.cpuNanos
+			if cpuDelta > 0 {
+				cpuPercent = float64(cpuDelta) / float64(elapsed) * 100
+				if cpuPercent > 100 {
+					cpuPercent = 100
+				}
+			}
 		}
+	}
+	c.prevInstanceCPU[name] = instanceCPUCounters{
+		cpuNanos: m.CPUUsage,
+		time:     now,
+	}
+
+	// 计算网络总流量（所有非 lo 接口的总和）
+	var netInTotal, netOutTotal int64
+	for iface, stat := range m.NetworkStats {
+		if iface == "lo" {
+			continue
+		}
+		netInTotal += stat.BytesReceived
+		netOutTotal += stat.BytesSent
+	}
+
+	// 计算网络速率（基于上次采集的差值）
+	var netInBps, netOutBps int64
+	if prev, exists := c.prevInstanceNet[name]; exists {
+		elapsed := now.Sub(prev.time).Seconds()
+		if elapsed > 0 {
+			// 计数器正常递增
+			if netInTotal >= prev.rxBytes {
+				netInBps = int64(float64(netInTotal-prev.rxBytes) / elapsed)
+			}
+			if netOutTotal >= prev.txBytes {
+				netOutBps = int64(float64(netOutTotal-prev.txBytes) / elapsed)
+			}
+		}
+	}
+	c.prevInstanceNet[name] = instanceNetCounters{
+		rxBytes: netInTotal,
+		txBytes: netOutTotal,
+		time:    now,
+	}
+
+	// 磁盘使用量（rootfs）- Incus state API 返回 bytes，转换为 MB
+	var diskUsed, diskTotal int64
+	if usage, ok := m.DiskUsage["root"]; ok {
+		diskUsed = usage / 1024 / 1024 // bytes -> MB
+	}
+	diskTotal = diskTotalMB
+
+	// 磁盘 IO 采集：通过 cgroup 读取容器所有进程的 IO 统计
+	// /proc/<pid>/io 只统计 init 进程自身的 IO，不包括子进程（如 fio）
+	// cgroup IO 统计包含容器内所有进程
+	var diskReadBps, diskWriteBps, diskReadIops, diskWriteIops int64
+	rb, wb, sr, sw := readContainerCgroupIO(name, m.PID)
+	if prev, exists := c.prevInstanceDiskIO[name]; exists {
+		elapsed := now.Sub(prev.time).Seconds()
+		if elapsed > 0 {
+			if rb >= prev.readBytes {
+				diskReadBps = int64(float64(rb-prev.readBytes) / elapsed)
+			}
+			if wb >= prev.writeBytes {
+				diskWriteBps = int64(float64(wb-prev.writeBytes) / elapsed)
+			}
+			if sr >= prev.readOps {
+				diskReadIops = int64(float64(sr-prev.readOps) / elapsed)
+			}
+			if sw >= prev.writeOps {
+				diskWriteIops = int64(float64(sw-prev.writeOps) / elapsed)
+			}
+		}
+	}
+	c.prevInstanceDiskIO[name] = instanceDiskIOCounters{
+		readBytes:  rb,
+		writeBytes: wb,
+		readOps:    sr,
+		writeOps:   sw,
+		time:       now,
 	}
 
 	return &ws.InstanceMetricPayload{
-		InstanceID: name,
-		CPUPercent: math.Round(cpuPercent*100) / 100,
-		MemUsed:    m.MemUsage / 1024 / 1024, // bytes -> MB
-		MemTotal:   m.MemTotal / 1024 / 1024,
-		DiskRead:   0,
-		DiskWrite:  0,
-		NetIn:      0,
-		NetOut:     0,
+		InstanceID:    name,
+		CPUPercent:    math.Round(cpuPercent*100) / 100,
+		MemUsed:       m.MemUsage / 1024 / 1024, // bytes -> MB
+		MemTotal:      m.MemTotal / 1024 / 1024,
+		DiskUsed:      diskUsed,
+		DiskTotal:     diskTotal,
+		DiskReadBps:   diskReadBps,
+		DiskWriteBps:  diskWriteBps,
+		DiskReadIops:  diskReadIops,
+		DiskWriteIops: diskWriteIops,
+		NetIn:         netInBps,
+		NetOut:        netOutBps,
+		NetInTotal:    netInTotal,
+		NetOutTotal:   netOutTotal,
 	}
+}
+
+// readProcIO 读取 /proc/<pid>/io 获取进程磁盘 IO 统计
+// 返回 (readBytes, writeBytes, syscr, syscw)
+// read_bytes: 实际从磁盘读取的字节数
+// write_bytes: 实际写入磁盘的字节数
+// syscr: 读系统调用次数（近似读 IOPS）
+// syscw: 写系统调用次数（近似写 IOPS）
+func readProcIO(pid int) (int64, int64, int64, int64) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/io", pid))
+	if err != nil {
+		return 0, 0, 0, 0
+	}
+	defer f.Close()
+
+	var rb, wb, sr, sw int64
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			continue
+		}
+		val, _ := strconv.ParseInt(parts[1], 10, 64)
+		switch parts[0] {
+		case "read_bytes:":
+			rb = val
+		case "write_bytes:":
+			wb = val
+		case "syscr:":
+			sr = val
+		case "syscw:":
+			sw = val
+		}
+	}
+	return rb, wb, sr, sw
+}
+
+// readContainerCgroupIO 读取容器级 IO 统计
+// 返回 (readBytes, writeBytes, readOps, writeOps)
+// 优先使用 cgroup v2 io.stat（内核级精确统计，包含容器内所有进程）
+// 回退到 cgroup v1 blkio.throttle.io_service_bytes_recursive
+// 最后回退到累加 cgroup.procs 中所有 PID 的 /proc/<pid>/io
+func readContainerCgroupIO(name string, pid int) (int64, int64, int64, int64) {
+	// 查找容器 cgroup v2 路径
+	cgroupDirs := []string{
+		fmt.Sprintf("/sys/fs/cgroup/lxc.payload.%s", name),
+	}
+
+	// 通过 init 进程的 cgroup 路径查找
+	if pid > 0 {
+		if cgroupPath, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
+			lines := strings.Split(string(cgroupPath), "\n")
+			for _, line := range lines {
+				parts := strings.SplitN(line, ":", 3)
+				if len(parts) == 3 && (parts[1] == "" || parts[1] == "0") {
+					cgroupSubpath := strings.TrimSpace(parts[2])
+					if cgroupSubpath != "" && cgroupSubpath != "/" {
+						cgroupDirs = append([]string{fmt.Sprintf("/sys/fs/cgroup%s", cgroupSubpath)}, cgroupDirs...)
+					}
+				}
+			}
+		}
+	}
+
+	// 优先尝试 cgroup v2 io.stat
+	for _, dir := range cgroupDirs {
+		ioStatPath := filepath.Join(dir, "io.stat")
+		data, err := os.ReadFile(ioStatPath)
+		if err != nil {
+			continue
+		}
+		if rb, wb, rios, wios := parseCgroupV2IOStat(data); rb > 0 || wb > 0 || rios > 0 || wios > 0 {
+			return rb, wb, rios, wios
+		}
+	}
+
+	// 回退到 cgroup v1 blkio 统计
+	cgroupV1Dirs := []string{
+		fmt.Sprintf("/sys/fs/cgroup/blkio/lxc/%s", name),
+		fmt.Sprintf("/sys/fs/cgroup/blkio/lxc.payload.%s", name),
+	}
+	if pid > 0 {
+		if cgroupPath, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
+			lines := strings.Split(string(cgroupPath), "\n")
+			for _, line := range lines {
+				parts := strings.SplitN(line, ":", 3)
+				if len(parts) == 3 && parts[1] == "blkio" {
+					cgroupSubpath := strings.TrimSpace(parts[2])
+					if cgroupSubpath != "" && cgroupSubpath != "/" {
+						cgroupV1Dirs = append([]string{fmt.Sprintf("/sys/fs/cgroup/blkio%s", cgroupSubpath)}, cgroupV1Dirs...)
+					}
+				}
+			}
+		}
+	}
+	for _, dir := range cgroupV1Dirs {
+		// 尝试递归版本（包含子 cgroup）
+		for _, fname := range []string{"blkio.throttle.io_service_bytes_recursive", "blkio.throttle.io_service_bytes"} {
+			path := filepath.Join(dir, fname)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			if rb, wb := parseCgroupV1BlkIO(data); rb > 0 || wb > 0 {
+				// cgroup v1 blkio 没有直接的 IOPS 统计，用 rbytes/wbytes 除以块大小估算
+				// 但更准确的方式是读取 blkio.throttle.io_serviced_recursive
+				rios, wios := readCgroupV1BlkIOServiced(dir)
+				return rb, wb, rios, wios
+			}
+		}
+	}
+
+	// 最终回退：累加 cgroup.procs 中所有 PID 的 /proc/<pid>/io
+	for _, dir := range cgroupDirs {
+		procsPath := filepath.Join(dir, "cgroup.procs")
+		data, err := os.ReadFile(procsPath)
+		if err != nil {
+			continue
+		}
+		return sumProcIOs(data)
+	}
+
+	// 最后回退到 /proc/<pid>/io（仅 init 进程）
+	if pid > 0 {
+		return readProcIO(pid)
+	}
+	return 0, 0, 0, 0
+}
+
+// parseCgroupV2IOStat 解析 cgroup v2 io.stat 文件
+// 格式示例:
+// 8:0 rbytes=1234567 wbytes=987654 rios=100 wios=50
+// 8:16 rbytes=0 wbytes=0 rios=0 wios=0
+func parseCgroupV2IOStat(data []byte) (readBytes, writeBytes, readOps, writeOps int64) {
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// 跳过设备号字段（如 "8:0"）
+		for _, field := range fields[1:] {
+			parts := strings.SplitN(field, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			val, _ := strconv.ParseInt(parts[1], 10, 64)
+			switch parts[0] {
+			case "rbytes":
+				readBytes += val
+			case "wbytes":
+				writeBytes += val
+			case "rios":
+				readOps += val
+			case "wios":
+				writeOps += val
+			}
+		}
+	}
+	return
+}
+
+// parseCgroupV1BlkIO 解析 cgroup v1 blkio.throttle.io_service_bytes 文件
+// 格式示例:
+// 8:0 Read 1234567
+// 8:0 Write 987654
+// 8:0 Sync 1234567
+// 8:0 Async 0
+// Total 2222221
+func parseCgroupV1BlkIO(data []byte) (readBytes, writeBytes int64) {
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		// 跳过 "Total" 行
+		if fields[0] == "Total" {
+			continue
+		}
+		val, _ := strconv.ParseInt(fields[2], 10, 64)
+		switch fields[1] {
+		case "Read":
+			readBytes += val
+		case "Write":
+			writeBytes += val
+		}
+	}
+	return
+}
+
+// readCgroupV1BlkIOServiced 读取 cgroup v1 blkio.throttle.io_serviced 获取 IOPS 计数
+func readCgroupV1BlkIOServiced(dir string) (readOps, writeOps int64) {
+	for _, fname := range []string{"blkio.throttle.io_serviced_recursive", "blkio.throttle.io_serviced"} {
+		path := filepath.Join(dir, fname)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := scanner.Text()
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			if fields[0] == "Total" {
+				continue
+			}
+			val, _ := strconv.ParseInt(fields[2], 10, 64)
+			switch fields[1] {
+			case "Read":
+				readOps += val
+			case "Write":
+				writeOps += val
+			}
+		}
+		return
+	}
+	return 0, 0
+}
+
+// sumProcIOs 根据 PID 列表累加所有进程的 /proc/<pid>/io
+func sumProcIOs(pidData []byte) (int64, int64, int64, int64) {
+	var totalRb, totalWb, totalSr, totalSw int64
+	scanner := bufio.NewScanner(strings.NewReader(string(pidData)))
+	for scanner.Scan() {
+		pidStr := strings.TrimSpace(scanner.Text())
+		if pidStr == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil || pid <= 0 {
+			continue
+		}
+		rb, wb, sr, sw := readProcIO(pid)
+		totalRb += rb
+		totalWb += wb
+		totalSr += sr
+		totalSw += sw
+	}
+	return totalRb, totalWb, totalSr, totalSw
 }
 
 // sendHeartbeat 发送心跳
@@ -530,4 +903,49 @@ type NetworkInterface struct {
 	Name         string   `json:"name"`
 	IPv4s        []string `json:"ipv4s"`
 	IPv6Prefixes []string `json:"ipv6_prefixes"`
+}
+
+// parseDiskLimitMB 解析 Incus limits.disk 配置值，返回 MB
+// 支持格式: "10GB", "512MB", "1TB", "1024" (默认 bytes)
+func parseDiskLimitMB(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	// 提取数字部分和单位部分
+	var numStr string
+	var unit string
+	for i, r := range s {
+		if (r >= '0' && r <= '9') || r == '.' {
+			numStr = s[:i+1]
+		} else {
+			unit = strings.ToLower(strings.TrimSpace(s[i:]))
+			break
+		}
+	}
+
+	if numStr == "" {
+		return 0
+	}
+
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0
+	}
+
+	switch unit {
+	case "tb", "tib":
+		return int64(num * 1024 * 1024)
+	case "gb", "gib":
+		return int64(num * 1024)
+	case "mb", "mib":
+		return int64(num)
+	case "kb", "kib":
+		return int64(num / 1024)
+	case "b", "":
+		return int64(num / 1024 / 1024)
+	default:
+		return int64(num / 1024 / 1024)
+	}
 }

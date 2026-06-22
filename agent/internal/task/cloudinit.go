@@ -1,11 +1,35 @@
 package task
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
+
+// motdBase64 是 Tsukiyo ASCII art 的 base64 编码
+// 原始内容包含 ANSI 256色转义序列和换行，用 base64 编码避免 YAML/shell 转义问题
+var motdBase64 = func() string {
+	const esc = "\033"
+	art := esc + "[38;5;196m        ,----,                                                              " + esc + "[0m\n" +
+		esc + "[38;5;202m      ,/   .`|                                                              " + esc + "[0m\n" +
+		esc + "[38;5;208m    ,`   .'  :                              ,-.                             " + esc + "[0m\n" +
+		esc + "[38;5;214m  ;    ;     /                          ,--/ /|   ,--,                      " + esc + "[0m\n" +
+		esc + "[38;5;220m.'___,/    ,'                    ,--, ,--. :/ | ,--.'|              ,---.   " + esc + "[0m\n" +
+		esc + "[38;5;226m|    :     |  .--.--.          ,'_ /| :  : ' /  |  |,              '   ,'\\  " + esc + "[0m\n" +
+		esc + "[38;5;154m;    |.';  ; /  /    '    .--. |  | : |  '  /   `--'_        .--, /   /   | " + esc + "[0m\n" +
+		esc + "[38;5;118m`----'  |  ||  :  /`./  ,'_ /| :  . | '  |   \\  '  | |  , ' , ' :'   | |: | " + esc + "[0m\n" +
+		esc + "[38;5;82m    '   :  ;|  :  ;_    |  ' | |  . . |  |   \\  '  : | /___/ \\: |'   | .; : " + esc + "[0m\n" +
+		esc + "[38;5;46m    |   |  ' \\  \\    `. |  | : ;  ; | |  | ' \\ `  : |__.  \\  ' ||   :    | " + esc + "[0m\n" +
+		esc + "[38;5;47m    '   :  |  `----.   \\:  | : ;  ; | |  | |. \\ |  | '.'|\\  ;   : \\   \\  /  " + esc + "[0m\n" +
+		esc + "[38;5;48m    ;   |.'  /  /`--'  /'  :  `--'   `'  : |--' |  |    ; \\  \\  ;  `----'   " + esc + "[0m\n" +
+		esc + "[38;5;49m    '---'   '--'.     / :  ,      .-./;  |,'    ;  :    ; \\  \\  :  `----'    " + esc + "[0m\n" +
+		esc + "[38;5;50m              `--'---'   `--`----'    '--'      |  ,   /   :  \\  \\          " + esc + "[0m\n" +
+		esc + "[38;5;51m                                                 ---`-'     \\  ' ;          " + esc + "[0m\n" +
+		esc + "[38;5;87m                                                             `--`           " + esc + "[0m\n"
+	return base64.StdEncoding.EncodeToString([]byte(art))
+}()
 
 // buildCloudInitNetworkConfig 生成 cloud-init network-config YAML，配置静态 IP
 func buildCloudInitNetworkConfig(internalIPv4, gatewayV4, ipv4CIDR string) string {
@@ -69,22 +93,8 @@ func buildCloudInitUserData(password, publicKey, loginMethod, internalIPv4, gate
 	lines = append(lines, "      [ -n \"$TSUKIYO_MOTD_SHOWN\" ] && return 0")
 	lines = append(lines, "      export TSUKIYO_MOTD_SHOWN=1")
 	lines = append(lines, "      echo")
-	lines = append(lines, "      printf \"\\033[38;5;196m        ,----,                                                              \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;202m      ,/   .\\`|                                                              \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;208m    ,\\`   .'  :                              ,-.                             \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;214m  ;    ;     /                          ,--/ /|   ,--,                      \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;220m.'___,/    ,'                    ,--, ,--. :/ | ,--.'|              ,---.   \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;226m|    :     |  .--.--.          ,'_ /| :  : ' /  |  |,              '   ,'\\\\  \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;154m;    |.';  ; /  /    '    .--. |  | : |  '  /   \\`--'_        .--, /   /   | \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;118m\\`----'  |  ||  :  /\\`./  ,'_ /| :  . | '  |   \\\\  '  | |  , ' , ' :'   | |: | \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;82m    '   :  ;|  :  ;_    |  ' | |  . . |  |   \\\\  '  : | /___/ \\: |'   | .; : \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;46m    |   |  ' \\\\  \\\\    \\`. |  | : ;  ; | |  | ' \\\\ \\`  : |__.  \\\\  ' ||   :    | \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;47m    '   :  |  \\`----.   \\\\:  | : ;  ; | |  | |. \\\\ |  | '.'|\\\\  ;   : \\\\   \\\\  /  \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;48m    ;   |.'  /  /\\`--'  /'  :  \\`--'   \\`'  : |--' |  |    ; \\\\  \\\\  ;  \\`----'   \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;49m    '---'   '--'.     / :  ,      .-./;  |,'    ;  :    ; \\\\  \\\\  :  \\`----'    \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;50m              \\`--'---'   \\`--\\`----'    '--'      |  ,   /   :  \\\\  \\\\          \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;51m                                                 ---\\`-'     \\\\  ' ;          \\033[0m\\n\"")
-	lines = append(lines, "      printf \"\\033[38;5;87m                                                             \\`--\\`           \\033[0m\\n\"")
+	// ASCII art 用 base64 编码，避免 YAML literal block 和 shell 中的转义问题
+	lines = append(lines, "      echo \""+motdBase64+"\" | base64 -d")
 	lines = append(lines, "      echo")
 	lines = append(lines, "      echo \"Tsukiyo Virtualization System By aDokiu\"")
 	lines = append(lines, "      echo \"Github       : https://github.com/adokiu/Tsukiyo\"")
@@ -105,22 +115,7 @@ func buildMotdScript() string {
 		"[ -n \"$TSUKIYO_MOTD_SHOWN\" ] && return 0\n" +
 		"export TSUKIYO_MOTD_SHOWN=1\n" +
 		"echo\n" +
-		"printf \"\\033[38;5;196m        ,----,                                                              \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;202m      ,/   .`|                                                              \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;208m    ,`   .'  :                              ,-.                             \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;214m  ;    ;     /                          ,--/ /|   ,--,                      \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;220m.'___,/    ,'                    ,--, ,--. :/ | ,--.'|              ,---.   \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;226m|    :     |  .--.--.          ,'_ /| :  : ' /  |  |,              '   ,'\\   \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;154m;    |.';  ; /  /    '    .--. |  | : |  '  /   `--'_        .--, /   /   | \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;118m`----'  |  ||  :  /`./  ,'_ /| :  . | '  |   \\\\  '  | |  , ' , ' :'   | |: | \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;82m    '   :  ;|  :  ;_    |  ' | |  . . |  |   \\\\  '  : | /___/ \\: |'   | .; : \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;46m    |   |  ' \\\\  \\\\    `. |  | : ;  ; | |  | ' \\\\ `  : |__.  \\\\  ' ||   :    | \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;47m    '   :  |  `----.   \\:  | : ;  ; | |  | |. \\\\ |  | '.'|\\\\  ;   : \\\\   \\\\  /  \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;48m    ;   |.'  /  /`--'  /'  :  `--'   `'  : |--' |  |    ; \\\\  \\\\  ;  `----'   \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;49m    '---'   '--'.     / :  ,      .-./;  |,'    ;  :    ; \\\\  \\\\  :  `----'    \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;50m              `--'---'   `--`----'    '--'      |  ,   /   :  \\\\  \\\\          \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;51m                                                 ---`-'     \\\\  ' ;          \\033[0m\\n\"\n" +
-		"printf \"\\033[38;5;87m                                                             `--`           \\033[0m\\n\"\n" +
+		"echo \"" + motdBase64 + "\" | base64 -d\n" +
 		"echo\n" +
 		"echo \"Tsukiyo Virtualization System By aDokiu\"\n" +
 		"echo \"Github       : https://github.com/adokiu/Tsukiyo\"\n" +
@@ -133,11 +128,10 @@ func buildMotdScript() string {
 }
 
 // isSpiritlhlSource 判断镜像源是否为 spiritlhl（预装 SSH）
-// imageSource 为空时默认为 spiritlhl（因为默认源已改为 spiritlhl）
 func isSpiritlhlSource(imageSource string) bool {
 	s := strings.TrimSpace(imageSource)
 	s = strings.TrimSuffix(s, ":")
-	if s == "" || s == "spiritlhl" {
+	if s == "spiritlhl" {
 		return true
 	}
 	return false

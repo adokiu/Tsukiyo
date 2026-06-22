@@ -12,6 +12,68 @@ import (
 	"go.uber.org/zap"
 )
 
+// injectMotdAndSSHConfig 配置 SSH 允许密码/root 登录并注入 motd，不安装 SSH。用于 VM/cloud 镜像（已预装 SSH）
+func injectMotdAndSSHConfig(instanceName, loginMethod string) error {
+	zap.L().Info("等待容器 exec 可用", zap.String("instance", instanceName))
+	for i := 0; i < 60; i++ {
+		if exec.Command("incus", "exec", instanceName, "--", "true").Run() == nil {
+			zap.L().Info("容器 exec 已可用", zap.String("instance", instanceName), zap.Int("wait_seconds", i))
+			break
+		}
+		if i == 59 {
+			return fmt.Errorf("容器 exec 60 秒内不可用")
+		}
+		if i == 0 || i%5 == 0 {
+			zap.L().Info("容器 exec 尚未就绪", zap.String("instance", instanceName), zap.Int("wait_seconds", i))
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	pwAuth := "no"
+	if loginMethod == "password" || loginMethod == "auto" || loginMethod == "" {
+		pwAuth = "yes"
+	}
+
+	script := `set -eu
+log() { echo "[tsukiyo-ssh-config] $*"; }
+
+log "配置 sshd 允许 root 登录和密码登录"
+if [ -f /etc/ssh/sshd_config ]; then
+    sed -i '/^PasswordAuthentication/d' /etc/ssh/sshd_config
+    sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config
+    sed -i '/^PubkeyAuthentication/d' /etc/ssh/sshd_config
+    sed -i '/^UsePAM/d' /etc/ssh/sshd_config
+    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+    echo 'PasswordAuthentication ` + pwAuth + `' >> /etc/ssh/sshd_config
+    echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config
+    echo 'UsePAM yes' >> /etc/ssh/sshd_config
+    log "sshd_config 已更新"
+else
+    log "WARNING: /etc/ssh/sshd_config 不存在，跳过 SSH 配置"
+fi
+
+log "重启 sshd 服务"
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+fi
+service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true
+
+log "清除旧 motd 并注入 Tsukiyo motd"
+rm -f /etc/motd
+touch /etc/motd
+rm -rf /etc/update-motd.d/* 2>/dev/null || true
+rm -f /etc/profile.d/*motd* 2>/dev/null || true
+` + buildMotdScript() + `
+log "motd 注入完成"
+`
+	if err := runIncusExecScript(instanceName, script); err != nil {
+		zap.L().Error("SSH 配置和 motd 注入失败", zap.String("instance", instanceName), zap.Error(err))
+		return err
+	}
+	zap.L().Info("SSH 配置和 motd 注入完成", zap.String("instance", instanceName))
+	return nil
+}
+
 // ensureSSHInContainer 通过 incus exec 安装、配置、启动 sshd
 func ensureSSHInContainer(instanceName, loginMethod, gatewayV4 string) error {
 	gw := gatewayV4

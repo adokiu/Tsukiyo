@@ -274,11 +274,18 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 			"path": "/",
 			"pool": req.StoragePool,
 			"type": "disk",
-			"size": fmt.Sprintf("%dGB", req.DiskGB),
+			"size": fmt.Sprintf("%dMB", req.DiskMB),
 		},
 	}
 	if req.StoragePool == "" {
 		devices["root"]["pool"] = "default"
+	}
+	// 磁盘 IO 限制（IOPS）设在 root 设备的 limits.read/limits.write 上
+	if req.IOReadIops > 0 {
+		devices["root"]["limits.read"] = fmt.Sprintf("%diops", req.IOReadIops)
+	}
+	if req.IOWriteIops > 0 {
+		devices["root"]["limits.write"] = fmt.Sprintf("%diops", req.IOWriteIops)
 	}
 
 	for _, dd := range req.DataDisks {
@@ -293,7 +300,7 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 			"type": "disk",
 			"pool": pool,
 			"path": dd.MountPoint,
-			"size": fmt.Sprintf("%dGB", dd.SizeGB),
+			"size": fmt.Sprintf("%dMB", dd.SizeMB),
 		}
 	}
 
@@ -317,10 +324,8 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 		nicDevice["parent"] = "incusbr0"
 	}
 
-	// 安全过滤
-	if req.IPv4Filter {
-		nicDevice["security.ipv4_filtering"] = "true"
-	}
+	// 安全过滤：启用 IPv4 filtering 防止容器自行添加未分配的 IP
+	nicDevice["security.ipv4_filtering"] = "true"
 	if req.MACFilter {
 		nicDevice["security.mac_filtering"] = "true"
 	}
@@ -339,6 +344,9 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 		"user.os_information": req.TemplateID,
 		"boot.autostart":      "1",
 	}
+	if req.SwapMB > 0 {
+		configMap["limits.memory.swap"] = fmt.Sprintf("%dMB", req.SwapMB)
+	}
 	if req.UserData != "" {
 		configMap["user.user-data"] = req.UserData
 	}
@@ -356,8 +364,13 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (string, error) {
 		body["profiles"] = []string{}
 		zap.L().Info("Bridge 模式排除默认 profile", zap.String("name", req.Name))
 	}
-	if req.Type == "" {
+	switch req.Type {
+	case "vm", "virtual-machine":
+		body["type"] = "virtual-machine"
+	case "", "container":
 		body["type"] = "container"
+	default:
+		body["type"] = req.Type
 	}
 
 	bodyJSON, _ := json.Marshal(body)
@@ -924,6 +937,7 @@ func (c *Client) GetInstanceMetrics(name string) (*InstanceMetrics, error) {
 			} `json:"counters"`
 		} `json:"network"`
 		Processes int `json:"processes"`
+		PID       int `json:"pid"`
 	}
 	if _, err := parseResponse(resp, &state); err != nil {
 		return nil, err
@@ -938,6 +952,7 @@ func (c *Client) GetInstanceMetrics(name string) (*InstanceMetrics, error) {
 		Processes:    state.Processes,
 		DiskUsage:    make(map[string]int64),
 		NetworkStats: make(map[string]NetworkStat),
+		PID:          state.PID,
 	}
 
 	for k, v := range state.Disk {
@@ -1507,16 +1522,33 @@ type ImageAlias struct {
 
 // ImageInfo 镜像信息
 type ImageInfo struct {
-	Fingerprint  string       `json:"fingerprint"`
-	Aliases      []ImageAlias `json:"aliases"`
-	Type         string       `json:"type"`
-	Architecture string       `json:"architecture"`
-	Public       bool         `json:"public"`
-	Size         int64        `json:"size"`
+	Fingerprint  string            `json:"fingerprint"`
+	Aliases      []ImageAlias      `json:"aliases"`
+	Type         string            `json:"type"`
+	Architecture string            `json:"architecture"`
+	Public       bool              `json:"public"`
+	Size         int64             `json:"size"`
+	Description  string            `json:"description,omitempty"`
+	Config       map[string]string `json:"config,omitempty"`
+	Properties   map[string]string `json:"properties,omitempty"`
+	CreatedAt    time.Time         `json:"created_at,omitempty"`
+	UploadedAt   time.Time         `json:"uploaded_at,omitempty"`
 }
 
-// ListImages 列出所有本地镜像，返回 image_key 列表 (alias|type|arch)
-func (c *Client) ListImages() ([]string, error) {
+// LocalImageInfo 上报给 master 的本地镜像完整信息
+type LocalImageInfo struct {
+	Fingerprint  string   `json:"fingerprint"`
+	Aliases      []string `json:"aliases"`
+	Type         string   `json:"type"`
+	Architecture string   `json:"architecture"`
+	Size         int64    `json:"size"`
+	Description  string   `json:"description"`
+	UploadDate   string   `json:"upload_date"`
+	ImageSource  string   `json:"image_source"`
+}
+
+// ListImages 列出所有本地镜像，返回完整镜像信息列表
+func (c *Client) ListImages() ([]LocalImageInfo, error) {
 	resp, err := c.doRequest("GET", "/images?recursion=1", nil)
 	if err != nil {
 		return nil, err
@@ -1525,15 +1557,75 @@ func (c *Client) ListImages() ([]string, error) {
 	if _, err := parseResponse(resp, &images); err != nil {
 		return nil, err
 	}
-	var keys []string
+	var result []LocalImageInfo
 	for _, img := range images {
+		var aliases []string
 		for _, alias := range img.Aliases {
 			if alias.Name != "" {
-				keys = append(keys, BuildImageKey(alias.Name, img.Type, img.Architecture))
+				aliases = append(aliases, alias.Name)
 			}
 		}
+		if len(aliases) == 0 {
+			continue
+		}
+
+		// 从 config 或 properties 中读取镜像来源标记
+		imageSource := "manual"
+		if img.Config != nil {
+			if src, ok := img.Config["user.tsukiyo_source"]; ok && src != "" {
+				imageSource = src
+			}
+		}
+		if imageSource == "manual" && img.Properties != nil {
+			if src, ok := img.Properties["user.tsukiyo_source"]; ok && src != "" {
+				imageSource = src
+			}
+		}
+
+		uploadDate := ""
+		if !img.UploadedAt.IsZero() {
+			uploadDate = img.UploadedAt.Format("2006-01-02 15:04")
+		} else if !img.CreatedAt.IsZero() {
+			uploadDate = img.CreatedAt.Format("2006-01-02 15:04")
+		}
+
+		result = append(result, LocalImageInfo{
+			Fingerprint:  img.Fingerprint,
+			Aliases:      aliases,
+			Type:         img.Type,
+			Architecture: img.Architecture,
+			Size:         img.Size,
+			Description:  img.Description,
+			UploadDate:   uploadDate,
+			ImageSource:  imageSource,
+		})
 	}
-	return keys, nil
+	return result, nil
+}
+
+// SetImageProperty 设置镜像的 user.* 属性
+func (c *Client) SetImageProperty(fingerprint, key, value string) error {
+	cmd := exec.Command("incus", "image", "set-property", fingerprint, key, value)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("设置镜像属性失败: %w, output: %s", err, string(output))
+	}
+	return nil
+}
+
+// GetImageFingerprint 通过别名获取镜像指纹
+func (c *Client) GetImageFingerprint(alias string) (string, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/images/aliases/%s", alias), nil)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		Target string `json:"target"`
+	}
+	if _, err := parseResponse(resp, &result); err != nil {
+		return "", err
+	}
+	return result.Target, nil
 }
 
 // StoragePoolExists 检查存储池是否存在
@@ -1730,7 +1822,7 @@ type ServerEnvironment struct {
 // DataDisk 数据盘
 type DataDisk struct {
 	Name        string `json:"name"`
-	SizeGB      int    `json:"size_gb"`
+	SizeMB      int    `json:"size_mb"`
 	StoragePool string `json:"storage_pool"`
 	MountPoint  string `json:"mount_point"`
 }
@@ -1742,7 +1834,8 @@ type CreateInstanceRequest struct {
 	Type          string
 	VCPU          float64
 	MemoryMB      int
-	DiskGB        int
+	SwapMB        int
+	DiskMB        int
 	StoragePool   string
 	NetworkBridge string
 	IPv4Address   string
@@ -1759,6 +1852,8 @@ type CreateInstanceRequest struct {
 	MACFilter    bool   // security.mac_filter
 	NetworkDown  int    // 下行限速 Mbit
 	NetworkUp    int    // 上行限速 Mbit
+	IOReadIops   int    // 磁盘读 IOPS 限制
+	IOWriteIops  int    // 磁盘写 IOPS 限制
 }
 
 // InstanceInfo 实例信息
@@ -1782,6 +1877,7 @@ type InstanceMetrics struct {
 	Processes    int
 	DiskUsage    map[string]int64
 	NetworkStats map[string]NetworkStat
+	PID          int
 }
 
 // NetworkStat 网络统计
@@ -1820,11 +1916,13 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 	if ipv6ULA != "" {
 		config["ipv6.address"] = ipv6ULA
 		config["ipv6.nat"] = "false"
-		config["ipv6.dhcp"] = "false"
+		config["ipv6.dhcp"] = "true"
+		config["ipv6.dhcp.stateful"] = "true"
 	} else if ipv6GUA != "" {
 		config["ipv6.address"] = ipv6GUA
 		config["ipv6.nat"] = "false"
-		config["ipv6.dhcp"] = "false"
+		config["ipv6.dhcp"] = "true"
+		config["ipv6.dhcp.stateful"] = "true"
 	}
 
 	body := map[string]interface{}{
@@ -1845,6 +1943,8 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 			zap.L().Info("bridge 网络已存在", zap.String("name", name))
 			return nil
 		}
+		// 尝试清理可能已创建的网络
+		c.DeleteBridgeNetwork(name)
 		return fmt.Errorf("创建 bridge 网络失败: %w", err)
 	}
 
@@ -1857,6 +1957,9 @@ func (c *Client) CreateBridgeNetwork(name, ipv4CIDR, ipv6ULA, ipv6GUA, gatewayV4
 		}
 		zap.L().Info("等待 bridge 创建操作完成", zap.String("name", name), zap.String("operation", pureOpID))
 		if err := c.waitOperation(pureOpID); err != nil {
+			// 创建操作失败（如 dnsmasq 启动失败），清理已创建的网络
+			zap.L().Warn("bridge 创建操作失败，尝试清理已创建的网络", zap.String("name", name), zap.Error(err))
+			c.DeleteBridgeNetwork(name)
 			return fmt.Errorf("等待 bridge 创建操作失败: %w", err)
 		}
 	}
@@ -1919,4 +2022,66 @@ func (c *Client) DeleteBridgeNetwork(name string) error {
 		}
 	}
 	return nil
+}
+
+// AddDevice 为实例添加设备（通过 PATCH /instances/{name} 合并 devices）
+func (c *Client) AddDevice(instanceName, deviceName string, deviceConfig map[string]string) error {
+	body := map[string]interface{}{
+		"devices": map[string]map[string]string{
+			deviceName: deviceConfig,
+		},
+	}
+	resp, err := c.doRequest("PATCH", fmt.Sprintf("/instances/%s", instanceName), body)
+	if err != nil {
+		return fmt.Errorf("添加设备 %s 失败: %w", deviceName, err)
+	}
+	_, err = parseResponse(resp, nil)
+	return err
+}
+
+// RemoveDevice 从实例移除设备（通过 incus CLI）
+func (c *Client) RemoveDevice(instanceName, deviceName string) error {
+	cmd := exec.Command("incus", "config", "device", "remove", instanceName, deviceName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(output), "not found") || strings.Contains(string(output), "doesn't exist") {
+			return nil
+		}
+		return fmt.Errorf("移除设备 %s 失败: %w, output: %s", deviceName, err, string(output))
+	}
+	return nil
+}
+
+// UpdateDevice 更新实例设备配置（通过 PUT 全量替换 devices）
+func (c *Client) UpdateDevice(instanceName string, devices map[string]map[string]string) error {
+	body := map[string]interface{}{
+		"devices": devices,
+	}
+	resp, err := c.doRequest("PUT", fmt.Sprintf("/instances/%s", instanceName), body)
+	if err != nil {
+		return fmt.Errorf("更新设备配置失败: %w", err)
+	}
+	_, err = parseResponse(resp, nil)
+	return err
+}
+
+// GetInstanceDevices 获取实例的所有设备配置
+func (c *Client) GetInstanceDevices(instanceName string) (map[string]map[string]string, error) {
+	info, err := c.GetInstance(instanceName)
+	if err != nil {
+		return nil, err
+	}
+	devices := make(map[string]map[string]string)
+	for name, dev := range info.Devices {
+		if devMap, ok := dev.(map[string]interface{}); ok {
+			strMap := make(map[string]string)
+			for k, v := range devMap {
+				if s, ok := v.(string); ok {
+					strMap[k] = s
+				}
+			}
+			devices[name] = strMap
+		}
+	}
+	return devices, nil
 }

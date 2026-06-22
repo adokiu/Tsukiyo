@@ -20,7 +20,8 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		TemplateID       string                   `json:"template_id"`
 		VCPU             float64                  `json:"vcpu"`
 		MemoryMB         int                      `json:"memory_mb"`
-		DiskGB           int                      `json:"disk_gb"`
+		SwapMB           int                      `json:"swap_mb"`
+		DiskMB           int                      `json:"disk_mb"`
 		StoragePool      string                   `json:"storage_pool"`
 		LoginMethod      string                   `json:"login_method"`
 		SSHPassword      string                   `json:"ssh_password"`
@@ -50,6 +51,12 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		MACFilter        bool                     `json:"mac_filter,omitempty"`
 		EgressV4Primary  string                   `json:"egress_v4_primary,omitempty"`
 		ParentIface      string                   `json:"parent_iface,omitempty"`
+		IPv4Mode         string                   `json:"ipv4_mode"`
+		IPv6Mode         string                   `json:"ipv6_mode"`
+		PortMappingLimit int                      `json:"port_mapping_limit"`
+		GatewayV6        string                   `json:"gateway_v6,omitempty"`
+		IPv6CIDR         string                   `json:"ipv6_cidr,omitempty"`
+		EIPAssignments   []map[string]interface{} `json:"eip_assignments,omitempty"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
 		zap.L().Error("创建实例参数解析失败", zap.Error(err))
@@ -97,7 +104,7 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	for _, dd := range req.DataDisks {
 		disk := incus.DataDisk{
 			Name:        getMapString(dd, "name"),
-			SizeGB:      getMapInt(dd, "size_gb"),
+			SizeMB:      getMapInt(dd, "size_mb"),
 			StoragePool: getMapString(dd, "storage_pool"),
 			MountPoint:  getMapString(dd, "mount_point"),
 		}
@@ -111,7 +118,8 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		Type:          req.Type,
 		VCPU:          req.VCPU,
 		MemoryMB:      req.MemoryMB,
-		DiskGB:        req.DiskGB,
+		SwapMB:        req.SwapMB,
+		DiskMB:        req.DiskMB,
 		StoragePool:   req.StoragePool,
 		IPv4Address:   req.IPv4Address,
 		IPv6Address:   req.IPv6Address,
@@ -126,6 +134,8 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		MACFilter:     req.MACFilter,
 		NetworkDown:   req.NetworkDown,
 		NetworkUp:     req.NetworkUp,
+		IOReadIops:    req.IORead,
+		IOWriteIops:   req.IOWrite,
 	}
 
 	name := req.InstanceID
@@ -170,12 +180,6 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	if req.MemoryMB > 0 {
 		limits["limits.memory"] = fmt.Sprintf("%dMB", req.MemoryMB)
 	}
-	if req.IORead > 0 {
-		limits["limits.disk.read"] = fmt.Sprintf("%dMB", req.IORead)
-	}
-	if req.IOWrite > 0 {
-		limits["limits.disk.write"] = fmt.Sprintf("%dMB", req.IOWrite)
-	}
 	if len(limits) > 0 {
 		if err := e.incusClient.UpdateInstanceConfig(name, limits); err != nil {
 			zap.L().Warn("设置资源限制失败", zap.Error(err))
@@ -217,9 +221,17 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 		}
 	}
 
-	isSSHPreinstalled := isSpiritlhlSource(req.ImageSource)
+	isVM := req.Type == "vm" || req.Type == "virtual-machine"
+	isSSHPreinstalled := isSpiritlhlSource(req.ImageSource) || isVM
 	if isSSHPreinstalled {
-		zap.L().Info("镜像源预装SSH，跳过SSH安装", zap.String("name", name), zap.String("image_source", req.ImageSource))
+		zap.L().Info("镜像源预装SSH或VM类型，跳过SSH安装", zap.String("name", name), zap.String("image_source", req.ImageSource), zap.String("type", req.Type))
+		// VM/cloud 镜像虽跳过 SSH 安装，但仍需配置 SSH 允许密码登录并注入 motd
+		zap.L().Info("开始配置 SSH 并注入 motd", zap.String("name", name))
+		if err := injectMotdAndSSHConfig(name, req.LoginMethod); err != nil {
+			zap.L().Warn("SSH 配置和 motd 注入失败", zap.String("name", name), zap.Error(err))
+		} else {
+			zap.L().Info("SSH 配置和 motd 注入成功", zap.String("name", name))
+		}
 	} else {
 		e.wsClient.SendInstanceProgress(ws.InstanceProgressPayload{
 			InstanceID: req.InstanceID,
@@ -240,6 +252,30 @@ func (e *Executor) handleCreateInstance(payload json.RawMessage) (json.RawMessag
 	if req.SSHPassword != "" && (req.LoginMethod == "auto" || req.LoginMethod == "password") {
 		if err := e.incusClient.SetInstancePassword(name, req.SSHPassword); err != nil {
 			zap.L().Warn("exec 设置密码失败", zap.Error(err))
+		}
+	}
+
+	// 配置 EIP（公网 IP），在实例启动后、端口映射之前
+	for _, eip := range req.EIPAssignments {
+		eipPayload, _ := json.Marshal(map[string]interface{}{
+			"instance_name":      name,
+			"instance_ip":        instanceIP,
+			"eip_cidr":           getMapString(eip, "eip_cidr"),
+			"ip_version":         getMapString(eip, "ip_version"),
+			"interface":          getMapString(eip, "interface"),
+			"bridge_name":        req.BridgeName,
+			"mapped_internal_ip": getMapString(eip, "mapped_internal_ip"),
+			"ipv4_cidr":          req.IPv4CIDR,
+			"ipv6_cidr":          req.IPv6CIDR,
+			"ipv4_gateway":       req.GatewayV4,
+			"ipv6_gateway":       req.GatewayV6,
+			"eip_gateway":        getMapString(eip, "eip_gateway"),
+		})
+		zap.L().Info("配置实例 EIP", zap.String("instance", name), zap.String("eip_cidr", getMapString(eip, "eip_cidr")), zap.String("ip_version", getMapString(eip, "ip_version")))
+		if _, err := e.handleAssignEIP(eipPayload); err != nil {
+			zap.L().Error("配置实例 EIP 失败", zap.String("instance", name), zap.Error(err))
+		} else {
+			zap.L().Info("配置实例 EIP 成功", zap.String("instance", name))
 		}
 	}
 

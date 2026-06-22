@@ -162,6 +162,9 @@ func (c *Config) IncusRemote() string { return "local" }
 func (c *Config) MetricsInterval() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.metricsInterval <= 0 {
+		return 1 * time.Second
+	}
 	return c.metricsInterval
 }
 

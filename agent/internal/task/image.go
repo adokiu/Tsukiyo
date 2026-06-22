@@ -57,24 +57,30 @@ func (e *Executor) handleDownloadImage(payload json.RawMessage) (json.RawMessage
 		}
 	}
 
+	// 镜像来源标记
+	imageSource := req.RemoteName
+	if imageSource == "" {
+		imageSource = "manual"
+	}
+
 	// Incus 远程镜像：使用 incus image copy
 	if strings.HasPrefix(req.Source, "images:") || strings.Contains(req.Source, ":") {
-		return e.downloadIncusImage(req.ImageKey, alias, req.Source, imageType)
+		return e.downloadIncusImage(req.ImageKey, alias, req.Source, imageType, imageSource)
 	}
 
 	// 自定义 URL 下载
 	switch imageType {
 	case "container":
-		return e.downloadContainerImage(req.ImageKey, alias, req.Source)
+		return e.downloadContainerImage(req.ImageKey, alias, req.Source, imageSource)
 	case "vm", "virtual-machine":
-		return e.downloadVMImage(req.ImageKey, alias, req.Source)
+		return e.downloadVMImage(req.ImageKey, alias, req.Source, imageSource)
 	default:
 		return nil, fmt.Errorf("未知镜像类型: %s", imageType)
 	}
 }
 
 // downloadIncusImage 使用 incus image copy 命令下载 Incus 官方镜像
-func (e *Executor) downloadIncusImage(imageKey, alias, source, imageType string) (json.RawMessage, error) {
+func (e *Executor) downloadIncusImage(imageKey, alias, source, imageType, imageSource string) (json.RawMessage, error) {
 	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
 		ImageID:  imageKey,
 		Stage:    "downloading",
@@ -175,11 +181,26 @@ func (e *Executor) downloadIncusImage(imageKey, alias, source, imageType string)
 
 	zap.L().Info("incus image copy 成功", zap.String("image_key", imageKey), zap.String("alias", alias))
 
+	// 设置镜像来源标记
+	if fp, err := e.incusClient.GetImageFingerprint(alias); err == nil && fp != "" {
+		if err := e.incusClient.SetImageProperty(fp, "user.tsukiyo_source", imageSource); err != nil {
+			zap.L().Warn("设置镜像来源标记失败", zap.String("fingerprint", fp), zap.Error(err))
+		}
+	}
+
 	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
 		ImageID:  imageKey,
 		Stage:    "done",
 		Progress: 100,
 	})
+
+	// 同步镜像列表到 master
+	go func() {
+		images, err := e.incusClient.ListImages()
+		if err == nil {
+			e.wsClient.SendLocalImages(images)
+		}
+	}()
 
 	return json.Marshal(map[string]interface{}{
 		"image_key": imageKey,
@@ -276,7 +297,7 @@ func parseSizeToBytes(s string) (int64, error) {
 }
 
 // downloadContainerImage 使用 downloader 模块下载容器镜像（自定义 URL）
-func (e *Executor) downloadContainerImage(imageKey, alias, source string) (json.RawMessage, error) {
+func (e *Executor) downloadContainerImage(imageKey, alias, source, imageSource string) (json.RawMessage, error) {
 	cacheDir := "/var/cache/tsukiyo/images"
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("创建缓存目录失败: %w", err)
@@ -357,6 +378,13 @@ func (e *Executor) downloadContainerImage(imageKey, alias, source string) (json.
 	}
 	zap.L().Info("容器镜像导入成功", zap.String("image_key", imageKey))
 
+	// 设置镜像来源标记
+	if fp, err := e.incusClient.GetImageFingerprint(alias); err == nil && fp != "" {
+		if err := e.incusClient.SetImageProperty(fp, "user.tsukiyo_source", imageSource); err != nil {
+			zap.L().Warn("设置镜像来源标记失败", zap.String("fingerprint", fp), zap.Error(err))
+		}
+	}
+
 	_ = os.Remove(target)
 
 	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
@@ -366,9 +394,9 @@ func (e *Executor) downloadContainerImage(imageKey, alias, source string) (json.
 	})
 
 	go func() {
-		aliases, err := e.incusClient.ListImages()
+		images, err := e.incusClient.ListImages()
 		if err == nil {
-			e.wsClient.SendLocalImages(aliases)
+			e.wsClient.SendLocalImages(images)
 		}
 	}()
 
@@ -376,7 +404,7 @@ func (e *Executor) downloadContainerImage(imageKey, alias, source string) (json.
 }
 
 // downloadVMImage 下载 VM 镜像（自定义 URL）
-func (e *Executor) downloadVMImage(imageKey, alias, url string) (json.RawMessage, error) {
+func (e *Executor) downloadVMImage(imageKey, alias, url, imageSource string) (json.RawMessage, error) {
 	if url == "" {
 		return nil, fmt.Errorf("VM 镜像 %s 无下载地址", alias)
 	}
@@ -489,6 +517,13 @@ func (e *Executor) downloadVMImage(imageKey, alias, url string) (json.RawMessage
 	}
 	zap.L().Info("VM 镜像导入成功", zap.String("image_key", imageKey))
 
+	// 设置镜像来源标记
+	if fp, err := e.incusClient.GetImageFingerprint(alias); err == nil && fp != "" {
+		if err := e.incusClient.SetImageProperty(fp, "user.tsukiyo_source", imageSource); err != nil {
+			zap.L().Warn("设置镜像来源标记失败", zap.String("fingerprint", fp), zap.Error(err))
+		}
+	}
+
 	_ = os.Remove(target)
 
 	e.wsClient.SendImageProgress(ws.ImageProgressPayload{
@@ -498,9 +533,9 @@ func (e *Executor) downloadVMImage(imageKey, alias, url string) (json.RawMessage
 	})
 
 	go func() {
-		aliases, err := e.incusClient.ListImages()
+		images, err := e.incusClient.ListImages()
 		if err == nil {
-			e.wsClient.SendLocalImages(aliases)
+			e.wsClient.SendLocalImages(images)
 		}
 	}()
 
@@ -531,6 +566,19 @@ func (e *Executor) handleCancelImageDownload(payload json.RawMessage) (json.RawM
 	})
 
 	return json.Marshal(map[string]string{"status": "canceled", "image_key": req.ImageKey})
+}
+
+// handleSyncImages 触发本地镜像列表同步上报
+func (e *Executor) handleSyncImages(payload json.RawMessage) (json.RawMessage, error) {
+	images, err := e.incusClient.ListImages()
+	if err != nil {
+		return nil, fmt.Errorf("查询本地镜像列表失败: %w", err)
+	}
+	if err := e.wsClient.SendLocalImages(images); err != nil {
+		return nil, fmt.Errorf("上报本地镜像列表失败: %w", err)
+	}
+	zap.L().Info("镜像列表同步完成", zap.Int("count", len(images)))
+	return json.Marshal(map[string]interface{}{"status": "synced", "count": len(images)})
 }
 
 // handleCheckImage 检查镜像是否已下载

@@ -186,6 +186,7 @@ func (e *Executor) handleBridgeNetwork(payload json.RawMessage) (json.RawMessage
 		}
 		if err := e.incusClient.CreateBridgeNetwork(req.BridgeName, req.IPv4CIDR, ipv6Addr, "", req.IPv4Gateway); err != nil {
 			zap.L().Error("创建 bridge 网络失败", zap.String("bridge", req.BridgeName), zap.Error(err))
+			e.incusClient.DeleteBridgeNetwork(req.BridgeName)
 			return nil, fmt.Errorf("创建 bridge 网络失败: %w", err)
 		}
 		zap.L().Info("bridge 网络创建成功", zap.String("bridge", req.BridgeName))
@@ -233,11 +234,8 @@ func (e *Executor) handleBindBridgeEgress(payload json.RawMessage) (json.RawMess
 	}
 
 	// 先关闭 NAT 清除旧规则
-	clearConfig := map[string]string{}
-	if req.IPVersion == "ipv6" {
-		clearConfig["ipv6.nat"] = "false"
-	} else {
-		clearConfig["ipv4.nat"] = "false"
+	clearConfig := map[string]string{
+		"ipv4.nat": "false",
 	}
 	zap.L().Info("[BindEgress] 步骤1: 关闭 NAT 清除旧规则", zap.String("bridge", req.BridgeName))
 	if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, clearConfig); err != nil {
@@ -245,13 +243,9 @@ func (e *Executor) handleBindBridgeEgress(payload json.RawMessage) (json.RawMess
 	}
 
 	// 再开启 NAT 并设置新的出口地址
-	config := map[string]string{}
-	if req.IPVersion == "ipv6" {
-		config["ipv6.nat"] = "true"
-		config["ipv6.nat.address"] = egressIP
-	} else {
-		config["ipv4.nat"] = "true"
-		config["ipv4.nat.address"] = egressIP
+	config := map[string]string{
+		"ipv4.nat":         "true",
+		"ipv4.nat.address": egressIP,
 	}
 	zap.L().Info("[BindEgress] 步骤2: 设置新 NAT 出口", zap.String("bridge", req.BridgeName), zap.String("egress_ip", egressIP))
 	if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, config); err != nil {
@@ -285,13 +279,9 @@ func (e *Executor) handleUnbindBridgeEgress(payload json.RawMessage) (json.RawMe
 		zap.String("ip_version", req.IPVersion))
 
 	// 通过 Incus 清除 bridge 网络的 NAT 出口地址并关闭 NAT
-	config := map[string]string{}
-	if req.IPVersion == "ipv6" {
-		config["ipv6.nat"] = "false"
-		config["ipv6.nat.address"] = ""
-	} else {
-		config["ipv4.nat"] = "false"
-		config["ipv4.nat.address"] = ""
+	config := map[string]string{
+		"ipv4.nat":         "false",
+		"ipv4.nat.address": "",
 	}
 
 	if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, config); err != nil {

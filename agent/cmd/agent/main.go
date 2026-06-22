@@ -63,12 +63,12 @@ func main() {
 
 	// 各模块引用
 	var (
-		incusClient  *incus.Client
-		netManager   *network.Manager
-		collector    *monitor.Collector
-		scanner      *security.Scanner
-		consoleProxy *console.Proxy
-		moduleMu     sync.Mutex
+		incusClient    *incus.Client
+		netManager     *network.Manager
+		collector      *monitor.Collector
+		scanner        *security.Scanner
+		consoleHandler *console.Handler
+		moduleMu       sync.Mutex
 	)
 
 	// 采集静态数据（CPU型号、内存条、GPU、环境工具版本等，仅启动时采集一次）
@@ -114,6 +114,16 @@ func main() {
 						r := reconcile.NewReconciler(ic)
 						if err := r.Reconcile(bridges); err != nil {
 							zap.L().Error("Bridge 状态对齐失败", zap.Error(err))
+						}
+
+						// 解析 EIP 分配信息并矫正 nftables 规则
+						if eipRaw, ok := data["eip_allocations"]; ok {
+							var eipConfigs []reconcile.EIPAllocationConfig
+							if eipJSON, err := json.Marshal(eipRaw); err == nil {
+								if err := json.Unmarshal(eipJSON, &eipConfigs); err == nil {
+									r.ReconcileEIPs(eipConfigs)
+								}
+							}
 						}
 					} else {
 						zap.L().Warn("解析 Bridge 配置失败", zap.Error(err))
@@ -183,6 +193,16 @@ func main() {
 					if err := r.Reconcile(bridges); err != nil {
 						zap.L().Error("Bridge 状态对齐失败", zap.Error(err))
 					}
+				}
+			}
+		}
+
+		// reconcile EIP nftables 规则
+		if eipRaw, ok := cfgData["eip_allocations"]; ok {
+			var eipConfigs []reconcile.EIPAllocationConfig
+			if eipJSON, err := json.Marshal(eipRaw); err == nil {
+				if err := json.Unmarshal(eipJSON, &eipConfigs); err == nil {
+					r.ReconcileEIPs(eipConfigs)
 				}
 			}
 		}
@@ -438,13 +458,63 @@ func main() {
 	scanner = security.NewScanner(config.AppConfig, netManager, wsClient)
 	scanner.Start()
 
-	// 初始化统一 HTTP 服务（健康检查 + 控制台代理 + Token 鉴权）
-	consoleProxy = console.NewProxy(config.AppConfig, wsClient)
-	go func() {
-		if err := consoleProxy.ServeHTTP(); err != nil {
-			zap.L().Error("统一 HTTP 服务异常", zap.Error(err))
+	// 初始化控制台处理器（通过 WS 消息处理，不监听任何端口）
+	consoleHandler = console.NewHandler()
+	vncHandler := console.NewVNCHandler(config.AppConfig.IncusSocketPath())
+	wsClient.SetConsoleHandler(func(msgType string, payload json.RawMessage) {
+		var msg struct {
+			SessionID string `json:"session_id"`
+			Container string `json:"container"`
+			Data      string `json:"data"`
+			Cols      int    `json:"cols"`
+			Rows      int    `json:"rows"`
 		}
-	}()
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			zap.L().Warn("解析控制台消息失败", zap.Error(err))
+			return
+		}
+		switch msgType {
+		case "console_ssh_start":
+			if err := consoleHandler.StartSSH(msg.SessionID, msg.Container, func(streamType string, data []byte) {
+				wsClient.SendConsoleMessage("console_data", map[string]interface{}{
+					"session_id": msg.SessionID,
+					"stream":     streamType,
+					"data":       string(data),
+				})
+			}); err != nil {
+				zap.L().Error("启动控制台会话失败", zap.Error(err))
+				wsClient.SendConsoleMessage("console_error", map[string]interface{}{
+					"session_id": msg.SessionID,
+					"error":      err.Error(),
+				})
+			}
+		case "console_ssh_input":
+			consoleHandler.WriteInput(msg.SessionID, []byte(msg.Data))
+		case "console_ssh_resize":
+			if err := consoleHandler.ResizeSession(msg.SessionID, msg.Cols, msg.Rows); err != nil {
+				zap.L().Warn("调整控制台窗口大小失败", zap.String("session_id", msg.SessionID), zap.Error(err))
+			}
+		case "console_ssh_close":
+			consoleHandler.RemoveSession(msg.SessionID)
+		case "console_vnc_start":
+			if err := vncHandler.StartVNC(msg.SessionID, msg.Container, func(data []byte) {
+				wsClient.SendConsoleMessage("console_vnc_data", map[string]interface{}{
+					"session_id": msg.SessionID,
+					"data":       string(data),
+				})
+			}); err != nil {
+				zap.L().Error("启动 VNC 控制台失败", zap.Error(err))
+				wsClient.SendConsoleMessage("console_vnc_error", map[string]interface{}{
+					"session_id": msg.SessionID,
+					"error":      err.Error(),
+				})
+			}
+		case "console_vnc_input":
+			vncHandler.WriteVNCInput(msg.SessionID, []byte(msg.Data))
+		case "console_vnc_close":
+			vncHandler.RemoveVNCSession(msg.SessionID)
+		}
+	})
 
 	// 首次上报本地 Incus 镜像列表
 	go func() {

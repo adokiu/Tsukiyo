@@ -72,6 +72,8 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 		return e.handleDeleteImage(payload)
 	case "list_remote_images":
 		return e.handleListRemoteImages(payload)
+	case "sync_images":
+		return e.handleSyncImages(payload)
 	case "apply_network":
 		return e.handleApplyNetwork(payload)
 	case "apply_firewall":
@@ -86,6 +88,10 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 		return e.handleDeletePartition(payload)
 	case "delete_storage":
 		return e.handleDeleteStorage(payload)
+	case "limit_network":
+		return e.handleLimitNetwork(payload)
+	case "limit_iops":
+		return e.handleLimitIOPS(payload)
 	case "migrate_instance":
 		return e.handleMigrateInstance(payload)
 	case "bridge_network":
@@ -97,6 +103,18 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 	case "unbind_bridge_egress":
 		zap.L().Info("执行 Bridge 出口 EIP 解绑任务")
 		return e.handleUnbindBridgeEgress(payload)
+	case "assign_eip":
+		zap.L().Info("执行实例 EIP 分配任务")
+		return e.handleAssignEIP(payload)
+	case "release_eip":
+		zap.L().Info("执行实例 EIP 释放任务")
+		return e.handleReleaseEIP(payload)
+	case "add_disk":
+		return e.handleAddDisk(payload)
+	case "delete_disk":
+		return e.handleDeleteDisk(payload)
+	case "resize_disk":
+		return e.handleResizeDisk(payload)
 	default:
 		return nil, fmt.Errorf("未知任务类型: %s", taskType)
 	}

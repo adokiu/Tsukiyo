@@ -11,7 +11,7 @@ func probeEnvironment() []EnvCheck {
 	checks := []EnvCheck{
 		commandCheck("systemd", "服务管理器 systemd", true, "systemctl"),
 		commandCheck("incus", "Incus 容器管理", true, "incus"),
-		commandCheck("iptables", "iptables 网络规则", true, "iptables"),
+		commandCheck("nft", "nftables 网络规则", true, "nft"),
 		commandCheck("ip", "iproute2 网络工具", true, "ip"),
 		commandCheck("smartctl", "硬盘健康检测", false, "smartctl"),
 	}

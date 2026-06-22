@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 
 	"go.uber.org/zap"
+
+	"tsukiyo/agent/internal/nftables"
 )
 
 // Manager 网络管理器
@@ -149,20 +150,19 @@ func (m *Manager) AddPortMapping(hostPort, containerPort int, protocol, containe
 	}
 	m.mu.Unlock()
 
-	// iptables DNAT
-	cmd := exec.Command("iptables", "-t", "nat", "-A", "PREROUTING",
-		"-p", protocol, "--dport", strconv.Itoa(hostPort),
-		"-j", "DNAT", "--to-destination",
-		fmt.Sprintf("%s:%d", containerIP, containerPort))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("添加 DNAT 失败: %s", string(out))
+	nftables.EnsureTable()
+
+	// nftables DNAT
+	dnatRule := fmt.Sprintf("%s dport %d dnat to %s:%d", protocol, hostPort, containerIP, containerPort)
+	dnatComment := fmt.Sprintf("tsukiyo-portmap-%s-%d", protocol, hostPort)
+	if err := nftables.AddRule("prerouting", dnatRule, dnatComment); err != nil {
+		return fmt.Errorf("添加 DNAT 失败: %w", err)
 	}
 
-	// iptables FORWARD 允许
-	cmd2 := exec.Command("iptables", "-A", "FORWARD",
-		"-p", protocol, "--dport", strconv.Itoa(containerPort),
-		"-j", "ACCEPT")
-	cmd2.Run()
+	// nftables FORWARD 允许
+	fwdRule := fmt.Sprintf("%s dport %d accept", protocol, containerPort)
+	fwdComment := fmt.Sprintf("tsukiyo-portfwd-%s-%d", protocol, hostPort)
+	nftables.AddRuleSilent("forward", fwdRule, fwdComment)
 
 	zap.L().Info("端口映射添加成功",
 		zap.Int("host_port", hostPort),
@@ -182,18 +182,15 @@ func (m *Manager) RemovePortMapping(hostPort int, protocol string) error {
 
 	m.mu.Lock()
 	key := fmt.Sprintf("%d/%s", hostPort, protocol)
-	mapping, exists := m.portMappings[key]
+	_, exists := m.portMappings[key]
 	if exists {
 		delete(m.portMappings, key)
 	}
 	m.mu.Unlock()
 
-	// 删除 iptables 规则
-	cmd := exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
-		"-p", protocol, "--dport", strconv.Itoa(hostPort),
-		"-j", "DNAT", "--to-destination",
-		fmt.Sprintf("%s:%d", mapping.ContainerIP, mapping.ContainerPort))
-	cmd.Run()
+	// 删除 nftables 规则
+	nftables.DeleteRulesByCommentPrefix("prerouting", fmt.Sprintf("tsukiyo-portmap-%s-%d", protocol, hostPort))
+	nftables.DeleteRulesByCommentPrefix("forward", fmt.Sprintf("tsukiyo-portfwd-%s-%d", protocol, hostPort))
 
 	zap.L().Info("端口映射删除成功", zap.Int("host_port", hostPort))
 	return nil
@@ -219,30 +216,34 @@ func (m *Manager) AddFirewallRule(direction, protocol, source string, port int, 
 	}
 	m.mu.Unlock()
 
-	var args []string
+	nftables.EnsureTable()
+
+	var chain string
 	if direction == "ingress" || direction == "inbound" {
-		args = []string{"-A", "INPUT"}
+		chain = "input"
 	} else {
-		args = []string{"-A", "OUTPUT"}
+		chain = "output"
 	}
 
+	// 构建 nftables 规则
+	var ruleParts []string
 	if source != "" && source != "0.0.0.0/0" {
-		args = append(args, "-s", source)
+		ruleParts = append(ruleParts, fmt.Sprintf("ip saddr %s", source))
 	}
-	args = append(args, "-p", protocol)
+	ruleParts = append(ruleParts, protocol)
 	if port > 0 {
-		args = append(args, "--dport", strconv.Itoa(port))
+		ruleParts = append(ruleParts, fmt.Sprintf("dport %d", port))
 	}
-
 	if action == "allow" || action == "accept" {
-		args = append(args, "-j", "ACCEPT")
+		ruleParts = append(ruleParts, "accept")
 	} else {
-		args = append(args, "-j", "DROP")
+		ruleParts = append(ruleParts, "drop")
 	}
 
-	cmd := exec.Command("iptables", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("添加防火墙规则失败: %s", string(out))
+	rule := strings.Join(ruleParts, " ")
+	comment := fmt.Sprintf("tsukiyo-fw-%s-%s-%d-%s", direction, protocol, port, source)
+	if err := nftables.AddRule(chain, rule, comment); err != nil {
+		return fmt.Errorf("添加防火墙规则失败: %w", err)
 	}
 
 	zap.L().Info("防火墙规则添加成功", zap.String("key", key))
@@ -263,7 +264,16 @@ func (m *Manager) RemoveFirewallRule(direction, protocol, source string, port in
 	}
 	m.mu.Unlock()
 
-	// 简化的删除逻辑：flush 所有相关链并重建
+	// 通过 comment 前缀删除 nftables 规则
+	commentPrefix := fmt.Sprintf("tsukiyo-fw-%s-%s-%d-%s", direction, protocol, port, source)
+	var chain string
+	if direction == "ingress" || direction == "inbound" {
+		chain = "input"
+	} else {
+		chain = "output"
+	}
+	nftables.DeleteRulesByCommentPrefix(chain, commentPrefix)
+
 	return nil
 }
 
@@ -277,13 +287,19 @@ func (m *Manager) BlockIP(ip string) error {
 	m.blockedIPs[ip] = true
 	m.mu.Unlock()
 
-	cmd := exec.Command("iptables", "-A", "INPUT", "-s", ip, "-j", "DROP")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("封锁 IP 失败: %s", string(out))
+	nftables.EnsureTable()
+
+	// nftables INPUT DROP
+	inputRule := fmt.Sprintf("ip saddr %s drop", ip)
+	inputComment := fmt.Sprintf("tsukiyo-block-in-%s", ip)
+	if err := nftables.AddRule("input", inputRule, inputComment); err != nil {
+		return fmt.Errorf("封锁 IP 失败: %w", err)
 	}
 
-	cmd2 := exec.Command("iptables", "-A", "FORWARD", "-s", ip, "-j", "DROP")
-	cmd2.Run()
+	// nftables FORWARD DROP
+	fwdRule := fmt.Sprintf("ip saddr %s drop", ip)
+	fwdComment := fmt.Sprintf("tsukiyo-block-fwd-%s", ip)
+	nftables.AddRuleSilent("forward", fwdRule, fwdComment)
 
 	zap.L().Warn("IP 已封锁", zap.String("ip", ip))
 	return nil
@@ -299,11 +315,8 @@ func (m *Manager) UnblockIP(ip string) error {
 	delete(m.blockedIPs, ip)
 	m.mu.Unlock()
 
-	cmd := exec.Command("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP")
-	cmd.Run()
-
-	cmd2 := exec.Command("iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP")
-	cmd2.Run()
+	nftables.DeleteRulesByCommentPrefix("input", fmt.Sprintf("tsukiyo-block-in-%s", ip))
+	nftables.DeleteRulesByCommentPrefix("forward", fmt.Sprintf("tsukiyo-block-fwd-%s", ip))
 
 	zap.L().Info("IP 已解封", zap.String("ip", ip))
 	return nil

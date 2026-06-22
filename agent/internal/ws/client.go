@@ -40,6 +40,9 @@ type RequestHandler func(reqType string, payload json.RawMessage) (json.RawMessa
 // ConfigHandler 配置下发回调
 type ConfigHandler func(data map[string]interface{})
 
+// ConsoleMessageHandler 控制台流式消息处理回调
+type ConsoleMessageHandler func(msgType string, payload json.RawMessage)
+
 // Client WebSocket 客户端
 type Client struct {
 	cfg            *config.Config
@@ -49,6 +52,7 @@ type Client struct {
 	taskHandler    TaskHandler
 	requestHandler RequestHandler
 	configHandler  ConfigHandler
+	consoleHandler ConsoleMessageHandler
 	shutdown       chan struct{}
 	reconnectCh    chan struct{}
 	pendingReqs    map[string]chan []byte
@@ -82,6 +86,28 @@ func (c *Client) SetRequestHandler(h RequestHandler) {
 // SetConfigHandler 设置配置下发处理器
 func (c *Client) SetConfigHandler(h ConfigHandler) {
 	c.configHandler = h
+}
+
+// SetConsoleHandler 设置控制台流式消息处理器
+func (c *Client) SetConsoleHandler(h ConsoleMessageHandler) {
+	c.consoleHandler = h
+}
+
+// SendConsoleMessage 发送控制台流式消息到 Master
+func (c *Client) SendConsoleMessage(msgType string, payload interface{}) error {
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    msgType,
+		"payload": payload,
+	})
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return fmt.Errorf("WebSocket 未连接")
+	}
+	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // Connect 连接到 Master
@@ -160,13 +186,6 @@ func getTotalDiskFromDisks(disks []system.DiskInfo) int64 {
 
 // sendMessage 发送消息
 func (c *Client) sendMessage(msgType MessageType, payload interface{}) error {
-	c.mu.RLock()
-	conn := c.conn
-	c.mu.RUnlock()
-	if conn == nil {
-		return fmt.Errorf("连接未建立")
-	}
-
 	data, err := json.Marshal(map[string]interface{}{
 		"type":    string(msgType),
 		"payload": payload,
@@ -177,6 +196,9 @@ func (c *Client) sendMessage(msgType MessageType, payload interface{}) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.conn == nil {
+		return fmt.Errorf("连接未建立")
+	}
 	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		return err
 	}
@@ -311,11 +333,11 @@ func (c *Client) SendImageProgress(p ImageProgressPayload) error {
 	return c.sendMessage(MsgTypeImageProgress, payload)
 }
 
-// SendLocalImages 上报本地已有镜像列表
-func (c *Client) SendLocalImages(imageAliases []string) error {
+// SendLocalImages 上报本地已有镜像完整信息列表
+func (c *Client) SendLocalImages(images interface{}) error {
 	payload := map[string]interface{}{
 		"token":  c.cfg.Token,
-		"images": imageAliases,
+		"images": images,
 	}
 	return c.sendMessage(MsgTypeImageProgress, payload)
 }
@@ -483,6 +505,18 @@ func (c *Client) readLoop() {
 			continue
 		}
 
+		// 处理控制台流式消息
+		if (msg.Type == "console_ssh_start" || msg.Type == "console_ssh_input" || msg.Type == "console_ssh_close" ||
+			msg.Type == "console_vnc_start" || msg.Type == "console_vnc_input" || msg.Type == "console_vnc_close") && c.consoleHandler != nil {
+			// console_vnc_start 和 console_ssh_start 同步处理, 确保 session 创建完成后再处理 input
+			if msg.Type == "console_vnc_start" || msg.Type == "console_ssh_start" {
+				c.consoleHandler(msg.Type, msg.Payload)
+			} else {
+				go c.consoleHandler(msg.Type, msg.Payload)
+			}
+			continue
+		}
+
 		// 处理 Master 同步请求消息（如 get_storages、get_instances 等）
 		if msg.ID != "" && c.requestHandler != nil {
 			go func(reqType string, reqID string, payload json.RawMessage) {
@@ -502,12 +536,12 @@ func (c *Client) readLoop() {
 					resp.Payload = respPayload
 				}
 				data, _ := json.Marshal(resp)
-				c.mu.RLock()
+				c.mu.Lock()
 				conn := c.conn
-				c.mu.RUnlock()
 				if conn != nil {
 					conn.WriteMessage(websocket.TextMessage, data)
 				}
+				c.mu.Unlock()
 			}(msg.Type, msg.ID, msg.Payload)
 		}
 	}
@@ -667,12 +701,18 @@ type InstanceStatusPayload struct {
 
 // InstanceMetricPayload 实例监控指标上报
 type InstanceMetricPayload struct {
-	InstanceID string  `json:"instance_id"`
-	CPUPercent float64 `json:"cpu_percent"`
-	MemUsed    int64   `json:"mem_used"`
-	MemTotal   int64   `json:"mem_total"`
-	DiskRead   int64   `json:"disk_read"`
-	DiskWrite  int64   `json:"disk_write"`
-	NetIn      int64   `json:"net_in"`
-	NetOut     int64   `json:"net_out"`
+	InstanceID    string  `json:"instance_id"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	MemUsed       int64   `json:"mem_used"`
+	MemTotal      int64   `json:"mem_total"`
+	DiskUsed      int64   `json:"disk_used"`
+	DiskTotal     int64   `json:"disk_total"`
+	DiskReadBps   int64   `json:"disk_read_bps"`
+	DiskWriteBps  int64   `json:"disk_write_bps"`
+	DiskReadIops  int64   `json:"disk_read_iops"`
+	DiskWriteIops int64   `json:"disk_write_iops"`
+	NetIn         int64   `json:"net_in"`
+	NetOut        int64   `json:"net_out"`
+	NetInTotal    int64   `json:"net_in_total"`
+	NetOutTotal   int64   `json:"net_out_total"`
 }

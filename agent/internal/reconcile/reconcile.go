@@ -4,6 +4,7 @@ package reconcile
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"tsukiyo/agent/internal/incus"
+	"tsukiyo/agent/internal/nftables"
 )
 
 // BridgeConfig Master 下发的 Bridge 期望配置
@@ -28,7 +30,6 @@ type BridgeConfig struct {
 	IPv6Gateway    string   `json:"ipv6_gateway"`
 	DNSServers     []string `json:"dns_servers"`
 	NATEgressIPv4  string   `json:"nat_egress_ipv4,omitempty"`
-	NATEgressIPv6  string   `json:"nat_egress_ipv6,omitempty"`
 	PortRangeStart int      `json:"port_range_start"`
 	PortRangeEnd   int      `json:"port_range_end"`
 	Status         string   `json:"status"`
@@ -81,6 +82,22 @@ type PortMappingConfig struct {
 	Description   string `json:"description,omitempty"`
 }
 
+// EIPAllocationConfig Master 下发的 EIP 分配配置
+type EIPAllocationConfig struct {
+	InstanceName     string `json:"instance_name"`
+	InstanceIP       string `json:"instance_ip"`
+	EIPCidr          string `json:"eip_cidr"`
+	Interface        string `json:"interface"`
+	IPVersion        string `json:"ip_version"`
+	BridgeName       string `json:"bridge_name"`
+	MappedInternalIP string `json:"mapped_internal_ip"`
+	IPv4CIDR         string `json:"ipv4_cidr"`
+	IPv6CIDR         string `json:"ipv6_cidr"`
+	IPv4Gateway      string `json:"ipv4_gateway"`
+	IPv6Gateway      string `json:"ipv6_gateway"`
+	EIPGateway       string `json:"eip_gateway"`
+}
+
 // Reconciler 状态对齐器
 type Reconciler struct {
 	ic *incus.Client
@@ -102,6 +119,13 @@ func (r *Reconciler) Reconcile(desired []BridgeConfig) error {
 
 	// 0. 确保系统级持久化基础设施就绪
 	r.ensureSystemPersistence()
+
+	// 0.5 确保 nftables 表存在并加载持久化规则
+	nftables.EnsureTable()
+	if err := nftables.LoadRules(); err != nil {
+		zap.L().Warn("[Reconcile] 加载 nftables 持久化规则失败", zap.Error(err))
+	}
+	nftables.EnsureSystemdService()
 
 	if !r.ic.IsAvailable() {
 		zap.L().Warn("[Reconcile] Incus 不可用，跳过网络对齐")
@@ -262,25 +286,37 @@ func (r *Reconciler) reconcileBridge(bridge BridgeConfig, actualMap map[string]i
 				zap.L().Info("[Reconcile] 创建后已设置 ipv4.nat.address", zap.String("bridge", bridge.BridgeName), zap.String("egress_ip", egressIP))
 			}
 		}
-		if bridge.IPv6Enabled && bridge.NATEgressIPv6 != "" {
-			egressIP := bridge.NATEgressIPv6
-			if idx := strings.Index(egressIP, "/"); idx > 0 {
-				egressIP = egressIP[:idx]
-			}
-			if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, map[string]string{
-				"ipv6.nat":         "true",
-				"ipv6.nat.address": egressIP,
-			}); err != nil {
-				zap.L().Error("[Reconcile] 创建后设置 ipv6.nat.address 失败", zap.Error(err))
-			} else {
-				zap.L().Info("[Reconcile] 创建后已设置 ipv6.nat.address", zap.String("bridge", bridge.BridgeName), zap.String("egress_ip", egressIP))
-			}
-		}
 	} else {
 		if actual.Type != "bridge" {
 			zap.L().Warn("[Reconcile] 网络类型不匹配",
 				zap.String("bridge", bridge.BridgeName),
 				zap.String("actual_type", actual.Type))
+		}
+
+		// 检查并修复 DHCP 配置
+		dhcpFix := map[string]string{}
+		if actual.Config["ipv4.dhcp"] != "true" {
+			dhcpFix["ipv4.dhcp"] = "true"
+		}
+		// IPv6 相关选项仅在 bridge 实际配置了 ipv6.address 时才有效
+		ipv6Addr := actual.Config["ipv6.address"]
+		if ipv6Addr != "" && ipv6Addr != "none" {
+			if actual.Config["ipv6.dhcp"] != "true" {
+				dhcpFix["ipv6.dhcp"] = "true"
+			}
+			if actual.Config["ipv6.dhcp.stateful"] != "true" {
+				dhcpFix["ipv6.dhcp.stateful"] = "true"
+			}
+		}
+		if len(dhcpFix) > 0 {
+			zap.L().Info("[Reconcile] 修复 bridge DHCP 配置",
+				zap.String("bridge", bridge.BridgeName),
+				zap.Any("fix", dhcpFix))
+			if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, dhcpFix); err != nil {
+				zap.L().Error("[Reconcile] 修复 DHCP 配置失败", zap.Error(err))
+			} else {
+				zap.L().Info("[Reconcile] DHCP 配置已修复", zap.String("bridge", bridge.BridgeName))
+			}
 		}
 
 		// 检查 ipv4.address 是否匹配
@@ -358,38 +394,6 @@ func (r *Reconciler) reconcileBridge(bridge BridgeConfig, actualMap map[string]i
 			}
 		}
 
-		// 检查 ipv6.nat.address 是否匹配
-		if bridge.IPv6Enabled && bridge.NATEgressIPv6 != "" {
-			expectedEgressIP := bridge.NATEgressIPv6
-			if idx := strings.Index(expectedEgressIP, "/"); idx > 0 {
-				expectedEgressIP = expectedEgressIP[:idx]
-			}
-			actualNatAddr := actual.Config["ipv6.nat.address"]
-			if actualNatAddr != expectedEgressIP {
-				zap.L().Warn("[Reconcile] bridge ipv6.nat.address 不匹配，修复",
-					zap.String("bridge", bridge.BridgeName),
-					zap.String("expected", expectedEgressIP),
-					zap.String("actual", actualNatAddr))
-				if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, map[string]string{
-					"ipv6.nat":         "true",
-					"ipv6.nat.address": expectedEgressIP,
-				}); err != nil {
-					zap.L().Error("[Reconcile] 更新 ipv6.nat.address 失败", zap.Error(err))
-				} else {
-					zap.L().Info("[Reconcile] ipv6.nat.address 已修复", zap.String("bridge", bridge.BridgeName), zap.String("egress_ip", expectedEgressIP))
-				}
-			}
-		} else if bridge.IPv6Enabled && bridge.NATEgressIPv6 == "" && actual.Config["ipv6.nat.address"] != "" {
-			zap.L().Warn("[Reconcile] bridge ipv6.nat.address 应为空，清除",
-				zap.String("bridge", bridge.BridgeName),
-				zap.String("actual", actual.Config["ipv6.nat.address"]))
-			if err := r.ic.UpdateBridgeNetwork(bridge.BridgeName, map[string]string{
-				"ipv6.nat.address": "",
-			}); err != nil {
-				zap.L().Error("[Reconcile] 清除 ipv6.nat.address 失败", zap.Error(err))
-			}
-		}
-
 	}
 
 	return nil
@@ -460,5 +464,170 @@ func (r *Reconciler) EnsureAllBridgeNAT() {
 					zap.String("bridge", net.Name))
 			}
 		}
+	}
+}
+
+// ReconcileEIPs 矫正 EIP 相关的 nftables 规则（Agent 重启后重建丢失的规则）
+func (r *Reconciler) ReconcileEIPs(eipConfigs []EIPAllocationConfig) {
+	if len(eipConfigs) == 0 {
+		zap.L().Info("[Reconcile] 无 EIP 分配配置，跳过")
+		return
+	}
+
+	zap.L().Info("[Reconcile] 开始矫正 EIP nftables 规则", zap.Int("count", len(eipConfigs)))
+
+	// 确保 nftables 表和链存在
+	nftables.EnsureTable()
+
+	for _, cfg := range eipConfigs {
+		if cfg.InstanceName == "" || cfg.EIPCidr == "" {
+			continue
+		}
+
+		eipAddr := cfg.EIPCidr
+		if idx := strings.Index(eipAddr, "/"); idx > 0 {
+			eipAddr = eipAddr[:idx]
+		}
+
+		iface := cfg.Interface
+		if iface == "" {
+			iface = "eth0"
+		}
+
+		if cfg.IPVersion == "ipv6" {
+			r.reconcileEIPv6(cfg, iface, eipAddr)
+		} else {
+			r.reconcileEIPv4(cfg, iface, eipAddr)
+		}
+	}
+
+	zap.L().Info("[Reconcile] EIP nftables 规则矫正完成")
+}
+
+// reconcileEIPv4 矫正 IPv4 EIP 的 nftables 规则
+func (r *Reconciler) reconcileEIPv4(cfg EIPAllocationConfig, iface, eipAddr string) {
+	// 检查 SNAT 规则是否存在（每个 src 一条规则，comment 唯一）
+	snatSources := []string{cfg.InstanceIP}
+	if cfg.MappedInternalIP != "" && cfg.MappedInternalIP != cfg.InstanceIP {
+		snatSources = append(snatSources, cfg.MappedInternalIP)
+	}
+	for _, src := range snatSources {
+		if src == "" {
+			continue
+		}
+		snatComment := fmt.Sprintf("tsukiyo-snat-%s-%s", eipAddr, src)
+		if !nftables.RuleExists("postrouting", snatComment) {
+			zap.L().Info("[Reconcile] SNAT 规则缺失，重建", zap.String("eip", eipAddr), zap.String("src", src))
+			rule := fmt.Sprintf("oifname %s ip saddr %s snat to %s", iface, src, eipAddr)
+			if err := nftables.AddRule("postrouting", rule, snatComment); err != nil {
+				zap.L().Error("[Reconcile] 重建 SNAT 规则失败", zap.String("eip", eipAddr), zap.Error(err))
+			}
+		}
+	}
+
+	// 检查 FORWARD 规则是否存在（每个 src 一条规则，comment 唯一）
+	for _, src := range snatSources {
+		if src == "" {
+			continue
+		}
+		fwdComment := fmt.Sprintf("tsukiyo-fwd-%s-%s", eipAddr, src)
+		if !nftables.RuleExists("forward", fwdComment) {
+			zap.L().Info("[Reconcile] FORWARD 规则缺失，重建", zap.String("eip", eipAddr), zap.String("src", src))
+			rule := fmt.Sprintf("ip saddr %s accept", src)
+			nftables.AddRuleSilent("forward", rule, fwdComment)
+		}
+	}
+
+	dnatComment := fmt.Sprintf("tsukiyo-dnat-%s", eipAddr)
+
+	// 检查 DNAT 规则是否存在
+	if cfg.InstanceIP != "" && !nftables.RuleExists("prerouting", dnatComment) {
+		zap.L().Info("[Reconcile] DNAT 规则缺失，重建", zap.String("eip", eipAddr))
+		rule := fmt.Sprintf("iifname %s ip daddr %s dnat to %s", iface, eipAddr, cfg.InstanceIP)
+		nftables.AddRuleSilent("prerouting", rule, dnatComment)
+	}
+
+	// 检查 policy routing
+	rtTable := fmt.Sprintf("tsukiyo-eip-%s", strings.ReplaceAll(eipAddr, ".", "-"))
+	exec.Command("sh", "-c", fmt.Sprintf("grep -q '%s' /etc/iproute2/rt_tables || echo '100 %s' >> /etc/iproute2/rt_tables", rtTable, rtTable)).Run()
+	exec.Command("ip", "route", "replace", "default", "dev", iface, "table", rtTable).Run()
+	exec.Command("ip", "rule", "add", "from", eipAddr, "table", rtTable).Run()
+
+	// 检查 EIP 是否已绑定到网卡
+	if cfg.EIPCidr != "" {
+		checkCmd := exec.Command("ip", "-o", "addr", "show", "dev", iface)
+		checkOut, err := checkCmd.Output()
+		if err == nil && !strings.Contains(string(checkOut), eipAddr) {
+			zap.L().Info("[Reconcile] EIP 未绑定到网卡，重新绑定", zap.String("eip", cfg.EIPCidr), zap.String("iface", iface))
+			exec.Command("ip", "addr", "add", cfg.EIPCidr, "dev", iface).Run()
+		}
+	}
+}
+
+// reconcileEIPv6 矫正 IPv6 EIP 的 nftables 规则
+func (r *Reconciler) reconcileEIPv6(cfg EIPAllocationConfig, iface, eipAddr string) {
+	bridgeName := cfg.BridgeName
+	if bridgeName == "" {
+		bridgeName = "tsukiyo-br0"
+	}
+
+	eipCIDR := cfg.EIPCidr
+	if !strings.Contains(eipCIDR, "/") {
+		eipCIDR = eipAddr + "/128"
+	}
+
+	// 从 CIDR 中提取网络地址
+	netIP := eipAddr
+	if ip, ipNet, err := net.ParseCIDR(eipCIDR); err == nil {
+		netIP = ip.Mask(ipNet.Mask).String()
+	}
+
+	fwdComment := fmt.Sprintf("tsukiyo-fwd6-%s", netIP)
+
+	// 确保 sysctl 配置
+	exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run()
+	exec.Command("sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.proxy_ndp=1", iface)).Run()
+
+	// 确保 bridge DHCPv6 有状态模式
+	exec.Command("incus", "network", "set", bridgeName, "ipv6.dhcp", "true").Run()
+	exec.Command("incus", "network", "set", bridgeName, "ipv6.dhcp.stateful", "true").Run()
+
+	// 检查 Incus ipv6.address 配置
+	if cfg.InstanceName != "" {
+		getCmd := exec.Command("incus", "config", "device", "get", cfg.InstanceName, "eth0", "ipv6.address")
+		getOut, err := getCmd.Output()
+		if err != nil || strings.TrimSpace(string(getOut)) != netIP {
+			zap.L().Info("[Reconcile] Incus ipv6.address 不匹配，修复", zap.String("instance", cfg.InstanceName), zap.String("expected", netIP))
+			exec.Command("incus", "config", "device", "set", cfg.InstanceName, "eth0", "ipv6.address", netIP).Run()
+		}
+
+		// 设置 IPv6 网关
+		gateway := cfg.EIPGateway
+		if gateway == "" {
+			gateway = cfg.IPv6Gateway
+		}
+		if gateway != "" {
+			exec.Command("incus", "config", "device", "set", cfg.InstanceName, "eth0", "ipv6.gateway", gateway).Run()
+		}
+
+		// 非单地址时，检查容器内 CIDR
+		isSingle := strings.HasSuffix(eipCIDR, "/128")
+		if !isSingle {
+			exec.Command("incus", "exec", cfg.InstanceName, "--",
+				"ip", "-6", "addr", "add", eipCIDR, "dev", "eth0").Run()
+		}
+	}
+
+	// 检查主机路由
+	exec.Command("ip", "-6", "route", "replace", eipCIDR, "dev", bridgeName).Run()
+
+	// 检查 NDP 代理
+	exec.Command("ip", "-6", "neigh", "add", "proxy", netIP, "dev", iface).Run()
+
+	// 检查 nftables FORWARD 规则
+	if !nftables.RuleExists("forward", fwdComment) {
+		zap.L().Info("[Reconcile] IPv6 FORWARD 规则缺失，重建", zap.String("ipv6", netIP))
+		rule := fmt.Sprintf("ip6 saddr %s accept", eipCIDR)
+		nftables.AddRuleSilent("forward", rule, fwdComment)
 	}
 }
