@@ -16,6 +16,8 @@ import StoragePage from '@/pages/admin/StoragePage'
 import SecurityPage from '@/pages/admin/SecurityPage'
 import SecurityPlaceholderPage from '@/pages/admin/SecurityPlaceholderPage'
 import SettingsPage from '@/pages/admin/SettingsPage'
+import ConsolePage from '@/pages/console/ConsolePage'
+import VNCPage from '@/pages/console/VNCPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -59,6 +61,8 @@ export default function AppRoutes() {
       <Routes>
         <Route path="/init" element={<InitPage />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/console" element={<ConsolePage />} />
+        <Route path="/vnc" element={<VNCPage />} />
         <Route
           path="/admin"
           element={

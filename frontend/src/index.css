@@ -49,34 +49,77 @@
     --color-success: #34c759;
     --color-warning: #ff9f0a;
     --color-info: #007aff;
+    --color-red-50: #fef2f2;
+    --color-blue-50: #eff6ff;
   }
 
   .dark {
-    --background: 0 0% 7%;
-    --foreground: 0 0% 96%;
-    --card: 0 0% 11%;
-    --card-foreground: 0 0% 96%;
-    --popover: 0 0% 11%;
-    --popover-foreground: 0 0% 96%;
-    --primary: 0 0% 96%;
-    --primary-foreground: 0 0% 7%;
-    --secondary: 0 0% 15%;
-    --secondary-foreground: 0 0% 96%;
-    --muted: 0 0% 15%;
-    --muted-foreground: 240 5% 65%;
-    --accent: 0 0% 15%;
-    --accent-foreground: 0 0% 96%;
+    --background: 0 0% 0%;
+    --foreground: 0 0% 95%;
+    --card: 0 0% 5%;
+    --card-foreground: 0 0% 95%;
+    --popover: 0 0% 8%;
+    --popover-foreground: 0 0% 95%;
+    --primary: 0 0% 95%;
+    --primary-foreground: 0 0% 0%;
+    --secondary: 0 0% 10%;
+    --secondary-foreground: 0 0% 95%;
+    --muted: 0 0% 10%;
+    --muted-foreground: 0 0% 55%;
+    --accent: 0 0% 12%;
+    --accent-foreground: 0 0% 95%;
     --destructive: 0 62% 30%;
     --destructive-foreground: 0 0% 100%;
-    --border: 0 0% 20%;
-    --input: 0 0% 20%;
-    --ring: 0 0% 96%;
+    --border: 0 0% 15%;
+    --input: 0 0% 15%;
+    --ring: 0 0% 95%;
+
+    --color-black: #ffffff;
+    --color-white: #0a0a0a;
+    --color-gray-50: #0a0a0a;
+    --color-gray-100: #141414;
+    --color-gray-200: #1e1e1e;
+    --color-gray-300: #2a2a2a;
+    --color-gray-400: #3a3a3a;
+    --color-gray-500: #6a6a6a;
+    --color-gray-600: #8a8a8a;
+    --color-gray-700: #ababab;
+    --color-gray-800: #cccccc;
+    --color-gray-900: #e8e8e8;
+    --color-danger: #ff453a;
+    --color-success: #30d158;
+    --color-warning: #ffd60a;
+    --color-info: #0a84ff;
+    --color-red-50: #2a1212;
+    --color-blue-50: #0d1a2a;
   }
 }
 
 @layer base {
   * {
     @apply border-border;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-gray-400);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-gray-500);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-gray-400) transparent;
   }
   html {
     -webkit-font-smoothing: antialiased;
@@ -95,6 +138,15 @@
   h1, h2, h3, h4, h5, h6 {
     @apply font-display tracking-tight;
   }
+
+  /* 全局输入框暗色模式适配 */
+  input, select, textarea {
+    background-color: var(--color-white);
+    color: var(--color-black);
+  }
+  input::placeholder, textarea::placeholder {
+    color: var(--color-gray-400);
+  }
 }
 
 .font-number {
@@ -102,6 +154,37 @@
 }
 
 @layer utilities {
+  /* 语义化背景 */
+  .bg-surface { background-color: var(--color-white); }
+  .bg-surface-secondary { background-color: var(--color-gray-50); }
+  .bg-surface-hover:hover { background-color: var(--color-gray-100); }
+  .bg-primary { background-color: var(--color-black); }
+
+  /* 语义化文字 */
+  .text-primary { color: var(--color-black); }
+  .text-secondary { color: var(--color-gray-700); }
+  .text-tertiary { color: var(--color-gray-500); }
+  .text-muted { color: var(--color-gray-400); }
+  .text-primary-hover:hover { color: var(--color-black); }
+  .text-secondary-hover:hover { color: var(--color-gray-700); }
+
+  /* 语义化边框 */
+  .border-surface { border-color: var(--color-gray-200); }
+  .border-surface-light { border-color: var(--color-gray-100); }
+  .border-surface-strong { border-color: var(--color-gray-300); }
+  .border-surface-hover:hover { border-color: var(--color-gray-400); }
+  .border-primary { border-color: var(--color-black); }
+  .divide-surface-light > * + * { border-color: var(--color-gray-100); }
+
+  /* 语义化按钮 */
+  .btn-primary {
+    background-color: var(--color-black);
+    color: var(--color-white);
+  }
+  .btn-primary-hover:hover {
+    background-color: var(--color-gray-800);
+  }
+
   .glass {
     @apply bg-white/80 dark:bg-black/60 backdrop-blur-apple border border-white/20 dark:border-white/10;
   }

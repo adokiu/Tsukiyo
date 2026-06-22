@@ -33,7 +33,7 @@ export default function AuditLogsPage() {
       key: 'success',
       title: '结果',
       render: (row: Log) => (
-        <span className={`text-xs px-2 py-1 rounded ${row.success ? 'bg-black text-white' : 'bg-red-100 text-red-600'}`}>
+        <span className={`text-xs px-2 py-1 rounded ${row.success ? 'bg-primary text-white' : 'bg-red-100 text-red-600'}`}>
           {row.success ? '成功' : '失败'}
         </span>
       ),
@@ -44,8 +44,8 @@ export default function AuditLogsPage() {
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center gap-3">
-        <ClipboardList size={22} className="text-black" />
-        <h1 className="text-xl font-semibold text-black">操作日志</h1>
+        <ClipboardList size={22} className="text-primary" />
+        <h1 className="text-xl font-semibold text-primary">操作日志</h1>
       </div>
       <DataTable columns={columns} data={logs} rowKey={(r) => r.id} loading={loading} />
     </div>

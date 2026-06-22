@@ -11,7 +11,7 @@ export default function SecurityURLFilterPage() {
           <h1 className="page-title">{t('nav.urlFilter')}</h1>
         </div>
       </div>
-      <div className="page-card p-8 text-center text-gray-500">
+      <div className="page-card p-8 text-center text-tertiary">
         {t('common.noData')}
       </div>
     </div>

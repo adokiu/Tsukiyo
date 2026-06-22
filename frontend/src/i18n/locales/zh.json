@@ -51,7 +51,18 @@
     "unknown": "未知",
     "yes": "是",
     "no": "否",
-    "actions": "操作"
+    "actions": "操作",
+    "creating": "创建中",
+    "starting": "启动中",
+    "stopping": "停止中",
+    "restarting": "重启中",
+    "reinstalling": "重装中",
+    "resizing": "调整中",
+    "deleting": "删除中",
+    "banned": "已封禁",
+    "expired": "已过期",
+    "nodeOffline": "节点离线",
+    "missing": "实例缺失"
   },
   "init": {
     "title": "欢迎使用 Tsukiyo",
@@ -262,7 +273,10 @@
     "deleteSnapshot": "删除快照",
     "network": "网络",
     "traffic": "流量",
-    "firewallRules": "防火墙规则"
+    "firewallRules": "防火墙规则",
+    "forceDelete": "强制删除",
+    "forceDeleteConfirm": "Agent 离线，将直接删除数据库记录，确认？",
+    "changeStatus": "修改状态"
   },
   "settings": {
     "title": "设置"

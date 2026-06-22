@@ -1,8 +1,15 @@
-import { useEffect, useState, useRef } from 'react'
-import { List, Clock, CheckCircle, XCircle, AlertCircle, RefreshCw } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { RefreshCw } from 'lucide-react'
 import apiClient from '@/api/client'
 import { DataTable, type Column } from '@/components/DataTable/DataTable'
 import { Button } from '@/components/Button/Button'
+import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
+import { useToastStore } from '@/stores/toast'
+import { PageLayout } from '@/components/PageLayout/PageLayout'
+import { SearchInput } from '@/components/SearchInput/SearchInput'
+import { FilterBar, type FilterField } from '@/components/FilterBar/FilterBar'
+import { useListQuery } from '@/hooks/useListQuery'
+import '@/components/PageTransition/PageTransition.css'
 
 interface Task {
   id: string
@@ -28,12 +35,12 @@ interface TaskLog {
   created_at: string
 }
 
-const statusMap: Record<string, { label: string; color: string; icon: any }> = {
-  pending: { label: '待处理', color: 'bg-gray-100 text-gray-600', icon: Clock },
-  running: { label: '执行中', color: 'bg-blue-100 text-blue-600', icon: RefreshCw },
-  completed: { label: '已完成', color: 'bg-green-100 text-green-600', icon: CheckCircle },
-  failed: { label: '失败', color: 'bg-red-100 text-red-600', icon: XCircle },
-  canceled: { label: '已取消', color: 'bg-yellow-100 text-yellow-600', icon: AlertCircle },
+const statusMap: Record<string, { label: string; tag: string }> = {
+  pending: { label: '待处理', tag: 'data-table-tag--offline' },
+  running: { label: '执行中', tag: 'data-table-tag--online' },
+  completed: { label: '已完成', tag: 'data-table-tag--completed' },
+  failed: { label: '失败', tag: 'data-table-tag--failed' },
+  canceled: { label: '已取消', tag: 'data-table-tag--offline' },
 }
 
 const typeMap: Record<string, string> = {
@@ -61,100 +68,51 @@ const typeMap: Record<string, string> = {
 }
 
 export default function TasksPage() {
-  const [tasks, setTasks] = useState<Task[]>([])
+  const toast = useToastStore()
+  const { data: tasks, total, loading, page, perPage, search, filters, setPage, setPerPage, setSearch, setFilter, refresh } = useListQuery<Task>('/tasks', {}, {
+    wsUrl: '/ws/tasks',
+    wsType: 'task_status',
+    wsUpdate: (prev: any[], msg: any) => {
+      return prev.map((task: any) =>
+        task.id === msg.task_id
+          ? { ...task, status: msg.status, error: msg.error }
+          : task
+      )
+    },
+    wsRefreshTypes: ['data_refresh'],
+  })
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [logs, setLogs] = useState<TaskLog[]>([])
-  const [loading, setLoading] = useState(true)
-  const [page, setPage] = useState(1)
-  const [total, setTotal] = useState(0)
-  const [statusFilter, setStatusFilter] = useState('')
-  const wsRef = useRef<WebSocket | null>(null)
-
-  const fetchTasks = async () => {
-    setLoading(true)
-    try {
-      const params: any = { page, per_page: 20 }
-      if (statusFilter) params.status = statusFilter
-      const res = await apiClient.get('/tasks', { params })
-      setTasks(res.data.data || [])
-      setTotal(res.data.total || 0)
-    } finally {
-      setLoading(false)
-    }
-  }
+  const [logPanelOpen, setLogPanelOpen] = useState(false)
 
   const fetchLogs = async (taskId: string) => {
     try {
       const res = await apiClient.get(`/tasks/${taskId}/logs`)
       setLogs(res.data.data || [])
-    } catch (err) {
-      console.error('获取任务日志失败', err)
+    } catch {
+      toast.error('获取任务日志失败')
     }
   }
-
-  const connectWebSocket = () => {
-    if (wsRef.current) {
-      wsRef.current.close()
-    }
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${proto}//${window.location.host}/ws/images`
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
-
-    ws.onopen = () => {
-      console.log('任务状态 WebSocket 已连接')
-    }
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg.type === 'task_status') {
-          setTasks((prev) =>
-            prev.map((task) =>
-              task.id === msg.task_id
-                ? { ...task, status: msg.status, error: msg.error }
-                : task
-            )
-          )
-          if (selectedTask && selectedTask.id === msg.task_id) {
-            setSelectedTask((prev) => prev ? { ...prev, status: msg.status, error: msg.error } : null)
-            fetchLogs(msg.task_id)
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-    ws.onclose = () => {
-      console.log('任务状态 WebSocket 已断开，3秒后重连')
-      wsRef.current = null
-      setTimeout(connectWebSocket, 3000)
-    }
-    ws.onerror = (err) => {
-      console.error('任务状态 WebSocket 错误', err)
-    }
-  }
-
-  useEffect(() => {
-    fetchTasks()
-    connectWebSocket()
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close()
-        wsRef.current = null
-      }
-    }
-  }, [page, statusFilter])
 
   useEffect(() => {
     if (selectedTask) {
       fetchLogs(selectedTask.id)
     }
-  }, [selectedTask])
+  }, [selectedTask?.id])
 
   const columns: Column<Task>[] = [
     {
+      key: 'id',
+      title: 'ID',
+      width: 100,
+      render: (row: Task) => (
+        <span className="text-sm font-number text-tertiary">{row.id.slice(0, 8)}</span>
+      ),
+    },
+    {
       key: 'type',
       title: '任务类型',
+      width: 140,
       render: (row: Task) => (
         <span className="text-sm">{typeMap[row.type] || row.type}</span>
       ),
@@ -162,12 +120,11 @@ export default function TasksPage() {
     {
       key: 'status',
       title: '状态',
+      width: 100,
       render: (row: Task) => {
         const status = statusMap[row.status] || statusMap.pending
-        const Icon = status.icon
         return (
-          <span className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded ${status.color}`}>
-            <Icon size={14} />
+          <span className={`data-table-tag ${status.tag}`}>
             {status.label}
           </span>
         )
@@ -176,6 +133,7 @@ export default function TasksPage() {
     {
       key: 'node',
       title: '节点',
+      width: 120,
       render: (row: Task) => (
         <span className="text-sm">{row.node_name || row.node_id}</span>
       ),
@@ -183,15 +141,25 @@ export default function TasksPage() {
     {
       key: 'instance',
       title: '实例',
+      width: 140,
       render: (row: Task) => (
         <span className="text-sm">{row.instance_name || '-'}</span>
       ),
     },
     {
+      key: 'retry_count',
+      title: '重试',
+      width: 60,
+      render: (row: Task) => (
+        <span className="font-number text-sm text-tertiary">{row.retry_count || 0}</span>
+      ),
+    },
+    {
       key: 'created_at',
       title: '创建时间',
+      width: 180,
       render: (row: Task) => (
-        <span className="text-sm text-gray-600">
+        <span className="text-sm text-tertiary font-number">
           {new Date(row.created_at).toLocaleString('zh-CN')}
         </span>
       ),
@@ -201,123 +169,123 @@ export default function TasksPage() {
       title: '操作',
       width: 100,
       render: (row: Task) => (
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => setSelectedTask(row)}
+        <button
+          className="data-table-link-btn"
+          onClick={() => { setSelectedTask(row); setLogPanelOpen(true) }}
         >
           查看日志
-        </Button>
+        </button>
       ),
     },
   ]
 
+  const statusOptions = [
+    { label: '待处理', value: 'pending' },
+    { label: '执行中', value: 'running' },
+    { label: '已完成', value: 'completed' },
+    { label: '失败', value: 'failed' },
+    { label: '已取消', value: 'canceled' },
+  ]
+
   return (
-    <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <List size={22} className="text-black" />
-          <h1 className="text-xl font-semibold text-black">任务队列</h1>
-        </div>
-        <div className="flex items-center gap-3">
-          <select
-            className="text-sm border border-gray-200 rounded-md px-3 py-1.5 bg-white focus:border-black focus:outline-none"
-            value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value)
-              setPage(1)
-            }}
-          >
-            <option value="">全部状态</option>
-            <option value="pending">待处理</option>
-            <option value="running">执行中</option>
-            <option value="completed">已完成</option>
-            <option value="failed">失败</option>
-            <option value="canceled">已取消</option>
-          </select>
-          <Button size="sm" variant="ghost" onClick={() => fetchTasks()}>
-            <RefreshCw size={14} className="mr-1" />
-            刷新
-          </Button>
-        </div>
+    <PageLayout
+      leftSlot={
+        <>
+          <SearchInput value={search} placeholder="搜索任务类型、节点、实例" onChange={setSearch} />
+          <FilterBar
+            fields={[
+              { key: 'status', label: '状态', options: statusOptions },
+            ] as FilterField[]}
+            values={filters}
+            onChange={setFilter}
+          />
+        </>
+      }
+      rightSlot={
+        <Button variant="ghost" onClick={() => refresh()} icon={<RefreshCw size={16} />}>
+          刷新
+        </Button>
+      }
+    >
+      <div className="page-transition__content" style={{ flex: 1, overflow: 'auto' }}>
+      <DataTable
+        columns={columns}
+        data={tasks}
+        rowKey={(r) => r.id}
+        loading={loading}
+        emptyText="暂无任务"
+        pagination={{ page, size: perPage, total }}
+        onPageChange={setPage}
+        onSizeChange={setPerPage}
+      />
+
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2">
-          <DataTable
-            columns={columns}
-            data={tasks}
-            rowKey={(r) => r.id}
-            loading={loading}
-          />
-          {total > 20 && (
-            <div className="flex items-center justify-between mt-4 px-4">
-              <span className="text-sm text-gray-600">
-                共 {total} 条记录
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={page === 1}
-                  onClick={() => setPage(page - 1)}
-                >
-                  上一页
-                </Button>
-                <span className="text-sm">第 {page} 页</span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={page * 20 >= total}
-                  onClick={() => setPage(page + 1)}
-                >
-                  下一页
-                </Button>
-              </div>
-            </div>
-          )}
-        </div>
-
+      {/* 任务日志侧边栏 */}
+      <SlidePanel
+        open={logPanelOpen}
+        onClose={() => setLogPanelOpen(false)}
+        title={`任务日志 - ${selectedTask ? (typeMap[selectedTask.type] || selectedTask.type) : ''}`}
+        width={720}
+      >
         {selectedTask && (
-          <div className="bg-white border border-gray-200 rounded-lg p-4">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="font-semibold">任务日志</h3>
-              <Button size="sm" variant="ghost" onClick={() => setSelectedTask(null)}>
-                关闭
-              </Button>
+          <div className="space-y-4">
+            {/* 任务详情 */}
+            <div className="overflow-hidden rounded-lg border border-surface bg-surface">
+              {[
+                ['任务 ID', selectedTask.id],
+                ['类型', typeMap[selectedTask.type] || selectedTask.type],
+                ['状态', statusMap[selectedTask.status]?.label || selectedTask.status],
+                ['节点', selectedTask.node_name || selectedTask.node_id],
+                ['实例', selectedTask.instance_name || '-'],
+                ['重试次数', String(selectedTask.retry_count || 0)],
+                ['创建时间', new Date(selectedTask.created_at).toLocaleString('zh-CN')],
+                ['开始时间', selectedTask.started_at ? new Date(selectedTask.started_at).toLocaleString('zh-CN') : '-'],
+                ['完成时间', selectedTask.completed_at ? new Date(selectedTask.completed_at).toLocaleString('zh-CN') : '-'],
+              ].map(([label, value]) => (
+                <div key={label} className="grid gap-2 border-b border-surface-light px-3 py-2 text-xs last:border-b-0 md:grid-cols-[120px_1fr]">
+                  <div className="font-medium text-tertiary">{label}</div>
+                  <div className="font-number whitespace-pre-wrap break-words text-secondary">{value}</div>
+                </div>
+              ))}
             </div>
-            <div className="space-y-2 mb-4 text-sm">
-              <div><span className="text-gray-600">任务 ID:</span> {selectedTask.id}</div>
-              <div><span className="text-gray-600">类型:</span> {typeMap[selectedTask.type] || selectedTask.type}</div>
-              <div><span className="text-gray-600">状态:</span> {statusMap[selectedTask.status]?.label || selectedTask.status}</div>
-              {selectedTask.error && (
-                <div><span className="text-gray-600">错误:</span> <span className="text-red-600">{selectedTask.error}</span></div>
-              )}
-            </div>
-            <div className="bg-gray-900 rounded-lg p-3 h-96 overflow-y-auto">
-              {logs.length === 0 ? (
-                <div className="text-gray-500 text-sm">暂无日志</div>
-              ) : (
-                logs.map((log) => (
-                  <div
-                    key={log.id}
-                    className={`text-xs font-mono mb-1 ${
-                      log.level === 'error' ? 'text-red-400' :
-                      log.level === 'warn' ? 'text-yellow-400' :
-                      'text-green-400'
-                    }`}
-                  >
-                    <span className="text-gray-500">
-                      [{new Date(log.created_at).toLocaleTimeString('zh-CN')}]
-                    </span>
-                    <span className="ml-2">{log.message}</span>
-                  </div>
-                ))
-              )}
+
+            {/* 错误信息 */}
+            {selectedTask.error && (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3">
+                <div className="text-xs font-medium text-red-800 mb-1">错误信息</div>
+                <div className="text-xs text-red-600 whitespace-pre-wrap break-words">{selectedTask.error}</div>
+              </div>
+            )}
+
+            {/* 日志输出 */}
+            <div>
+              <h3 className="mb-2 text-sm font-semibold text-primary">日志输出</h3>
+              <div className="bg-gray-900 rounded-lg p-3 h-96 overflow-y-auto">
+                {logs.length === 0 ? (
+                  <div className="text-tertiary text-sm">暂无日志</div>
+                ) : (
+                  logs.map((log) => (
+                    <div
+                      key={log.id}
+                      className={`text-xs font-mono mb-1 ${
+                        log.level === 'error' ? 'text-red-400' :
+                        log.level === 'warn' ? 'text-yellow-400' :
+                        'text-green-400'
+                      }`}
+                    >
+                      <span className="text-tertiary">
+                        [{new Date(log.created_at).toLocaleTimeString('zh-CN')}]
+                      </span>
+                      <span className="ml-2">{log.message}</span>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
           </div>
         )}
-      </div>
-    </div>
+      </SlidePanel>
+    </PageLayout>
   )
 }

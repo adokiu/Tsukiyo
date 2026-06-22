@@ -122,12 +122,12 @@ export default function SecurityPage() {
     {
       key: 'instance_id',
       title: '实例',
-      render: (row) => <span className="text-xs text-gray-500 font-mono">{row.instance_id || '-'}</span>,
+      render: (row) => <span className="text-xs text-tertiary font-mono">{row.instance_id || '-'}</span>,
     },
     {
       key: 'node_id',
       title: '节点',
-      render: (row) => <span className="text-xs text-gray-500 font-mono">{row.node_id?.slice(0, 8) || '-'}</span>,
+      render: (row) => <span className="text-xs text-tertiary font-mono">{row.node_id?.slice(0, 8) || '-'}</span>,
     },
     {
       key: 'source_ip',
@@ -141,7 +141,7 @@ export default function SecurityPage() {
         <span className={`text-xs px-2 py-0.5 rounded-full ${
           row.status === 'open' ? 'bg-red-100 text-red-700' :
           row.status === 'resolved' ? 'bg-green-100 text-green-700' :
-          'bg-gray-100 text-gray-600'
+          'bg-surface-secondary text-tertiary'
         }`}>
           {row.status === 'open' ? '待处理' : row.status === 'resolved' ? '已解决' : '已忽略'}
         </span>
@@ -150,7 +150,7 @@ export default function SecurityPage() {
     {
       key: 'detected_at',
       title: '检测时间',
-      render: (row) => <span className="text-xs text-gray-500">{new Date(row.detected_at).toLocaleString()}</span>,
+      render: (row) => <span className="text-xs text-tertiary">{new Date(row.detected_at).toLocaleString()}</span>,
     },
     {
       key: 'action',
@@ -166,7 +166,7 @@ export default function SecurityPage() {
             解决
           </button>
           <button
-            className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700"
+            className="flex items-center gap-1 text-xs text-tertiary hover:text-secondary"
             onClick={() => handleIgnore(row.id)}
             title="忽略"
           >
@@ -174,7 +174,7 @@ export default function SecurityPage() {
             忽略
           </button>
         </div>
-      ) : <span className="text-xs text-gray-400">-</span>,
+      ) : <span className="text-xs text-muted">-</span>,
     },
   ]
 
@@ -182,8 +182,8 @@ export default function SecurityPage() {
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Shield size={22} className="text-black" />
-          <h1 className="text-xl font-semibold text-black">安全管理</h1>
+          <Shield size={22} className="text-primary" />
+          <h1 className="text-xl font-semibold text-primary">安全管理</h1>
         </div>
         <Button size="sm" onClick={() => { fetchAlerts(); fetchSummary() }}>
           <RefreshCw size={14} className="mr-1" />
@@ -205,14 +205,14 @@ export default function SecurityPage() {
           <button
             key={s || 'all'}
             className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
-              statusFilter === s ? 'bg-black text-white border-black' : 'bg-white text-gray-600 border-gray-300 hover:border-gray-400'
+              statusFilter === s ? 'bg-primary text-white border-primary' : 'bg-surface text-tertiary border-surface-strong hover:border-surface-hover'
             }`}
             onClick={() => setStatusFilter(s)}
           >
             {s === 'open' ? '待处理' : s === 'resolved' ? '已解决' : s === 'ignored' ? '已忽略' : '全部'}
           </button>
         ))}
-        <span className="text-xs text-gray-400 self-center ml-2">共 {total} 条</span>
+        <span className="text-xs text-muted self-center ml-2">共 {total} 条</span>
       </div>
 
       <DataTable columns={columns} data={alerts} rowKey={(r) => r.id} loading={loading} />
@@ -223,7 +223,7 @@ export default function SecurityPage() {
 function StatCard({ label, value, color }: { label: string; value: number; color: string }) {
   return (
     <div className="rounded-lg border p-4">
-      <p className="text-xs text-gray-500">{label}</p>
+      <p className="text-xs text-tertiary">{label}</p>
       <p className={`text-2xl font-bold ${color}`}>{value}</p>
     </div>
   )

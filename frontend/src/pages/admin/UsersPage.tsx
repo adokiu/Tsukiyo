@@ -52,8 +52,8 @@ export default function UsersPage() {
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Users size={22} className="text-black" />
-          <h1 className="text-xl font-semibold text-black">用户管理</h1>
+          <Users size={22} className="text-primary" />
+          <h1 className="text-xl font-semibold text-primary">用户管理</h1>
         </div>
         <Button onClick={() => toast.info('新建用户功能待完善')}>新建用户</Button>
       </div>

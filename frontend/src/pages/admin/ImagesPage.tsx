@@ -1,10 +1,15 @@
-import { useEffect, useState, useRef, useMemo, Fragment } from 'react'
-import { HardDrive, Download, Square, CheckCircle, AlertCircle, Server, Trash2, RefreshCw, Monitor, Box } from 'lucide-react'
+import { useEffect, useState, useRef, useMemo, Fragment, useCallback } from 'react'
+import { Download, Square, CheckCircle, AlertCircle, Trash2, RefreshCw, Monitor, Box, Server, X } from 'lucide-react'
 import apiClient from '@/api/client'
 import { Button } from '@/components/Button/Button'
 import { Select } from '@/components/Select/Select'
+import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
+import { Modal } from '@/components/Modal/Modal'
 import { useToastStore } from '@/stores/toast'
+import { PageLayout } from '@/components/PageLayout/PageLayout'
 import { getOSImage } from '@/utils/osImageHelper'
+import '@/components/PageTransition/PageTransition.css'
+import '@/components/DataTable/DataTable.css'
 
 interface Node {
   id: string
@@ -14,7 +19,8 @@ interface Node {
   is_online: boolean
 }
 
-interface Image {
+// 远程镜像（下载tab）
+interface RemoteImage {
   id: string
   alias: string
   name: string
@@ -28,6 +34,31 @@ interface Image {
   total_bytes?: number
   speed_bps?: number
   download_error?: string
+}
+
+// 已安装镜像（agent上报）
+interface InstalledImage {
+  id: string
+  fingerprint: string
+  alias: string
+  display_name: string
+  type: string
+  architecture: string
+  size: number
+  description: string
+  image_source: string
+  upload_date: string
+  category_id?: string | null
+  category_name?: string
+  install_ssh: boolean
+}
+
+// 分类
+interface Category {
+  id: string
+  name: string
+  image_type: string
+  sort_order: number
 }
 
 const DISTRO_INFO: Record<string, { name: string; desc: string }> = {
@@ -75,22 +106,58 @@ function formatArch(arch: string): string {
   }
 }
 
+function sourceLabel(source: string): string {
+  switch (source) {
+    case 'spiritlhl': return 'Spiritlhl'
+    case 'images': return '官方'
+    case 'manual': return '手动导入'
+    default: return source || '未知'
+  }
+}
+
+function typeLabel(type: string): string {
+  switch (type) {
+    case 'container': return '容器'
+    case 'virtual-machine': return '虚拟机'
+    default: return type
+  }
+}
+
 export default function ImagesPage() {
   const toast = useToastStore()
-  const [images, setImages] = useState<Image[]>([])
+  const [activeTab, setActiveTab] = useState<'installed' | 'remote'>('installed')
   const [nodes, setNodes] = useState<Node[]>([])
   const [selectedNode, setSelectedNode] = useState('')
   const [loading, setLoading] = useState(true)
-  const [imageSource, setImageSource] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
+  const wsManualClose = useRef(false)
 
-  // 局部更新单个镜像，按 image_key (id) 匹配
-  const patchImage = (imageKey: string, patch: Partial<Image>) => {
-    setImages((prev) =>
+  // 远程镜像tab状态
+  const [remoteImages, setRemoteImages] = useState<RemoteImage[]>([])
+  const [imageSource, setImageSource] = useState('')
+
+  // 已安装镜像tab状态
+  const [installedImages, setInstalledImages] = useState<InstalledImage[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
+  const [installedFilterType, setInstalledFilterType] = useState('')
+  const [editingImage, setEditingImage] = useState<InstalledImage | null>(null)
+  const [editDisplayName, setEditDisplayName] = useState('')
+  const [editCategoryName, setEditCategoryName] = useState('')
+  const [editInstallSSH, setEditInstallSSH] = useState(false)
+  const [editPanelOpen, setEditPanelOpen] = useState(false)
+  const [categoryInput, setCategoryInput] = useState('')
+
+  // 删除确认
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [confirmImage, setConfirmImage] = useState<RemoteImage | null>(null)
+
+  // 局部更新单个远程镜像
+  const patchRemoteImage = useCallback((imageKey: string, patch: Partial<RemoteImage>) => {
+    setRemoteImages((prev) =>
       prev.map((img) => (img.id === imageKey ? { ...img, ...patch } : img))
     )
-  }
+  }, [])
 
   const fetchNodes = async () => {
     try {
@@ -111,15 +178,44 @@ export default function ImagesPage() {
     }
   }
 
-  const fetchImages = async (nodeId?: string, silent = false) => {
+  const fetchRemoteImages = async (nodeId?: string, silent = false) => {
     if (!silent) setLoading(true)
     try {
       const id = nodeId ?? selectedNode
-      if (!id) { setImages([]); return }
+      if (!id) { setRemoteImages([]); return }
       const res = await apiClient.get('/images', { params: { node_id: id } })
-      setImages(res.data.data || [])
+      setRemoteImages(res.data.data || [])
     } finally {
       if (!silent) setLoading(false)
+    }
+  }
+
+  const fetchInstalledImages = async (nodeId?: string, silent = false) => {
+    if (!silent) setLoading(true)
+    try {
+      const id = nodeId ?? selectedNode
+      if (!id) { setInstalledImages([]); return }
+      const params: Record<string, string> = { node_id: id }
+      if (installedFilterType) params.type = installedFilterType
+      const res = await apiClient.get('/images/installed', { params })
+      setInstalledImages(res.data.data || [])
+    } catch {
+      setInstalledImages([])
+    } finally {
+      if (!silent) setLoading(false)
+    }
+  }
+
+  const fetchCategories = async (nodeId?: string) => {
+    const id = nodeId ?? selectedNode
+    if (!id) { setCategories([]); return }
+    try {
+      const params: Record<string, string> = { node_id: id }
+      if (installedFilterType) params.type = installedFilterType
+      const res = await apiClient.get('/images/categories', { params })
+      setCategories(res.data.data || [])
+    } catch {
+      setCategories([])
     }
   }
 
@@ -136,7 +232,7 @@ export default function ImagesPage() {
     try {
       await apiClient.put('/images/source', { source: String(value) })
       toast.success('镜像源已切换，缓存已刷新')
-      if (selectedNode) await fetchImages(selectedNode, true)
+      if (selectedNode) await fetchRemoteImages(selectedNode, true)
     } catch (err: any) {
       toast.error(err.response?.data?.error || '切换失败')
     } finally {
@@ -147,9 +243,17 @@ export default function ImagesPage() {
   const handleRefresh = async () => {
     setRefreshing(true)
     try {
-      await apiClient.post('/images/refresh', null, { params: selectedNode ? { node_id: selectedNode } : {} })
-      toast.success('镜像缓存已刷新')
-      if (selectedNode) await fetchImages(selectedNode, true)
+      if (activeTab === 'installed') {
+        if (selectedNode) {
+          await apiClient.post('/images/sync', null, { params: { node_id: selectedNode } })
+          toast.success('同步任务已触发')
+          setTimeout(() => fetchInstalledImages(selectedNode, true), 2000)
+        }
+      } else {
+        await apiClient.post('/images/refresh', null, { params: selectedNode ? { node_id: selectedNode } : {} })
+        toast.success('镜像缓存已刷新')
+        if (selectedNode) await fetchRemoteImages(selectedNode, true)
+      }
     } catch (err: any) {
       toast.error(err.response?.data?.error || '刷新失败')
     } finally {
@@ -168,18 +272,28 @@ export default function ImagesPage() {
         const msg = JSON.parse(event.data)
         if (msg.type === 'image_progress') {
           const p = msg.payload
-          patchImage(p.image_id, {
-            stage: p.stage,
-            progress: p.progress,
-            speed_bps: p.speed_bps,
-            download_error: p.error,
-          })
+          if (p.stage === 'sync') {
+            // 镜像列表同步完成，刷新已安装镜像
+            if (selectedNode) fetchInstalledImages(selectedNode, true)
+          } else {
+            patchRemoteImage(p.image_id, {
+              stage: p.stage,
+              progress: p.progress,
+              speed_bps: p.speed_bps,
+              download_error: p.error,
+            })
+          }
         }
       } catch { /* ignore */ }
     }
     ws.onclose = () => {
       wsRef.current = null
-      setTimeout(connectWebSocket, 3000)
+      if (!wsManualClose.current) {
+        setTimeout(connectWebSocket, 3000)
+      }
+    }
+    ws.onerror = () => {
+      ws.close()
     }
   }
 
@@ -190,19 +304,34 @@ export default function ImagesPage() {
     }
     init()
     connectWebSocket()
-    return () => { wsRef.current?.close(); wsRef.current = null }
+    return () => { wsManualClose.current = true; wsRef.current?.close(); wsRef.current = null }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    if (selectedNode) fetchImages(selectedNode)
+    if (selectedNode) {
+      if (activeTab === 'installed') {
+        fetchInstalledImages(selectedNode)
+        fetchCategories(selectedNode)
+      } else {
+        fetchRemoteImages(selectedNode)
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedNode])
 
-  const handleDownload = async (image: Image) => {
+  useEffect(() => {
+    if (selectedNode && activeTab === 'installed') {
+      fetchInstalledImages(selectedNode, true)
+      fetchCategories(selectedNode)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [installedFilterType])
+
+  const handleDownload = async (image: RemoteImage) => {
     const nodeId = selectedNode
     if (!nodeId) { toast.error('请先选择节点'); return }
-    patchImage(image.id, { stage: 'downloading', progress: 0 })
+    patchRemoteImage(image.id, { stage: 'downloading', progress: 0 })
     try {
       await apiClient.post('/images/download', {
         node_id: nodeId,
@@ -210,12 +339,12 @@ export default function ImagesPage() {
       })
       toast.success('下载任务已下发')
     } catch (err: any) {
-      patchImage(image.id, { stage: undefined, progress: undefined })
+      patchRemoteImage(image.id, { stage: undefined, progress: undefined })
       toast.error(err.response?.data?.error || '下发失败')
     }
   }
 
-  const handleCancel = async (image: Image) => {
+  const handleCancel = async (image: RemoteImage) => {
     const nodeId = selectedNode
     if (!nodeId) return
     try {
@@ -226,33 +355,68 @@ export default function ImagesPage() {
     }
   }
 
-  const handleDelete = async (image: Image) => {
+  const handleDeleteRemote = async (image: RemoteImage) => {
+    setConfirmImage(image)
+    setConfirmOpen(true)
+  }
+
+  const doDelete = async () => {
+    const image = confirmImage
     const nodeId = selectedNode
-    if (!nodeId) { toast.error('请先选择节点'); return }
-    if (!confirm(`确认删除镜像 ${image.alias} (${image.type === 'container' ? '容器' : '虚拟机'}, ${formatArch(image.arch)})？`)) return
+    if (!image || !nodeId) return
     try {
       await apiClient.delete('/images', { data: { node_id: nodeId, image_key: image.id } })
       toast.success('删除任务已下发')
-      fetchImages(nodeId)
+      fetchRemoteImages(nodeId)
+      setTimeout(() => fetchInstalledImages(nodeId, true), 2000)
     } catch (err: any) {
       toast.error(err.response?.data?.error || '删除失败')
     }
   }
 
-  // 按发行版分组
-  const groupedImages = useMemo(() => {
-    const groups: Record<string, Image[]> = {}
-    for (const img of images) {
+  // 已安装镜像编辑
+  const handleEditImage = (img: InstalledImage) => {
+    setEditingImage(img)
+    setEditDisplayName(img.display_name)
+    setEditCategoryName(img.category_name || '')
+    setEditInstallSSH(img.install_ssh)
+    setCategoryInput('')
+    setEditPanelOpen(true)
+  }
+
+  const doEditImage = async () => {
+    if (!editingImage || !selectedNode) return
+    try {
+      await apiClient.put('/images/alias', {
+        node_id: selectedNode,
+        fingerprint: editingImage.fingerprint,
+        image_type: editingImage.type,
+        category_name: editCategoryName || '',
+        display_name: editDisplayName,
+        install_ssh: editInstallSSH,
+      })
+      toast.success('镜像已更新')
+      setEditPanelOpen(false)
+      fetchInstalledImages(selectedNode, true)
+      fetchCategories(selectedNode)
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || '更新失败')
+    }
+  }
+
+  // 远程镜像 - 按发行版分组
+  const groupedRemoteImages = useMemo(() => {
+    const groups: Record<string, RemoteImage[]> = {}
+    for (const img of remoteImages) {
       const key = img.distro || 'unknown'
       if (!groups[key]) groups[key] = []
       groups[key].push(img)
     }
     return Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0]))
-  }, [images])
+  }, [remoteImages])
 
-  // 按 release+arch 分组，同一行显示 VM 和容器
-  const groupedByReleaseArch = (distroImages: Image[]) => {
-    const map: Record<string, { release: string; arch: string; vm?: Image; container?: Image }> = {}
+  const groupedByReleaseArch = (distroImages: RemoteImage[]) => {
+    const map: Record<string, { release: string; arch: string; vm?: RemoteImage; container?: RemoteImage }> = {}
     for (const img of distroImages) {
       const key = `${img.release}|${img.arch}`
       if (!map[key]) map[key] = { release: img.release, arch: img.arch }
@@ -262,15 +426,30 @@ export default function ImagesPage() {
     return Object.values(map).sort((a, b) => a.release.localeCompare(b.release) || a.arch.localeCompare(b.arch))
   }
 
-  const renderDownloadCell = (img: Image | undefined, typeLabel: string) => {
-    if (!img) return <span className="text-xs text-gray-300">-</span>
-    if (!selectedNode) return <span className="text-xs text-gray-300">{typeLabel}</span>
+  // 已安装镜像 - 按分类分组
+  const groupedInstalledImages = useMemo(() => {
+    const groups: Record<string, InstalledImage[]> = {}
+    for (const img of installedImages) {
+      const key = img.category_name || '__uncategorized__'
+      if (!groups[key]) groups[key] = []
+      groups[key].push(img)
+    }
+    return Object.entries(groups).sort((a, b) => {
+      if (a[0] === '__uncategorized__') return 1
+      if (b[0] === '__uncategorized__') return -1
+      return a[0].localeCompare(b[0])
+    })
+  }, [installedImages])
+
+  const renderDownloadCell = (img: RemoteImage | undefined, typeLabel: string) => {
+    if (!img) return <span className="text-xs text-muted">-</span>
+    if (!selectedNode) return <span className="text-xs text-muted">{typeLabel}</span>
 
     if (img.stage === 'downloading') {
       return (
         <div className="flex items-center gap-1.5">
-          <span className="text-xs text-gray-600 font-number">{img.progress || 0}%</span>
-          <button onClick={() => handleCancel(img)} className="text-gray-400 hover:text-red-500" title="取消">
+          <span className="text-xs text-tertiary font-number">{img.progress || 0}%</span>
+          <button onClick={() => handleCancel(img)} className="text-muted hover:text-red-500" title="取消">
             <Square size={11} />
           </button>
         </div>
@@ -280,7 +459,7 @@ export default function ImagesPage() {
       return (
         <div className="flex items-center gap-1.5">
           <span className="inline-flex items-center gap-1 text-xs text-green-600"><CheckCircle size={12} />已下载</span>
-          <button onClick={() => handleDelete(img)} className="text-gray-400 hover:text-red-500" title="删除">
+          <button onClick={() => handleDeleteRemote(img)} className="text-muted hover:text-red-500" title="删除">
             <Trash2 size={11} />
           </button>
         </div>
@@ -294,176 +473,349 @@ export default function ImagesPage() {
       )
     }
     return (
-      <button onClick={() => handleDownload(img)} className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-black transition-colors">
+      <button onClick={() => handleDownload(img)} className="inline-flex items-center gap-1 text-xs text-tertiary hover:text-primary transition-colors">
         <Download size={12} />下载
       </button>
     )
   }
 
-  const renderProgressBar = (img: Image | undefined) => {
+  const renderProgressBar = (img: RemoteImage | undefined) => {
     if (!img || img.stage !== 'downloading') return null
     const totalBytes = img.total_bytes || 0
     const hasReal = totalBytes > 0
     const downloadedBytes = hasReal ? Math.floor((img.progress || 0) * totalBytes / 100) : 0
     return (
-      <td colSpan={6} className="px-4 py-1.5 bg-gray-50/50">
+      <td colSpan={6} className="px-4 py-1.5 bg-surface-secondary/50">
         <div className="flex items-center gap-3">
           {hasReal ? (
-            <div className="flex-1 bg-gray-200 rounded-full h-1.5">
-              <div className="bg-black h-1.5 rounded-full transition-all" style={{ width: `${img.progress || 0}%` }} />
+            <div className="flex-1 bg-surface-secondary rounded-full h-1.5">
+              <div className="bg-primary h-1.5 rounded-full transition-all" style={{ width: `${img.progress || 0}%` }} />
             </div>
           ) : (
-            <div className="flex-1 bg-gray-200 rounded-full h-1.5 animate-pulse" />
+            <div className="flex-1 bg-surface-secondary rounded-full h-1.5 animate-pulse" />
           )}
-          <span className="text-xs text-gray-500 whitespace-nowrap font-number">
+          <span className="text-xs text-tertiary whitespace-nowrap font-number">
             {hasReal ? `${formatBytes(downloadedBytes)}/${formatBytes(totalBytes)}` : '下载中...'}
           </span>
-          {img.speed_bps ? <span className="text-xs text-gray-400 whitespace-nowrap font-number">{formatSpeed(img.speed_bps)}</span> : null}
+          {img.speed_bps ? <span className="text-xs text-muted whitespace-nowrap font-number">{formatSpeed(img.speed_bps)}</span> : null}
         </div>
       </td>
     )
   }
 
+  const nodeOptions = nodes.map((n) => ({ label: `${n.name} (${n.hostname}) ${n.is_online ? '在线' : '离线'}`, value: n.id }))
+
+  // 渲染已安装镜像tab
+  const renderInstalledTab = () => {
+    if (loading) {
+      return <div className="flex items-center justify-center py-20 text-muted"><RefreshCw size={20} className="animate-spin mr-2" />加载中...</div>
+    }
+    if (installedImages.length === 0) {
+      return <div className="flex items-center justify-center py-20 text-muted text-sm">暂无已安装镜像，请先在"远程下载"Tab中下载镜像</div>
+    }
+    return (
+      <div className="space-y-4">
+        {/* 按分类分组的镜像列表 */}
+        {groupedInstalledImages.map(([catName, catImages]) => {
+          const displayName = catName === '__uncategorized__' ? '未分类' : catName
+          return (
+            <div key={catName} className="rounded-lg border border-surface bg-surface overflow-hidden">
+              <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-light bg-surface-secondary/80">
+                <h3 className="text-sm font-semibold text-primary">{displayName}</h3>
+                <span className="text-xs text-muted">{catImages.length} 个镜像</span>
+              </div>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>别名</th>
+                    <th>显示名</th>
+                    <th style={{ width: 80 }}>类型</th>
+                    <th style={{ width: 80 }}>架构</th>
+                    <th style={{ width: 80 }}>来源</th>
+                    <th style={{ width: 96 }}>大小</th>
+                    <th style={{ width: 80 }}>SSH</th>
+                    <th style={{ width: 64 }}>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {catImages.map((img) => (
+                    <tr key={img.id}>
+                      <td className="text-secondary">{img.alias}</td>
+                      <td className="text-secondary">{img.display_name || '-'}</td>
+                      <td><span className="data-table-tag">{typeLabel(img.type)}</span></td>
+                      <td className="text-tertiary">{formatArch(img.architecture)}</td>
+                      <td className="text-tertiary">{sourceLabel(img.image_source)}</td>
+                      <td className="text-tertiary font-number">{img.size ? formatBytes(img.size) : '-'}</td>
+                      <td>
+                        {img.install_ssh ? <span className="text-success">是</span> : <span className="text-muted">否</span>}
+                      </td>
+                      <td>
+                        <button onClick={() => handleEditImage(img)} className="data-table-link-btn">
+                          编辑
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // 渲染远程下载tab
+  const renderRemoteTab = () => {
+    if (loading) {
+      return <div className="flex items-center justify-center py-20 text-muted"><RefreshCw size={20} className="animate-spin mr-2" />加载中...</div>
+    }
+    if (groupedRemoteImages.length === 0) {
+      return <div className="flex items-center justify-center py-20 text-muted text-sm">暂无镜像数据</div>
+    }
+    return (
+      <div className="space-y-4">
+        {groupedRemoteImages.map(([distro, distroImages]) => {
+          const info = getDistroInfo(distro)
+          const rows = groupedByReleaseArch(distroImages)
+          return (
+            <div key={distro} className="rounded-lg border border-surface bg-surface overflow-hidden">
+              <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-light bg-surface-secondary/80">
+                <img src={getOSImage(info.name)} alt={info.name} className="w-7 h-7 rounded object-contain flex-shrink-0" />
+                <div className="min-w-0">
+                  <div className="flex items-baseline gap-2">
+                    <h2 className="text-sm font-semibold text-primary">{info.name}</h2>
+                    <span className="text-xs text-muted">{distroImages.length} 个镜像</span>
+                  </div>
+                  {info.desc && <p className="text-xs text-tertiary leading-relaxed mt-0.5 line-clamp-2">{info.desc}</p>}
+                </div>
+              </div>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>版本</th>
+                    <th style={{ width: 80 }}>架构</th>
+                    <th style={{ width: 96 }}>
+                      <span className="inline-flex items-center gap-1"><Monitor size={12} />VM大小</span>
+                    </th>
+                    <th style={{ width: 144 }}>VM下载</th>
+                    <th style={{ width: 96 }}>
+                      <span className="inline-flex items-center gap-1"><Box size={12} />容器大小</span>
+                    </th>
+                    <th style={{ width: 144 }}>容器下载</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => {
+                    const vmDownloading = row.vm?.stage === 'downloading'
+                    const containerDownloading = row.container?.stage === 'downloading'
+                    return (
+                      <Fragment key={`${row.release}|${row.arch}`}>
+                        <tr>
+                          <td className="font-medium text-secondary">{info.name} {row.release}</td>
+                          <td>
+                            <span className="data-table-tag">{formatArch(row.arch)}</span>
+                          </td>
+                          <td className="text-tertiary font-number">
+                            {row.vm?.total_bytes ? formatBytes(row.vm.total_bytes) : '-'}
+                          </td>
+                          <td>{renderDownloadCell(row.vm, '虚拟机')}</td>
+                          <td className="text-tertiary font-number">
+                            {row.container?.total_bytes ? formatBytes(row.container.total_bytes) : '-'}
+                          </td>
+                          <td>{renderDownloadCell(row.container, '容器')}</td>
+                        </tr>
+                        {vmDownloading && (
+                          <tr className="border-b border-surface-light">
+                            {renderProgressBar(row.vm)}
+                          </tr>
+                        )}
+                        {containerDownloading && (
+                          <tr className="border-b border-surface-light">
+                            {renderProgressBar(row.container)}
+                          </tr>
+                        )}
+                      </Fragment>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   return (
-    <div className="p-6 space-y-6">
-      {/* 标题 */}
-      <div className="flex items-center gap-3">
-        <HardDrive size={22} className="text-black" />
-        <h1 className="text-xl font-semibold text-black">实例模板管理</h1>
+    <PageLayout
+      leftSlot={
+        <>
+          {activeTab === 'remote' && (
+            <Select
+              value={imageSource}
+              editable
+              placeholder="镜像源"
+              options={[
+                { label: 'Spiritlhl 镜像源(默认)', value: 'spiritlhl:' },
+                { label: '官方镜像源', value: 'images:' },
+                { label: '清华 TUNA 镜像源', value: 'https://mirrors.tuna.tsinghua.edu.cn/lxc-images' },
+                { label: '中科院 ISCAS 镜像源', value: 'https://mirror.iscas.ac.cn/lxc-images' },
+                { label: 'CERNET 教育网镜像源', value: 'https://mirrors.cernet.edu.cn/lxc-images' },
+                { label: '南阳理工镜像源', value: 'https://mirror.nyist.edu.cn/lxc-images' },
+              ]}
+              onChange={(v) => handleSourceChange(String(v))}
+            />
+          )}
+          {activeTab === 'installed' && (
+            <Select
+              value={installedFilterType}
+              options={[{ label: '全部类型', value: '' }, { label: '容器', value: 'container' }, { label: '虚拟机', value: 'virtual-machine' }]}
+              placeholder="类型筛选"
+              onChange={(v) => setInstalledFilterType(String(v))}
+            />
+          )}
+          <Select
+            value={selectedNode}
+            options={nodeOptions}
+            placeholder="选择节点"
+            emptyText="无可用节点"
+            onChange={(v) => setSelectedNode(String(v))}
+          />
+        </>
+      }
+      rightSlot={
+        <Button onClick={handleRefresh} disabled={refreshing} icon={<RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} />}>
+          {refreshing ? '刷新中' : '刷新'}
+        </Button>
+      }
+    >
+      <div className="page-transition__content" style={{ flex: 1, overflow: 'auto' }}>
+        {/* Tab 切换 */}
+        <div className="flex items-center gap-1 mb-4 border-b border-surface-light">
+          <button
+            onClick={() => { setActiveTab('installed'); if (selectedNode) { fetchInstalledImages(selectedNode); fetchCategories(selectedNode) } }}
+            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${activeTab === 'installed' ? 'border-primary text-primary' : 'border-transparent text-muted hover:text-secondary'}`}
+          >
+            <span className="inline-flex items-center gap-1.5"><Server size={14} />已安装镜像</span>
+          </button>
+          <button
+            onClick={() => { setActiveTab('remote'); if (selectedNode) fetchRemoteImages(selectedNode) }}
+            className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${activeTab === 'remote' ? 'border-primary text-primary' : 'border-transparent text-muted hover:text-secondary'}`}
+          >
+            <span className="inline-flex items-center gap-1.5"><Download size={14} />远程下载</span>
+          </button>
+        </div>
+
+        {activeTab === 'installed' ? renderInstalledTab() : renderRemoteTab()}
       </div>
 
-      {/* 工具栏 */}
-      <div className="rounded-lg border border-gray-200 bg-white px-4 py-3 overflow-visible">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <label className="text-xs font-medium text-gray-500 whitespace-nowrap">镜像源</label>
-            <div className="w-52 flex-shrink-0">
-              <Select
-                value={imageSource}
-                editable
-                placeholder="选择镜像源"
-                options={[
-                  { label: 'Spiritlhl 镜像源(默认)', value: 'spiritlhl:' },
-                  { label: '官方镜像源', value: 'images:' },
-                  { label: '清华 TUNA 镜像源', value: 'https://mirrors.tuna.tsinghua.edu.cn/lxc-images' },
-                  { label: '中科院 ISCAS 镜像源', value: 'https://mirror.iscas.ac.cn/lxc-images' },
-                  { label: 'CERNET 教育网镜像源', value: 'https://mirrors.cernet.edu.cn/lxc-images' },
-                  { label: '南阳理工镜像源', value: 'https://mirror.nyist.edu.cn/lxc-images' },
-                ]}
-                onChange={(v) => handleSourceChange(String(v))}
+      {/* 删除远程镜像确认 */}
+      <Modal
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        title="删除镜像"
+        confirmMode
+        confirmText="确认删除"
+        confirmVariant="danger"
+        onConfirm={() => { setConfirmOpen(false); doDelete() }}
+        width={440}
+      >
+        确认删除镜像 {confirmImage?.alias} ({confirmImage?.type === 'container' ? '容器' : '虚拟机'}, {confirmImage ? formatArch(confirmImage.arch) : ''})？
+      </Modal>
+
+      {/* 编辑镜像 - SlidePanel */}
+      <SlidePanel
+        open={editPanelOpen}
+        onClose={() => setEditPanelOpen(false)}
+        title="编辑镜像"
+        width={480}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setEditPanelOpen(false)}>取消</Button>
+            <Button onClick={doEditImage}>保存</Button>
+          </div>
+        }
+      >
+        <div className="space-y-5">
+          <div>
+            <label className="block text-xs text-tertiary mb-1.5">镜像别名</label>
+            <span className="text-sm text-secondary">{editingImage?.alias}</span>
+          </div>
+          <div>
+            <label className="block text-xs text-tertiary mb-1.5">显示名称</label>
+            <input
+              type="text"
+              value={editDisplayName}
+              onChange={(e) => setEditDisplayName(e.target.value)}
+              placeholder="自定义显示名"
+              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:border-primary transition-colors"
+              style={{ fontFamily: 'inherit' }}
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-tertiary mb-1.5">分类</label>
+            <div className="flex flex-wrap items-center gap-1.5 px-2 py-2 border border-gray-200 rounded-lg min-h-[38px]" style={{ fontFamily: 'inherit' }}>
+              {editCategoryName && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-100 text-xs text-secondary">
+                  {editCategoryName}
+                  <button
+                    onClick={() => setEditCategoryName('')}
+                    className="text-muted hover:text-red-500"
+                  >
+                    <X size={12} />
+                  </button>
+                </span>
+              )}
+              <input
+                type="text"
+                value={categoryInput}
+                onChange={(e) => setCategoryInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    const val = categoryInput.trim()
+                    if (val) {
+                      setEditCategoryName(val)
+                      setCategoryInput('')
+                    }
+                  }
+                  if (e.key === 'Backspace' && !categoryInput && editCategoryName) {
+                    setEditCategoryName('')
+                  }
+                }}
+                placeholder={editCategoryName ? '' : '输入分类名称后回车'}
+                className="flex-1 min-w-[120px] text-sm outline-none bg-transparent"
+                style={{ fontFamily: 'inherit' }}
               />
             </div>
-          </div>
-
-          <div className="h-5 w-px bg-gray-200 flex-shrink-0" />
-
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <Server size={14} className="text-gray-400" />
-            <label className="text-xs font-medium text-gray-500 whitespace-nowrap">节点</label>
-            <select
-              className="text-sm border border-gray-200 rounded-md px-2.5 py-1.5 bg-white focus:border-black focus:outline-none"
-              value={selectedNode}
-              onChange={(e) => setSelectedNode(e.target.value)}
-            >
-              <option value="">-- 选择节点 --</option>
-              {nodes.map((n) => (
-                <option key={n.id} value={n.id}>
-                  {n.name} ({n.hostname}) {n.is_online ? '在线' : '离线'}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="ml-auto flex-shrink-0">
-            <Button size="sm" variant="secondary" onClick={handleRefresh} disabled={refreshing} icon={<RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />}>
-              {refreshing ? '刷新中' : '刷新'}
-            </Button>
-          </div>
-        </div>
-      </div>
-
-      {/* 镜像列表 - 按发行版分组的表格 */}
-      {loading ? (
-        <div className="flex items-center justify-center py-20 text-gray-400">
-          <RefreshCw size={20} className="animate-spin mr-2" />加载中...
-        </div>
-      ) : groupedImages.length === 0 ? (
-        <div className="flex items-center justify-center py-20 text-gray-400 text-sm">暂无镜像数据</div>
-      ) : (
-        <div className="space-y-4">
-          {groupedImages.map(([distro, distroImages]) => {
-            const info = getDistroInfo(distro)
-            const rows = groupedByReleaseArch(distroImages)
-
-            return (
-              <div key={distro} className="rounded-lg border border-gray-200 bg-white overflow-hidden">
-                {/* 表头：发行版信息 */}
-                <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 bg-gray-50/80">
-                  <img src={getOSImage(info.name)} alt={info.name} className="w-7 h-7 rounded object-contain flex-shrink-0" />
-                  <div className="min-w-0">
-                    <div className="flex items-baseline gap-2">
-                      <h2 className="text-sm font-semibold text-gray-900">{info.name}</h2>
-                      <span className="text-xs text-gray-400">{distroImages.length} 个镜像</span>
-                    </div>
-                    {info.desc && <p className="text-xs text-gray-500 leading-relaxed mt-0.5 line-clamp-2">{info.desc}</p>}
-                  </div>
-                </div>
-                {/* 表格 */}
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-gray-100 text-left text-xs text-gray-500">
-                      <th className="px-4 py-2 font-medium">版本</th>
-                      <th className="px-4 py-2 font-medium w-20">架构</th>
-                      <th className="px-4 py-2 font-medium w-24">
-                        <span className="inline-flex items-center gap-1"><Monitor size={12} />VM大小</span>
-                      </th>
-                      <th className="px-4 py-2 font-medium w-36">VM下载</th>
-                      <th className="px-4 py-2 font-medium w-24">
-                        <span className="inline-flex items-center gap-1"><Box size={12} />容器大小</span>
-                      </th>
-                      <th className="px-4 py-2 font-medium w-36">容器下载</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row) => {
-                      const vmDownloading = row.vm?.stage === 'downloading'
-                      const containerDownloading = row.container?.stage === 'downloading'
-                      return (
-                        <Fragment key={`${row.release}|${row.arch}`}>
-                          <tr className="border-b border-gray-50 last:border-0 hover:bg-gray-50/50">
-                            <td className="px-4 py-2 font-medium text-gray-800">{info.name} {row.release}</td>
-                            <td className="px-4 py-2">
-                              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">{formatArch(row.arch)}</span>
-                            </td>
-                            <td className="px-4 py-2 text-xs text-gray-500 font-number">
-                              {row.vm?.total_bytes ? formatBytes(row.vm.total_bytes) : '-'}
-                            </td>
-                            <td className="px-4 py-2">{renderDownloadCell(row.vm, '虚拟机')}</td>
-                            <td className="px-4 py-2 text-xs text-gray-500 font-number">
-                              {row.container?.total_bytes ? formatBytes(row.container.total_bytes) : '-'}
-                            </td>
-                            <td className="px-4 py-2">{renderDownloadCell(row.container, '容器')}</td>
-                          </tr>
-                          {vmDownloading && (
-                            <tr className="border-b border-gray-50">
-                              {renderProgressBar(row.vm)}
-                            </tr>
-                          )}
-                          {containerDownloading && (
-                            <tr className="border-b border-gray-50">
-                              {renderProgressBar(row.container)}
-                            </tr>
-                          )}
-                        </Fragment>
-                      )
-                    })}
-                  </tbody>
-                </table>
+            {categories.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {categories.filter(c => c.image_type === editingImage?.type).map((cat) => (
+                  <button
+                    key={cat.id}
+                    onClick={() => setEditCategoryName(cat.name)}
+                    className="px-2 py-0.5 rounded-md bg-gray-50 text-xs text-muted hover:bg-gray-100 hover:text-secondary transition-colors"
+                  >
+                    {cat.name}
+                  </button>
+                ))}
               </div>
-            )
-          })}
+            )}
+          </div>
+          <div>
+            <label className="flex items-center gap-2 text-sm text-secondary cursor-pointer">
+              <input
+                type="checkbox"
+                checked={editInstallSSH}
+                onChange={(e) => setEditInstallSSH(e.target.checked)}
+                className="rounded"
+              />
+              创建实例时默认安装 SSH
+            </label>
+          </div>
         </div>
-      )}
-    </div>
+      </SlidePanel>
+    </PageLayout>
   )
 }

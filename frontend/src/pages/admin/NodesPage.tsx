@@ -1,13 +1,19 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Plus, Server, Copy, Check, Cpu, MemoryStick, HardDrive, Activity, CheckCircle2, XCircle } from 'lucide-react'
+import { Plus, Copy, Check, Cpu, MemoryStick, HardDrive, Activity, CheckCircle2, XCircle } from 'lucide-react'
 import apiClient from '@/api/client'
 import { DataTable, type Column } from '@/components/DataTable/DataTable'
 import { Button } from '@/components/Button/Button'
 import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
 import { Select } from '@/components/Select/Select'
+import { Modal } from '@/components/Modal/Modal'
+import { SearchInput } from '@/components/SearchInput/SearchInput'
+import { FilterBar, type FilterField } from '@/components/FilterBar/FilterBar'
+import { PageLayout } from '@/components/PageLayout/PageLayout'
+import { useListQuery } from '@/hooks/useListQuery'
 import { useToastStore } from '@/stores/toast'
 import { getOSImage } from '@/utils/osImageHelper'
+import '@/components/PageTransition/PageTransition.css'
 
 interface IPProbe {
   interface: string
@@ -183,8 +189,35 @@ interface Node {
 export default function NodesPage() {
   const { t } = useTranslation()
   const toast = useToastStore()
-  const [nodes, setNodes] = useState<Node[]>([])
-  const [loading, setLoading] = useState(true)
+  const { data: nodes, total, loading, page, perPage, search, filters, setPage, setPerPage, setSearch, setFilter, refresh } = useListQuery<Node>('/nodes', {}, {
+    wsUrl: '/ws/nodes',
+    wsType: 'node_heartbeat',
+    wsUpdate: (prev: any[], msg: any) => {
+      if (!msg.node_id || !msg.payload) return prev
+      const p = msg.payload
+      return prev.map((n: any) =>
+        n.id === msg.node_id
+          ? {
+              ...n,
+              status: p.status ?? n.status,
+              is_online: p.is_online ?? n.is_online,
+              used_cpu: p.used_cpu ?? n.used_cpu,
+              used_memory: p.used_memory ?? n.used_memory,
+              total_memory: p.mem_total ?? n.total_memory,
+              used_disk: p.used_disk ?? n.used_disk,
+              total_disk: p.disk_total ?? n.total_disk,
+              net_in: p.net_in ?? n.net_in,
+              net_out: p.net_out ?? n.net_out,
+              uptime: p.uptime ?? n.uptime,
+              instance_count: p.instance_count ?? n.instance_count,
+              running_count: p.running_count ?? n.running_count,
+              last_heartbeat: p.last_heartbeat ?? n.last_heartbeat,
+            }
+          : n
+      )
+    },
+    wsRefreshTypes: ['data_refresh'],
+  })
   const [panelOpen, setPanelOpen] = useState(false)
   const [configOpen, setConfigOpen] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -192,77 +225,15 @@ export default function NodesPage() {
   const [currentNode, setCurrentNode] = useState<Node | null>(null)
   const [nodeName, setNodeName] = useState('')
   const [newToken, setNewToken] = useState('')
-  const wsRef = useRef<WebSocket | null>(null)
 
-  const fetchNodes = async () => {
-    setLoading(true)
-    try {
-      const res = await apiClient.get('/nodes')
-      setNodes(res.data.data || [])
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => { fetchNodes() }, [])
-
-  // WebSocket 局部刷新节点数据
-  useEffect(() => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/nodes`)
-    wsRef.current = ws
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg.type === 'node_heartbeat' && msg.node_id && msg.payload) {
-          const p = msg.payload
-          setNodes((prev) =>
-            prev.map((n) =>
-              n.id === msg.node_id
-                ? {
-                    ...n,
-                    status: p.status ?? n.status,
-                    is_online: p.is_online ?? n.is_online,
-                    used_cpu: p.used_cpu ?? n.used_cpu,
-                    used_memory: p.used_memory ?? n.used_memory,
-                    total_memory: p.mem_total ?? n.total_memory,
-                    used_disk: p.used_disk ?? n.used_disk,
-                    total_disk: p.disk_total ?? n.total_disk,
-                    net_in: p.net_in ?? n.net_in,
-                    net_out: p.net_out ?? n.net_out,
-                    uptime: p.uptime ?? n.uptime,
-                    instance_count: p.instance_count ?? n.instance_count,
-                    running_count: p.running_count ?? n.running_count,
-                    last_heartbeat: p.last_heartbeat ?? n.last_heartbeat,
-                  }
-                : n
-            )
-          )
-        }
-      } catch {
-        // ignore
-      }
-    }
-    ws.onclose = () => {
-      wsRef.current = null
-      setTimeout(() => {
-        if (wsRef.current === null) {
-          const p = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-          const w = new WebSocket(`${p}//${window.location.host}/ws/nodes`)
-          wsRef.current = w
-          // 重新绑定事件
-          w.onmessage = ws.onmessage
-          w.onclose = ws.onclose
-        }
-      }, 3000)
-    }
-
-    return () => {
-      ws.close()
-      wsRef.current = null
-    }
-  }, [])
+  // 确认弹窗状态
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [confirmTitle, setConfirmTitle] = useState('')
+  const [confirmMessage, setConfirmMessage] = useState('')
+  const [confirmAction, setConfirmAction] = useState<() => void>(() => {})
+  const [confirmRequireInput, setConfirmRequireInput] = useState(false)
+  const [confirmRequireLabel, setConfirmRequireLabel] = useState('')
+  const [confirmRequireValue, setConfirmRequireValue] = useState('')
 
   const handleCreate = async () => {
     if (!nodeName.trim()) return
@@ -273,14 +244,21 @@ export default function NodesPage() {
     setTokenOpen(true)
     setNodeName('')
     setPanelOpen(false)
-    fetchNodes()
+    refresh()
   }
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('确认删除该节点？')) return
-    await apiClient.delete(`/nodes/${id}`)
-    toast.success('节点删除成功')
-    fetchNodes()
+  const handleDelete = async (id: string, name: string) => {
+    setConfirmTitle('删除节点')
+    setConfirmMessage(`确认删除节点「${name}」？`)
+    setConfirmRequireInput(true)
+    setConfirmRequireLabel('请输入节点名称以确认')
+    setConfirmRequireValue(name)
+    setConfirmAction(() => async () => {
+      await apiClient.delete(`/nodes/${id}`)
+      toast.success('节点删除成功')
+      refresh()
+    })
+    setConfirmOpen(true)
   }
 
   const copyToken = (token: string) => {
@@ -326,7 +304,7 @@ export default function NodesPage() {
     if (!currentNode) return
     await apiClient.put(`/nodes/${currentNode.id}/config`, cfgForm)
     toast.success('配置已保存并下发给 Agent')
-    await fetchNodes()
+    await refresh()
     setConfigOpen(false)
   }
 
@@ -397,6 +375,14 @@ export default function NodesPage() {
   }
 
   const columns: Column<Node>[] = [
+    {
+      key: 'id',
+      title: 'ID',
+      width: 100,
+      render: (row: Node) => (
+        <span className="text-sm font-number text-tertiary">{row.id.slice(0, 8)}</span>
+      ),
+    },
     {
       key: 'name',
       title: t('node.name'),
@@ -591,7 +577,7 @@ export default function NodesPage() {
           <button
             className="data-table-link-btn"
             style={{ color: '#dc2626' }}
-            onClick={() => handleDelete(row.id)}
+            onClick={() => handleDelete(row.id, row.name)}
           >
             {t('node.delete')}
           </button>
@@ -601,18 +587,37 @@ export default function NodesPage() {
   ]
 
   return (
-    <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Server size={22} className="text-black" />
-          <h1 className="text-xl font-semibold text-black">{t('node.title')}</h1>
-        </div>
+    <PageLayout
+      leftSlot={
+        <>
+          <SearchInput value={search} placeholder="搜索节点名称、主机名、IP" onChange={setSearch} />
+          <FilterBar
+            fields={[
+              { key: 'status', label: '状态', options: [
+                { label: '在线', value: 'online' },
+                { label: '离线', value: 'offline' },
+              ] },
+            ] as FilterField[]}
+            values={filters}
+            onChange={setFilter}
+          />
+        </>
+      }
+      rightSlot={
         <Button icon={<Plus size={16} />} onClick={() => setPanelOpen(true)}>
           {t('node.addNode')}
         </Button>
-      </div>
-
-      <DataTable columns={columns} data={nodes} rowKey={(r) => r.id} loading={loading} />
+      }
+    >
+      <DataTable
+        columns={columns}
+        data={nodes}
+        rowKey={(r) => r.id}
+        loading={loading}
+        pagination={{ page, size: perPage, total }}
+        onPageChange={setPage}
+        onSizeChange={setPerPage}
+      />
 
       {/* 新建节点 */}
       <SlidePanel open={panelOpen} onClose={() => setPanelOpen(false)} title="新建节点"
@@ -624,9 +629,9 @@ export default function NodesPage() {
         }
       >
         <div className="space-y-4">
-          <label className="block text-sm font-medium text-black">节点名称</label>
+          <label className="block text-sm font-medium text-primary">节点名称</label>
           <input
-            className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:border-black focus:outline-none focus:ring-2 focus:ring-black/5"
+            className="w-full rounded-lg border border-surface px-3 py-2 text-sm focus:border-surface-strong focus:outline-none focus:ring-2 focus:ring-black/5"
             placeholder="输入节点名称"
             value={nodeName}
             onChange={(e) => setNodeName(e.target.value)}
@@ -643,9 +648,9 @@ export default function NodesPage() {
         }
       >
         <div className="space-y-4">
-          <p className="text-sm text-gray-600">请复制以下 Token 配置到 Agent 的 config.yaml 文件中：</p>
-          <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-            <pre className="text-sm font-mono text-gray-800 whitespace-pre-wrap break-all">
+          <p className="text-sm text-tertiary">请复制以下 Token 配置到 Agent 的 config.yaml 文件中：</p>
+          <div className="bg-surface-secondary rounded-lg p-4 border border-surface">
+            <pre className="text-sm font-mono text-secondary whitespace-pre-wrap break-all">
 {`master: "wss://your-master-domain"
 token: "${newToken}"`}
             </pre>
@@ -690,32 +695,32 @@ token: "${newToken}"`}
               <>
                 {/* 概览卡片 */}
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <div className="rounded-lg border border-gray-200 bg-white px-3 py-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-gray-500"><Cpu className="h-4 w-4" />CPU</div>
-                    <div className="line-clamp-2 break-words text-sm font-semibold text-gray-900" title={info.cpu?.model || 'Unknown'}>{info.cpu?.model || 'Unknown'}</div>
-                    <div className="mt-1 truncate text-xs text-gray-500">{info.cpu ? `${info.cpu.cores} 核 / ${info.cpu.threads} 线程` : '-'}</div>
+                  <div className="rounded-lg border border-surface bg-surface px-3 py-3">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-tertiary"><Cpu className="h-4 w-4" />CPU</div>
+                    <div className="line-clamp-2 break-words text-sm font-semibold text-primary" title={info.cpu?.model || 'Unknown'}>{info.cpu?.model || 'Unknown'}</div>
+                    <div className="mt-1 truncate text-xs text-tertiary">{info.cpu ? `${info.cpu.cores} 核 / ${info.cpu.threads} 线程` : '-'}</div>
                   </div>
-                  <div className="rounded-lg border border-gray-200 bg-white px-3 py-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-gray-500"><MemoryStick className="h-4 w-4" />RAM</div>
-                    <div className="font-number text-sm font-semibold text-gray-900">{info.memory ? formatMB(info.memory.total_mb) : '-'}</div>
-                    <div className="font-number mt-1 truncate text-xs text-gray-500">{info.memory ? `${formatMB(info.memory.used_mb)} 已用` : '-'}</div>
+                  <div className="rounded-lg border border-surface bg-surface px-3 py-3">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-tertiary"><MemoryStick className="h-4 w-4" />RAM</div>
+                    <div className="font-number text-sm font-semibold text-primary">{info.memory ? formatMB(info.memory.total_mb) : '-'}</div>
+                    <div className="font-number mt-1 truncate text-xs text-tertiary">{info.memory ? `${formatMB(info.memory.used_mb)} 已用` : '-'}</div>
                   </div>
-                  <div className="rounded-lg border border-gray-200 bg-white px-3 py-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-gray-500"><HardDrive className="h-4 w-4" />DISK</div>
-                    <div className="font-number text-sm font-semibold text-gray-900">{info.disks?.length || 0} 块硬盘</div>
-                    <div className="mt-1 truncate text-xs text-gray-500">{info.disks?.map(d => diskTypeLabel(d)).filter(Boolean).join(' / ') || 'Unknown'}</div>
+                  <div className="rounded-lg border border-surface bg-surface px-3 py-3">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-tertiary"><HardDrive className="h-4 w-4" />DISK</div>
+                    <div className="font-number text-sm font-semibold text-primary">{info.disks?.length || 0} 块硬盘</div>
+                    <div className="mt-1 truncate text-xs text-tertiary">{info.disks?.map(d => diskTypeLabel(d)).filter(Boolean).join(' / ') || 'Unknown'}</div>
                   </div>
-                  <div className="rounded-lg border border-gray-200 bg-white px-3 py-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-gray-500"><Activity className="h-4 w-4" />运行状态</div>
-                    <div className="text-sm font-semibold text-gray-900">{info.system?.uptime_text || '-'}</div>
-                    <div className="font-number mt-1 truncate text-xs text-gray-500">{info.system ? `${info.system.process_count} 个进程` : '-'}</div>
+                  <div className="rounded-lg border border-surface bg-surface px-3 py-3">
+                    <div className="mb-2 flex items-center gap-2 text-xs font-medium text-tertiary"><Activity className="h-4 w-4" />运行状态</div>
+                    <div className="text-sm font-semibold text-primary">{info.system?.uptime_text || '-'}</div>
+                    <div className="font-number mt-1 truncate text-xs text-tertiary">{info.system ? `${info.system.process_count} 个进程` : '-'}</div>
                   </div>
                 </div>
 
                 {/* 系统概览 */}
                 <section>
-                  <h2 className="mb-2 text-sm font-semibold text-black">系统概览</h2>
-                  <div className="overflow-hidden rounded-lg border border-gray-200 bg-white">
+                  <h2 className="mb-2 text-sm font-semibold text-primary">系统概览</h2>
+                  <div className="overflow-hidden rounded-lg border border-surface bg-surface">
                     {[
                       ['主机名', info.hostname],
                       ['操作系统', info.os],
@@ -729,9 +734,9 @@ token: "${newToken}"`}
                       ['运行能力-虚拟机', info.runtime ? (info.runtime.kvm_available ? '可创建虚拟机' : '不可创建虚拟机') : '-'],
                       ['KVM 嵌套虚拟化', info.runtime ? `${info.runtime.nested_virtualization ? '支持' : '未检测到'} (${info.runtime.nested_detail || '-'})` : '-'],
                     ].map(([label, value]) => (
-                      <div key={label} className="grid gap-2 border-b border-gray-100 px-3 py-2 text-xs last:border-b-0 md:grid-cols-[160px_1fr]">
-                        <div className="font-medium text-gray-500">{label}</div>
-                        <div className="font-number whitespace-pre-wrap break-words text-gray-800">{value || '-'}</div>
+                      <div key={label} className="grid gap-2 border-b border-surface-light px-3 py-2 text-xs last:border-b-0 md:grid-cols-[160px_1fr]">
+                        <div className="font-medium text-tertiary">{label}</div>
+                        <div className="font-number whitespace-pre-wrap break-words text-secondary">{value || '-'}</div>
                       </div>
                     ))}
                   </div>
@@ -739,8 +744,8 @@ token: "${newToken}"`}
 
                 {/* 公网与路由 */}
                 <section>
-                  <h2 className="mb-2 text-sm font-semibold text-black">公网与路由</h2>
-                  <div className="overflow-hidden rounded-lg border border-gray-200 bg-white">
+                  <h2 className="mb-2 text-sm font-semibold text-primary">公网与路由</h2>
+                  <div className="overflow-hidden rounded-lg border border-surface bg-surface">
                     {[
                       ['公网 IPv4', info.public_ipv4?.length ? info.public_ipv4.join('\n') : '未检测到'],
                       ['IPv4 地址', info.ipv4_addresses?.length ? info.ipv4_addresses.map(ip => `${ip.address}/${ip.prefix_len} (${ip.interface})`).join('\n') : '未检测到'],
@@ -749,9 +754,9 @@ token: "${newToken}"`}
                       ['IPv6 段', info.ipv6_prefixes?.length ? info.ipv6_prefixes.map(p => `${p.address}/${p.prefix_len} via ${p.gateway || '-'} dev ${p.interface}`).join('\n') : '未检测到'],
                       ['网关', info.gateways?.length ? info.gateways.map(g => `${g.family}: ${g.gateway || '-'} dev ${g.interface || '-'}`).join('\n') : '未检测到'],
                     ].map(([label, value]) => (
-                      <div key={label} className="grid gap-2 border-b border-gray-100 px-3 py-2 text-xs last:border-b-0 md:grid-cols-[160px_1fr]">
-                        <div className="font-medium text-gray-500">{label}</div>
-                        <div className="font-number whitespace-pre-wrap break-words text-gray-800">{value || '-'}</div>
+                      <div key={label} className="grid gap-2 border-b border-surface-light px-3 py-2 text-xs last:border-b-0 md:grid-cols-[160px_1fr]">
+                        <div className="font-medium text-tertiary">{label}</div>
+                        <div className="font-number whitespace-pre-wrap break-words text-secondary">{value || '-'}</div>
                       </div>
                     ))}
                   </div>
@@ -760,11 +765,11 @@ token: "${newToken}"`}
                 {/* 内存条 */}
                 {(info.mem_modules?.length ?? 0) > 0 && (
                   <section>
-                    <h2 className="mb-2 text-sm font-semibold text-black">内存条</h2>
-                    <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+                    <h2 className="mb-2 text-sm font-semibold text-primary">内存条</h2>
+                    <div className="overflow-x-auto rounded-lg border border-surface bg-surface">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-gray-100 bg-gray-50 text-left text-gray-500">
+                          <tr className="border-b border-surface-light bg-surface-secondary text-left text-tertiary">
                             <th className="px-3 py-2 font-medium">插槽</th>
                             <th className="px-3 py-2 font-medium">容量</th>
                             <th className="px-3 py-2 font-medium">类型</th>
@@ -773,15 +778,15 @@ token: "${newToken}"`}
                             <th className="px-3 py-2 font-medium">型号/序列号</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100">
+                        <tbody className="divide-y divide-surface-light">
                           {info.mem_modules!.map((m, i) => (
                             <tr key={i} className="align-top">
-                              <td className="px-3 py-2 text-gray-700">{m.locator || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{m.size || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{m.type || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{m.speed || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{m.manufacturer || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{[m.part_number, m.serial_number].filter(Boolean).join(' / ') || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{m.locator || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{m.size || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{m.type || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{m.speed || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{m.manufacturer || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{[m.part_number, m.serial_number].filter(Boolean).join(' / ') || '-'}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -793,11 +798,11 @@ token: "${newToken}"`}
                 {/* 硬盘与健康 */}
                 {(info.disks?.length ?? 0) > 0 && (
                   <section>
-                    <h2 className="mb-2 text-sm font-semibold text-black">硬盘与健康</h2>
-                    <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+                    <h2 className="mb-2 text-sm font-semibold text-primary">硬盘与健康</h2>
+                    <div className="overflow-x-auto rounded-lg border border-surface bg-surface">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-gray-100 bg-gray-50 text-left text-gray-500">
+                          <tr className="border-b border-surface-light bg-surface-secondary text-left text-tertiary">
                             <th className="px-3 py-2 font-medium">设备</th>
                             <th className="px-3 py-2 font-medium">型号</th>
                             <th className="px-3 py-2 font-medium">容量</th>
@@ -810,19 +815,19 @@ token: "${newToken}"`}
                             <th className="px-3 py-2 font-medium">写入</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100">
+                        <tbody className="divide-y divide-surface-light">
                           {info.disks!.map((d, i) => (
                             <tr key={i} className="align-top">
-                              <td className="max-w-[180px] whitespace-pre-wrap break-words px-3 py-2 text-gray-700">{d.path || d.name}{d.serial ? `\n${d.serial}` : ''}</td>
-                              <td className="px-3 py-2 text-gray-700">{d.model || '-'}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{formatBytes(d.size_bytes)}</td>
-                              <td className="px-3 py-2 text-gray-700">{diskTypeLabel(d)}</td>
-                              <td className="max-w-[120px] whitespace-pre-wrap break-words px-3 py-2 text-gray-700">{d.mountpoints?.length ? d.mountpoints.join('\n') : '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{diskHealthLabel(d.health)}{d.health_detail ? `\n${d.health_detail}` : ''}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{d.virtual ? '不支持' : (d.smart.life_used_percent !== undefined ? `${d.smart.life_used_percent}% 已用\n${Math.max(0, 100 - d.smart.life_used_percent)}% 剩余` : '-')}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{d.virtual ? '不支持' : (d.smart.power_on_hours ? `${d.smart.power_on_hours} 小时` : '-')}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{d.virtual ? '不支持' : formatBytes(d.smart.read_data_bytes || 0)}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{d.virtual ? '不支持' : formatBytes(d.smart.written_data_bytes || 0)}</td>
+                              <td className="max-w-[180px] whitespace-pre-wrap break-words px-3 py-2 text-secondary">{d.path || d.name}{d.serial ? `\n${d.serial}` : ''}</td>
+                              <td className="px-3 py-2 text-secondary">{d.model || '-'}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{formatBytes(d.size_bytes)}</td>
+                              <td className="px-3 py-2 text-secondary">{diskTypeLabel(d)}</td>
+                              <td className="max-w-[120px] whitespace-pre-wrap break-words px-3 py-2 text-secondary">{d.mountpoints?.length ? d.mountpoints.join('\n') : '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{diskHealthLabel(d.health)}{d.health_detail ? `\n${d.health_detail}` : ''}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{d.virtual ? '不支持' : (d.smart.life_used_percent !== undefined ? `${d.smart.life_used_percent}% 已用\n${Math.max(0, 100 - d.smart.life_used_percent)}% 剩余` : '-')}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{d.virtual ? '不支持' : (d.smart.power_on_hours ? `${d.smart.power_on_hours} 小时` : '-')}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{d.virtual ? '不支持' : formatBytes(d.smart.read_data_bytes || 0)}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{d.virtual ? '不支持' : formatBytes(d.smart.written_data_bytes || 0)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -834,11 +839,11 @@ token: "${newToken}"`}
                 {/* 网卡 */}
                 {(info.network_interfaces?.length ?? 0) > 0 && (
                   <section>
-                    <h2 className="mb-2 text-sm font-semibold text-black">网卡</h2>
-                    <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+                    <h2 className="mb-2 text-sm font-semibold text-primary">网卡</h2>
+                    <div className="overflow-x-auto rounded-lg border border-surface bg-surface">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-gray-100 bg-gray-50 text-left text-gray-500">
+                          <tr className="border-b border-surface-light bg-surface-secondary text-left text-tertiary">
                             <th className="px-3 py-2 font-medium">网卡</th>
                             <th className="px-3 py-2 font-medium">状态</th>
                             <th className="px-3 py-2 font-medium">驱动/速率</th>
@@ -847,15 +852,15 @@ token: "${newToken}"`}
                             <th className="px-3 py-2 font-medium">IPv6</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100">
+                        <tbody className="divide-y divide-surface-light">
                           {info.network_interfaces!.map((n, i) => (
                             <tr key={i} className="align-top">
-                              <td className="max-w-[180px] whitespace-pre-wrap break-words px-3 py-2 text-gray-700">{n.name}{n.model ? `\n${n.model}` : ''}</td>
-                              <td className="px-3 py-2 text-gray-700">{n.state || '-'}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{n.driver || '-'}{n.speed_mbps > 0 ? `\n${n.speed_mbps} Mbps` : ''}</td>
-                              <td className="font-number px-3 py-2 text-gray-700">{n.mac || '-'}</td>
-                              <td className="font-number max-w-[200px] whitespace-pre-wrap break-words px-3 py-2 text-gray-700">{n.ipv4?.length ? n.ipv4.map(ip => `${ip.address}/${ip.prefix_len}`).join('\n') : '-'}</td>
-                              <td className="font-number max-w-[200px] whitespace-pre-wrap break-words px-3 py-2 text-gray-700">{n.ipv6?.length ? n.ipv6.map(ip => `${ip.address}/${ip.prefix_len} ${ip.scope}`).join('\n') : '-'}</td>
+                              <td className="max-w-[180px] whitespace-pre-wrap break-words px-3 py-2 text-secondary">{n.name}{n.model ? `\n${n.model}` : ''}</td>
+                              <td className="px-3 py-2 text-secondary">{n.state || '-'}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{n.driver || '-'}{n.speed_mbps > 0 ? `\n${n.speed_mbps} Mbps` : ''}</td>
+                              <td className="font-number px-3 py-2 text-secondary">{n.mac || '-'}</td>
+                              <td className="font-number max-w-[200px] whitespace-pre-wrap break-words px-3 py-2 text-secondary">{n.ipv4?.length ? n.ipv4.map(ip => `${ip.address}/${ip.prefix_len}`).join('\n') : '-'}</td>
+                              <td className="font-number max-w-[200px] whitespace-pre-wrap break-words px-3 py-2 text-secondary">{n.ipv6?.length ? n.ipv6.map(ip => `${ip.address}/${ip.prefix_len} ${ip.scope}`).join('\n') : '-'}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -867,24 +872,24 @@ token: "${newToken}"`}
                 {/* 显卡 */}
                 {(info.gpus?.length ?? 0) > 0 && (
                   <section>
-                    <h2 className="mb-2 text-sm font-semibold text-black">显卡</h2>
-                    <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+                    <h2 className="mb-2 text-sm font-semibold text-primary">显卡</h2>
+                    <div className="overflow-x-auto rounded-lg border border-surface bg-surface">
                       <table className="w-full text-xs">
                         <thead>
-                          <tr className="border-b border-gray-100 bg-gray-50 text-left text-gray-500">
+                          <tr className="border-b border-surface-light bg-surface-secondary text-left text-tertiary">
                             <th className="px-3 py-2 font-medium">名称</th>
                             <th className="px-3 py-2 font-medium">厂商</th>
                             <th className="px-3 py-2 font-medium">类型</th>
                             <th className="px-3 py-2 font-medium">驱动</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100">
+                        <tbody className="divide-y divide-surface-light">
                           {info.gpus!.map((g, i) => (
                             <tr key={i} className="align-top">
-                              <td className="px-3 py-2 text-gray-700">{g.name}</td>
-                              <td className="px-3 py-2 text-gray-700">{g.vendor || '-'}</td>
-                              <td className="px-3 py-2 text-gray-700">{gpuTypeLabel(g.type)}</td>
-                              <td className="px-3 py-2 text-gray-700">{g.driver || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{g.name}</td>
+                              <td className="px-3 py-2 text-secondary">{g.vendor || '-'}</td>
+                              <td className="px-3 py-2 text-secondary">{gpuTypeLabel(g.type)}</td>
+                              <td className="px-3 py-2 text-secondary">{g.driver || '-'}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -896,19 +901,19 @@ token: "${newToken}"`}
                 {/* 环境支持 */}
                 {(info.environment?.length ?? 0) > 0 && (
                   <section>
-                    <h2 className="mb-2 text-sm font-semibold text-black">环境支持</h2>
+                    <h2 className="mb-2 text-sm font-semibold text-primary">环境支持</h2>
                     <div className="grid gap-2 md:grid-cols-2">
                       {info.environment!.map((item) => (
-                        <div key={item.key} className="flex items-start gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2">
+                        <div key={item.key} className="flex items-start gap-2 rounded-lg border border-surface bg-surface px-3 py-2">
                           {item.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-green-600" /> : <XCircle className={`mt-0.5 h-4 w-4 shrink-0 ${item.required ? 'text-red-600' : 'text-amber-600'}`} />}
                           <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-gray-800">
+                            <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-secondary">
                               <span>{item.label}</span>
-                              <span className={`rounded px-1.5 py-0.5 text-[10px] ${item.required ? 'bg-gray-100 text-gray-600' : 'bg-blue-50 text-blue-700'}`}>
+                              <span className={`rounded px-1.5 py-0.5 text-[10px] ${item.required ? 'bg-surface-secondary text-tertiary' : 'bg-blue-50 text-blue-700'}`}>
                                 {item.required ? '必要' : '可选'}
                               </span>
                             </div>
-                            <div className="font-number mt-1 break-all text-[11px] text-gray-500">{item.detail || '-'}</div>
+                            <div className="font-number mt-1 break-all text-[11px] text-tertiary">{item.detail || '-'}</div>
                           </div>
                         </div>
                       ))}
@@ -932,46 +937,46 @@ token: "${newToken}"`}
       >
         <div className="space-y-4 pr-2">
           <div>
-            <label className="block text-sm font-medium text-black">Incus Socket 路径</label>
+            <label className="block text-sm font-medium text-primary">Incus Socket 路径</label>
             <input
-              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
               value={cfgForm.incus_socket_path}
               onChange={(e) => setCfgForm({ ...cfgForm, incus_socket_path: e.target.value })}
             />
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-black">监控间隔（秒）</label>
+              <label className="block text-sm font-medium text-primary">监控间隔（秒）</label>
               <input
                 type="number"
-                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
                 value={cfgForm.metrics_interval}
                 onChange={(e) => setCfgForm({ ...cfgForm, metrics_interval: Number(e.target.value) })}
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-black">心跳间隔（秒）</label>
+              <label className="block text-sm font-medium text-primary">心跳间隔（秒）</label>
               <input
                 type="number"
-                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
                 value={cfgForm.heartbeat_interval}
                 onChange={(e) => setCfgForm({ ...cfgForm, heartbeat_interval: Number(e.target.value) })}
               />
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium text-black">Agent URL（外部可访问地址）</label>
+            <label className="block text-sm font-medium text-primary">Agent URL（外部可访问地址）</label>
             <input
               type="text"
               placeholder="https://us-lax.testnode.com"
-              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+              className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
               value={cfgForm.agent_url}
               onChange={(e) => setCfgForm({ ...cfgForm, agent_url: e.target.value })}
             />
-            <p className="mt-1 text-xs text-gray-500">用于前端直连宿主机 VNC / WebSSH 等服务，需包含协议（http/https）</p>
+            <p className="mt-1 text-xs text-tertiary">用于前端直连宿主机 VNC / WebSSH 等服务，需包含协议（http/https）</p>
           </div>
           <div>
-            <label className="block text-sm font-medium text-black">镜像源地址</label>
+            <label className="block text-sm font-medium text-primary">镜像源地址</label>
             <Select
               value={cfgForm.image_remote_url}
               editable
@@ -986,10 +991,26 @@ token: "${newToken}"`}
               ]}
               onChange={(v) => setCfgForm({ ...cfgForm, image_remote_url: String(v) })}
             />
-            <p className="mt-1 text-xs text-gray-500">留空则使用站点默认配置，可从预设选择或自行输入镜像站 URL</p>
+            <p className="mt-1 text-xs text-tertiary">留空则使用站点默认配置，可从预设选择或自行输入镜像站 URL</p>
           </div>
         </div>
       </SlidePanel>
-    </div>
+
+      <Modal
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        title={confirmTitle}
+        confirmMode
+        confirmText="确认"
+        confirmVariant="danger"
+        requireInput={confirmRequireInput}
+        requireInputLabel={confirmRequireLabel}
+        requireInputValue={confirmRequireValue}
+        onConfirm={() => { setConfirmOpen(false); confirmAction() }}
+        width={440}
+      >
+        {confirmMessage}
+      </Modal>
+    </PageLayout>
   )
 }

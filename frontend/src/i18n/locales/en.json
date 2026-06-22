@@ -51,7 +51,18 @@
     "unknown": "Unknown",
     "yes": "Yes",
     "no": "No",
-    "actions": "Actions"
+    "actions": "Actions",
+    "creating": "Creating",
+    "starting": "Starting",
+    "stopping": "Stopping",
+    "restarting": "Restarting",
+    "reinstalling": "Reinstalling",
+    "resizing": "Resizing",
+    "deleting": "Deleting",
+    "banned": "Banned",
+    "expired": "Expired",
+    "nodeOffline": "Node Offline",
+    "missing": "Missing"
   },
   "init": {
     "title": "Welcome to Tsukiyo",
@@ -262,6 +273,9 @@
     "deleteSnapshot": "Delete Snapshot",
     "network": "Network",
     "traffic": "Traffic",
-    "firewallRules": "Firewall Rules"
+    "firewallRules": "Firewall Rules",
+    "forceDelete": "Force Delete",
+    "forceDeleteConfirm": "Agent is offline. This will delete the database record directly. Confirm?",
+    "changeStatus": "Change Status"
   }
 }
