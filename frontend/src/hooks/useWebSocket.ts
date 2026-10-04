@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
+import { buildAuthenticatedWebSocketUrl } from '@/utils/wsUrl'
 
 export type WsMessageHandler = (msg: any) => void
 
@@ -21,8 +22,7 @@ export function useWebSocket({ url, onMessage, reconnectInterval = 3000, enabled
 
   const connect = useCallback(() => {
     if (!enabled) return
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const fullUrl = url.startsWith('ws') ? url : `${proto}//${window.location.host}${url}`
+    const fullUrl = buildAuthenticatedWebSocketUrl(url)
     const ws = new WebSocket(fullUrl)
     wsRef.current = ws
 

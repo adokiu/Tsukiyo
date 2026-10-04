@@ -91,7 +91,7 @@ func CreateInstance(c *gin.Context) {
 func ListInstances(c *gin.Context) {
 	_, exists := c.Get("user_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "未认证"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "未认证"})
 		return
 	}
 
@@ -393,11 +393,11 @@ func UpdateInstance(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrDiskShrinkNotSupported {
@@ -615,11 +615,11 @@ func ResetInstancePassword(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建重置密码任务失败: " + err.Error()})
@@ -665,7 +665,7 @@ func GetConsoleCredentials(c *gin.Context) {
 
 	result, err := instanceService.GetConsoleCredentialsByToken(token)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "token 无效或已过期"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "token 无效或已过期"})
 		return
 	}
 
@@ -694,10 +694,10 @@ func GetInstanceMetrics(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"cpu_usage":       metrics.CPU,
-		"memory_usage":    metrics.MemUsed * 1024 * 1024,   // MB -> bytes
-		"memory_total":    metrics.MemTotal * 1024 * 1024,  // MB -> bytes
-		"disk_used":       metrics.DiskUsed * 1024 * 1024,  // MB -> bytes
-		"disk_total":      metrics.DiskTotal * 1024 * 1024, // MB -> bytes
+		"memory_usage":    (metrics.MemUsed + (int64(instance.MemoryMB) - metrics.MemTotal)) * 1024 * 1024,
+		"memory_total":    int64(instance.MemoryMB) * 1024 * 1024,
+		"disk_used":       (metrics.DiskUsed + (int64(instance.DiskMB) - metrics.DiskTotal)) * 1024 * 1024,
+		"disk_total":      int64(instance.DiskMB) * 1024 * 1024,
 		"disk_read_bps":   metrics.DiskReadBps,
 		"disk_write_bps":  metrics.DiskWriteBps,
 		"disk_read_iops":  metrics.DiskReadIops,
@@ -748,22 +748,32 @@ func GetInstanceMetricsHistory(c *gin.Context) {
 		return
 	}
 
-	// 转换单位：MB -> bytes，使前端可以用 formatBytes 统一显示
+	// 转换单位：MB -> bytes，使用配置上限统一显示
+	var inst models.Instance
+	if err := db.DB.Where("id = ?", instanceID).First(&inst).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "实例不存在"})
+		return
+	}
+	memConfigMB := int64(inst.MemoryMB)
+	diskConfigMB := int64(inst.DiskMB)
+
 	result := make([]gin.H, 0, len(points))
 	for _, p := range points {
+		memUsedAdjusted := p.MemUsed + (memConfigMB - p.MemTotal)
+		diskUsedAdjusted := p.DiskUsed + (diskConfigMB - p.DiskTotal)
 		result = append(result, gin.H{
 			"timestamp":       p.Timestamp,
 			"cpu":             p.CPU,
 			"cpu_max":         p.CPUMax,
 			"cpu_min":         p.CPUMin,
-			"mem_used":        p.MemUsed * 1024 * 1024,
-			"mem_used_max":    p.MemUsedMax * 1024 * 1024,
-			"mem_used_min":    p.MemUsedMin * 1024 * 1024,
-			"mem_total":       p.MemTotal * 1024 * 1024,
-			"disk_used":       p.DiskUsed * 1024 * 1024,
-			"disk_used_max":   p.DiskUsedMax * 1024 * 1024,
-			"disk_used_min":   p.DiskUsedMin * 1024 * 1024,
-			"disk_total":      p.DiskTotal * 1024 * 1024,
+			"mem_used":        memUsedAdjusted * 1024 * 1024,
+			"mem_used_max":    (p.MemUsedMax + (memConfigMB - p.MemTotal)) * 1024 * 1024,
+			"mem_used_min":    (p.MemUsedMin + (memConfigMB - p.MemTotal)) * 1024 * 1024,
+			"mem_total":       memConfigMB * 1024 * 1024,
+			"disk_used":       diskUsedAdjusted * 1024 * 1024,
+			"disk_used_max":   (p.DiskUsedMax + (diskConfigMB - p.DiskTotal)) * 1024 * 1024,
+			"disk_used_min":   (p.DiskUsedMin + (diskConfigMB - p.DiskTotal)) * 1024 * 1024,
+			"disk_total":      diskConfigMB * 1024 * 1024,
 			"disk_read_bps":   p.DiskReadBps,
 			"disk_read_max":   p.DiskReadMax,
 			"disk_write_bps":  p.DiskWriteBps,
@@ -894,11 +904,11 @@ func UpdateInstanceNetwork(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建网络配置任务失败: " + err.Error()})
@@ -933,11 +943,11 @@ func AddInstanceDisk(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrDiskNameExists {
@@ -976,11 +986,11 @@ func DeleteInstanceDisk(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrDiskNotFound {
@@ -1030,11 +1040,11 @@ func ResizeInstanceDisk(c *gin.Context) {
 			return
 		}
 		if err == service.ErrInstanceBanned {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrInstanceExpired {
-			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": err.Error()})
 			return
 		}
 		if err == service.ErrDiskNotFound {

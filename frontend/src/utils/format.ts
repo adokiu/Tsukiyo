@@ -57,6 +57,10 @@ const STATUS_LABEL_KEYS: Record<string, string> = {
   error: 'common.error',
   reinstalling: 'common.reinstalling',
   resizing: 'common.resizing',
+  banned: 'common.banned',
+  expired: 'common.expired',
+  offline: 'common.offline',
+  missing: 'common.missing',
 }
 
 export function getStatusLabel(status: string, t: (key: string) => string): string {

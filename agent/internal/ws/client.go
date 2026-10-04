@@ -2,10 +2,12 @@ package ws
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,6 +33,9 @@ const (
 	MsgTypeTaskLog          MessageType = "task_log"
 )
 
+// ErrNotRegistered Agent 尚未完成 Master 注册，不应上报业务消息
+var ErrNotRegistered = errors.New("未注册到 Master")
+
 // TaskHandler 任务处理回调
 type TaskHandler func(taskID string, taskType string, payload json.RawMessage) (json.RawMessage, error)
 
@@ -48,7 +53,13 @@ type Client struct {
 	cfg            *config.Config
 	conn           *websocket.Conn
 	mu             sync.RWMutex
+	writeMu        sync.Mutex
+	connectMu      sync.Mutex
 	connected      bool
+	registering    bool
+	connGen        uint64
+	connecting     int32
+	reconnecting   int32
 	taskHandler    TaskHandler
 	requestHandler RequestHandler
 	configHandler  ConfigHandler
@@ -64,13 +75,15 @@ type Client struct {
 // NewClient 创建 WebSocket 客户端
 func NewClient(cfg *config.Config) *Client {
 	hostname, _ := os.Hostname()
-	return &Client{
+	c := &Client{
 		cfg:         cfg,
 		shutdown:    make(chan struct{}),
 		reconnectCh: make(chan struct{}, 1),
 		pendingReqs: make(map[string]chan []byte),
 		hostname:    hostname,
 	}
+	go c.reconnectLoop()
+	return c
 }
 
 // SetTaskHandler 设置任务处理器
@@ -102,17 +115,101 @@ func (c *Client) SendConsoleMessage(msgType string, payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
-		return fmt.Errorf("WebSocket 未连接")
-	}
-	return c.conn.WriteMessage(websocket.TextMessage, data)
+	return c.writeBytes(data)
 }
 
-// Connect 连接到 Master
+func (c *Client) canSend() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connected && !c.registering && c.conn != nil
+}
+
+// writeBytes 唯一业务消息写入口（注册完成后）
+func (c *Client) writeBytes(data []byte) error {
+	if !c.canSend() {
+		return ErrNotRegistered
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	c.mu.RLock()
+	conn := c.conn
+	ok := c.connected && !c.registering && conn != nil
+	c.mu.RUnlock()
+	if !ok {
+		return ErrNotRegistered
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		c.onTransportError()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) onTransportError() {
+	c.mu.Lock()
+	c.connected = false
+	c.registering = false
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+	c.mu.Unlock()
+	if atomic.LoadInt32(&c.connecting) == 0 {
+		c.triggerReconnect()
+	}
+}
+
+func (c *Client) drainReconnectCh() {
+	for {
+		select {
+		case <-c.reconnectCh:
+		default:
+			return
+		}
+	}
+}
+
+func (c *Client) isStaleGen(gen uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return gen != c.connGen
+}
+
+func (c *Client) dropConn(gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gen != c.connGen {
+		return
+	}
+	c.connected = false
+	c.registering = false
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+}
+
+// Connect 连接到 Master 并完成注册
 func (c *Client) Connect() error {
-	headers := http.Header{}
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	atomic.StoreInt32(&c.connecting, 1)
+	defer atomic.StoreInt32(&c.connecting, 0)
+
+	c.mu.Lock()
+	c.connected = false
+	c.registering = true
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+	c.connGen++
+	gen := c.connGen
+	c.mu.Unlock()
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -121,27 +218,70 @@ func (c *Client) Connect() error {
 	url := c.cfg.MasterWSURL()
 	zap.L().Info("正在连接 Master", zap.String("url", url))
 
-	conn, _, err := dialer.Dial(url, headers)
+	conn, _, err := dialer.Dial(url, http.Header{})
 	if err != nil {
 		return fmt.Errorf("连接 Master 失败: %w", err)
 	}
 
+	c.mu.Lock()
+	if gen != c.connGen {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("连接已过期")
+	}
 	c.conn = conn
-	c.connected = true
+	c.mu.Unlock()
 
-	// 发送注册消息
 	if err := c.sendRegister(); err != nil {
-		conn.Close()
+		c.dropConn(gen)
 		return fmt.Errorf("注册失败: %w", err)
 	}
 
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_, ackData, err := conn.ReadMessage()
+	if err != nil {
+		c.dropConn(gen)
+		return fmt.Errorf("等待注册确认失败: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	var ackMsg struct {
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(ackData, &ackMsg); err != nil {
+		c.dropConn(gen)
+		return fmt.Errorf("解析注册确认失败: %w", err)
+	}
+	if ackMsg.Type == "auth_error" {
+		var errMsg struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(ackMsg.Payload, &errMsg)
+		c.dropConn(gen)
+		return fmt.Errorf("Master 认证失败: %s", errMsg.Error)
+	}
+	if ackMsg.Type != "register_ack" {
+		c.dropConn(gen)
+		return fmt.Errorf("期望 register_ack，收到 %s", ackMsg.Type)
+	}
+
+	c.mu.Lock()
+	if gen != c.connGen {
+		c.mu.Unlock()
+		c.dropConn(gen)
+		return fmt.Errorf("连接已过期")
+	}
+	c.connected = true
+	c.registering = false
+	c.mu.Unlock()
+
 	zap.L().Info("WebSocket 连接成功")
 
-	// 启动读写 goroutine
-	go c.readLoop()
-	go c.writeLoop()
-	go c.heartbeatLoop()
+	go c.readLoop(gen)
+	go c.writeLoop(gen)
 
+	c.drainReconnectCh()
 	return nil
 }
 
@@ -173,7 +313,7 @@ func (c *Client) sendRegister() error {
 		"system_info":   hostInfo,
 	}
 
-	return c.sendMessage(MsgTypeRegister, payload)
+	return c.writePayload(MsgTypeRegister, payload)
 }
 
 func getTotalDiskFromDisks(disks []system.DiskInfo) int64 {
@@ -184,8 +324,8 @@ func getTotalDiskFromDisks(disks []system.DiskInfo) int64 {
 	return total
 }
 
-// sendMessage 发送消息
-func (c *Client) sendMessage(msgType MessageType, payload interface{}) error {
+// writePayload 写入消息（注册阶段使用，不要求 connected）
+func (c *Client) writePayload(msgType MessageType, payload interface{}) error {
 	data, err := json.Marshal(map[string]interface{}{
 		"type":    string(msgType),
 		"payload": payload,
@@ -194,15 +334,27 @@ func (c *Client) sendMessage(msgType MessageType, payload interface{}) error {
 		return err
 	}
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
 		return fmt.Errorf("连接未建立")
 	}
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	return conn.WriteMessage(websocket.TextMessage, data)
+}
+
+// sendMessage 发送已注册连接上的业务消息
+func (c *Client) sendMessage(msgType MessageType, payload interface{}) error {
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    string(msgType),
+		"payload": payload,
+	})
+	if err != nil {
 		return err
 	}
-	return nil
+	return c.writeBytes(data)
 }
 
 // SendRequest 发送同步请求 (如 console 连接请求)
@@ -235,14 +387,7 @@ func (c *Client) SendRequest(reqType string, payload interface{}) ([]byte, error
 		return nil, err
 	}
 
-	c.mu.Lock()
-	if c.conn == nil {
-		c.mu.Unlock()
-		return nil, fmt.Errorf("连接未建立")
-	}
-	err = c.conn.WriteMessage(websocket.TextMessage, data)
-	c.mu.Unlock()
-	if err != nil {
+	if err := c.writeBytes(data); err != nil {
 		return nil, err
 	}
 
@@ -410,10 +555,14 @@ func (c *Client) SendSecurityAlert(p SecurityAlertPayload) error {
 }
 
 // readLoop 读取消息循环
-func (c *Client) readLoop() {
+func (c *Client) readLoop(gen uint64) {
+	shutdownExit := false
 	defer func() {
 		if r := recover(); r != nil {
 			zap.L().Error("readLoop panic", zap.Any("recover", r))
+		}
+		if shutdownExit || c.isStaleGen(gen) {
+			return
 		}
 		c.triggerReconnect()
 	}()
@@ -421,14 +570,20 @@ func (c *Client) readLoop() {
 	for {
 		select {
 		case <-c.shutdown:
+			shutdownExit = true
 			return
 		default:
 		}
 
+		if c.isStaleGen(gen) {
+			return
+		}
+
 		c.mu.RLock()
 		conn := c.conn
+		stale := gen != c.connGen
 		c.mu.RUnlock()
-		if conn == nil {
+		if stale || conn == nil {
 			return
 		}
 
@@ -536,12 +691,7 @@ func (c *Client) readLoop() {
 					resp.Payload = respPayload
 				}
 				data, _ := json.Marshal(resp)
-				c.mu.Lock()
-				conn := c.conn
-				if conn != nil {
-					conn.WriteMessage(websocket.TextMessage, data)
-				}
-				c.mu.Unlock()
+				_ = c.writeBytes(data)
 			}(msg.Type, msg.ID, msg.Payload)
 		}
 	}
@@ -590,7 +740,7 @@ func (c *Client) handleTask(payload json.RawMessage) {
 }
 
 // writeLoop 写入消息循环 (处理 ping)
-func (c *Client) writeLoop() {
+func (c *Client) writeLoop(gen uint64) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -599,19 +749,27 @@ func (c *Client) writeLoop() {
 		case <-c.shutdown:
 			return
 		case <-ticker.C:
-			c.mu.Lock()
-			if c.conn != nil {
-				c.conn.WriteMessage(websocket.PingMessage, nil)
+			if c.isStaleGen(gen) {
+				return
 			}
-			c.mu.Unlock()
+			if c.isStaleGen(gen) || !c.canSend() {
+				continue
+			}
+			c.writeMu.Lock()
+			c.mu.RLock()
+			conn := c.conn
+			ok := c.connected && !c.registering && conn != nil && gen == c.connGen
+			c.mu.RUnlock()
+			if ok {
+				_ = conn.WriteMessage(websocket.PingMessage, nil)
+			}
+			c.writeMu.Unlock()
 		}
 	}
 }
 
-// heartbeatLoop 心跳循环 (由外部调用更精确的数据)
-func (c *Client) heartbeatLoop() {
-	// 心跳由 monitor 模块主动调用 SendHeartbeat
-	// 这里只负责 reconnect 逻辑
+// reconnectLoop 处理重连（全局唯一）
+func (c *Client) reconnectLoop() {
 	for {
 		select {
 		case <-c.shutdown:
@@ -624,10 +782,18 @@ func (c *Client) heartbeatLoop() {
 
 // triggerReconnect 触发重连
 func (c *Client) triggerReconnect() {
+	if atomic.LoadInt32(&c.connecting) != 0 {
+		return
+	}
+	if atomic.LoadInt32(&c.reconnecting) != 0 {
+		return
+	}
+
 	c.mu.Lock()
 	c.connected = false
+	c.registering = false
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		c.conn = nil
 	}
 	c.mu.Unlock()
@@ -640,6 +806,11 @@ func (c *Client) triggerReconnect() {
 
 // reconnect 重连逻辑 (指数退避)
 func (c *Client) reconnect() {
+	if !atomic.CompareAndSwapInt32(&c.reconnecting, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&c.reconnecting, 0)
+
 	zap.L().Info("开始重连 Master")
 	for i := 0; i < 120; i++ {
 		select {
@@ -650,6 +821,7 @@ func (c *Client) reconnect() {
 
 		if err := c.Connect(); err == nil {
 			zap.L().Info("重连成功")
+			c.drainReconnectCh()
 			return
 		} else {
 			zap.L().Warn("重连失败", zap.Int("attempt", i+1), zap.Error(err))
@@ -675,11 +847,9 @@ func (c *Client) Shutdown() {
 	c.mu.Unlock()
 }
 
-// IsConnected 检查连接状态
+// IsConnected 检查连接状态（注册完成且可上报）
 func (c *Client) IsConnected() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.connected
+	return c.canSend()
 }
 
 // generateReqID 生成请求 ID

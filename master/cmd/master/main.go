@@ -79,6 +79,9 @@ func main() {
 	// 配置路由
 	router := api.SetupRouter(agentMgr)
 
+	// 注册主题静态文件路由和 SPA 回退
+	api.SetupThemeStaticRoutes(router, handlers.DefaultThemeFS)
+
 	// 注入全局广播函数，handler 变更数据后通知前端刷新
 	handlers.SetBroadcastFn(func(msgType string, payload interface{}) {
 		agentMgr.BroadcastToFrontend(map[string]interface{}{

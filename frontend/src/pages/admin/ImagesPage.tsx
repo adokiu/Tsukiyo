@@ -8,6 +8,7 @@ import { Modal } from '@/components/Modal/Modal'
 import { useToastStore } from '@/stores/toast'
 import { PageLayout } from '@/components/PageLayout/PageLayout'
 import { getOSImage } from '@/utils/osImageHelper'
+import { buildAuthenticatedWebSocketUrl } from '@/utils/wsUrl'
 import '@/components/PageTransition/PageTransition.css'
 import '@/components/DataTable/DataTable.css'
 
@@ -263,8 +264,7 @@ export default function ImagesPage() {
 
   const connectWebSocket = () => {
     if (wsRef.current) wsRef.current.close()
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/images`)
+    const ws = new WebSocket(buildAuthenticatedWebSocketUrl('/ws/images'))
     wsRef.current = ws
 
     ws.onmessage = (event) => {

@@ -57,4 +57,5 @@ var (
 	ErrInstanceBanned             = &ServiceError{Message: "实例已被封禁"}
 	ErrInstanceExpired            = &ServiceError{Message: "实例已过期"}
 	ErrVMResizeRequiresStop       = &ServiceError{Message: "虚拟机运行时无法调整内存，请先关机再操作"}
+	ErrDynamicBindingPoolExists   = &ServiceError{Message: "同一网卡同一IP版本只能有一个动态绑定池"}
 )

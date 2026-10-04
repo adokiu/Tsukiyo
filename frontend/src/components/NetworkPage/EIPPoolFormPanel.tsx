@@ -4,6 +4,7 @@ import apiClient from '@/api/client'
 import { Button } from '@/components/Button/Button'
 import { Select } from '@/components/Select/Select'
 import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
+import { useFormValidation } from '@/hooks/useFormValidation'
 import { useToastStore } from '@/stores/toast'
 import type { EIPPool, EIPPoolDraftItem, NodeNetwork } from './types'
 import { makeDraftItem } from './types'
@@ -18,6 +19,7 @@ interface EIPPoolFormPanelProps {
 
 export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, onClose, onSuccess }: EIPPoolFormPanelProps) {
   const toast = useToastStore()
+  const { validate, hasError, clearError, reset } = useFormValidation()
   const [loading, setLoading] = useState(false)
   const [nodeNetworks, setNodeNetworks] = useState<NodeNetwork[]>([])
   const [ipVersion, setIpVersion] = useState<'ipv4' | 'ipv6'>('ipv4')
@@ -76,17 +78,31 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
   }
 
   const handleSubmit = async () => {
+    const rules: { field: string; valid: () => boolean }[] = []
     let validItems: EIPPoolDraftItem[] = []
     if (ipVersion === 'ipv4') {
       validItems = draftItems.filter(it => it.cidr.trim())
+      draftItems.forEach((it, idx) => {
+        if (it.cidr.trim()) rules.push({ field: `cidr_${it.id}`, valid: () => true })
+        else rules.push({ field: `cidr_${it.id}`, valid: () => false })
+      })
     } else {
       validItems = draftItems.filter(it => it.hostAddr.trim() && it.prefix.trim()).map(it => ({
         ...it,
         cidr: `${it.hostAddr}/${it.prefix}`,
       }))
+      draftItems.forEach((it) => {
+        if (it.hostAddr.trim() && it.prefix.trim()) rules.push({ field: `hostAddr_${it.id}`, valid: () => true })
+        else rules.push({ field: `hostAddr_${it.id}`, valid: () => false })
+      })
     }
+    const result = validate(rules)
     if (validItems.length === 0) {
       toast.error('请至少添加一条 IP 记录')
+      return
+    }
+    if (!result.ok) {
+      toast.error('请填写完整的 IP 记录')
       return
     }
     for (const item of validItems) {
@@ -106,6 +122,7 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
           gateway: item.gateway || undefined,
           alias: item.alias || undefined,
           pool_type: item.poolType,
+          dynamic_binding: item.dynamicBinding,
         }
         if (ipVersion === 'ipv4' && item.netmask) {
           payload.netmask_prefix = parseInt(item.netmask) || 0
@@ -115,6 +132,7 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
       toast.success(`成功创建 ${validItems.length} 条 EIP 记录`)
       onSuccess()
       onClose()
+      reset()
     } catch (err: any) {
       toast.error(err.response?.data?.error || '操作失败')
     } finally {
@@ -207,6 +225,7 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                   <th className="px-3 py-2 text-left font-medium" style={{ minWidth: 140 }}>网关</th>
                   <th className="px-3 py-2 text-left font-medium" style={{ minWidth: 140 }}>别名</th>
                   <th className="px-3 py-2 text-left font-medium" style={{ width: 100 }}>类型</th>
+                  <th className="px-3 py-2 text-left font-medium" style={{ width: 90 }}>动态绑定</th>
                   <th className="px-3 py-2 text-right font-medium" style={{ width: 50 }}>操作</th>
                 </tr>
               ) : (
@@ -216,6 +235,7 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                   <th className="px-3 py-2 text-left font-medium" style={{ minWidth: 150 }}>网卡</th>
                   <th className="px-3 py-2 text-left font-medium" style={{ minWidth: 140 }}>网关</th>
                   <th className="px-3 py-2 text-left font-medium" style={{ minWidth: 100 }}>类型</th>
+                  <th className="px-3 py-2 text-left font-medium" style={{ width: 90 }}>动态绑定</th>
                   <th className="px-3 py-2 text-right font-medium" style={{ width: 50 }}>操作</th>
                 </tr>
               )}
@@ -236,10 +256,11 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                     <td className="px-3 py-2">
                       <Select
                         value={item.cidr}
+                        error={hasError(`cidr_${item.id}`)}
                         options={getCidrOptions(item.interface)}
                         editable
                         placeholder="8.8.8.8/24"
-                        onChange={(v) => handleCidrChange(item, String(v))}
+                        onChange={(v) => { handleCidrChange(item, String(v)); clearError(`cidr_${item.id}`) }}
                       />
                     </td>
                     <td className="px-3 py-2">
@@ -277,6 +298,14 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                         onChange={(v) => updateDraftItem(item.id, { poolType: v as 'host' | 'eip' })}
                       />
                     </td>
+                    <td className="px-3 py-2 text-center">
+                      <input
+                        type="checkbox"
+                        checked={item.dynamicBinding}
+                        onChange={(e) => updateDraftItem(item.id, { dynamicBinding: e.target.checked })}
+                        className="w-4 h-4"
+                      />
+                    </td>
                     <td className="px-3 py-2 text-right">
                       <button onClick={() => removeRow(item.id)} className="text-red-500 hover:text-red-700 text-xs">删除</button>
                     </td>
@@ -294,10 +323,11 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                     <td className="px-3 py-2">
                       <Select
                         value={item.hostAddr}
+                        error={hasError(`hostAddr_${item.id}`)}
                         options={getHostAddrOptions(item.interface)}
                         editable
                         placeholder="如 240e:525::"
-                        onChange={(v) => handleHostAddrChange(item, String(v))}
+                        onChange={(v) => { handleHostAddrChange(item, String(v)); clearError(`hostAddr_${item.id}`) }}
                       />
                     </td>
                     <td className="px-3 py-2">
@@ -326,6 +356,14 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
                           { label: '弹性', value: 'eip' },
                         ]}
                         onChange={(v) => updateDraftItem(item.id, { poolType: v as 'host' | 'eip' })}
+                      />
+                    </td>
+                    <td className="px-3 py-2 text-center">
+                      <input
+                        type="checkbox"
+                        checked={item.dynamicBinding}
+                        onChange={(e) => updateDraftItem(item.id, { dynamicBinding: e.target.checked })}
+                        className="w-4 h-4"
                       />
                     </td>
                     <td className="px-3 py-2 text-right">
@@ -361,6 +399,7 @@ export function EIPPoolFormPanel({ open, nodeId, existingPools: _existingPools, 
             </>
           )}
           <p>类型：宿主机 = 仅用于网桥 NAT 出口，不能分配给实例；弹性 = 可分配给实例或网桥</p>
+          <p>动态绑定：开启后自动监听网卡 IP 变化，IP 变更时自动换绑新 IP 并重算所有分配。同一网卡同一 IP 版本只能有一个动态绑定池</p>
           <p>别名：DMZ 场景下对应的公网 IP 段（CIDR），前缀长度必须与池 CIDR 相同，如池 172.19.10.10/30 则别名填 125.25.1.10/30</p>
         </div>
       </div>

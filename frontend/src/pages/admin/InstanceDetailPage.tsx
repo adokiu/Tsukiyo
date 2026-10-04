@@ -15,6 +15,7 @@ import { DiskTab } from '@/components/InstanceDetail/DiskTab'
 import { SnapshotTab } from '@/components/InstanceDetail/SnapshotTab'
 import { ReinstallTab } from '@/components/InstanceDetail/ReinstallTab'
 import { getStatusLabel, generateRandomPassword } from '@/utils/format'
+import { buildAuthenticatedWebSocketUrl } from '@/utils/wsUrl'
 
 type TabKey = 'overview' | 'monitoring' | 'portMapping' | 'disk' | 'snapshot' | 'reinstall'
 
@@ -285,8 +286,7 @@ export default function InstanceDetailPage() {
     let manualClose = false
 
     const connect = () => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/instances`)
+      const ws = new WebSocket(buildAuthenticatedWebSocketUrl('/ws/instances'))
       wsRef.current = ws
 
       ws.onopen = () => {

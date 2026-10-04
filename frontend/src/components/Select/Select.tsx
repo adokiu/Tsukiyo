@@ -4,7 +4,7 @@ import { ChevronDown, Check } from 'lucide-react'
 import './Select.css'
 
 export interface SelectOption {
-  label: string
+  label: React.ReactNode
   value: string | number
 }
 
@@ -15,10 +15,11 @@ interface SelectProps {
   disabled?: boolean
   editable?: boolean
   emptyText?: string
+  error?: boolean
   onChange: (value: string | number) => void
 }
 
-export function Select({ value, options, placeholder = '请选择', disabled = false, editable = false, emptyText, onChange }: SelectProps) {
+export function Select({ value, options, placeholder = '请选择', disabled = false, editable = false, emptyText, error = false, onChange }: SelectProps) {
   const [open, setOpen] = useState(false)
   const [inputValue, setInputValue] = useState<string>('')
   const ref = useRef<HTMLDivElement>(null)
@@ -30,7 +31,7 @@ export function Select({ value, options, placeholder = '请选择', disabled = f
 
   useEffect(() => {
     const sel = options.find((o) => o.value === value)
-    setInputValue(sel ? sel.label : (value != null ? String(value) : ''))
+    setInputValue(sel ? String(sel.label) : (value != null ? String(value) : ''))
   }, [value, options])
 
   const updatePosition = useCallback(() => {
@@ -85,7 +86,7 @@ export function Select({ value, options, placeholder = '请选择', disabled = f
   }
 
   return (
-    <div ref={ref} className={`select ${open ? 'select--open' : ''} ${disabled ? 'select--disabled' : ''} ${editable ? 'select--editable' : ''}`}>
+    <div ref={ref} className={`select ${open ? 'select--open' : ''} ${disabled ? 'select--disabled' : ''} ${editable ? 'select--editable' : ''} ${error ? 'select--error' : ''}`}>
       {editable ? (
         <div className="select__trigger">
           <input
@@ -129,7 +130,7 @@ export function Select({ value, options, placeholder = '请选择', disabled = f
                   className={`select__option ${value === opt.value ? 'select__option--active' : ''}`}
                   onClick={() => {
                     onChange(opt.value)
-                    setInputValue(String(opt.label))
+                    setInputValue(typeof opt.label === 'string' ? opt.label : String(opt.label))
                     setOpen(false)
                   }}
                 >

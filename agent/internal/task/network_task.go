@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os/exec"
 	"strings"
 
 	"go.uber.org/zap"
@@ -194,6 +195,37 @@ func (e *Executor) handleBridgeNetwork(payload json.RawMessage) (json.RawMessage
 	case "update":
 		zap.L().Info("Bridge 更新完成", zap.String("bridge", req.BridgeName))
 
+	case "update_ipv6":
+		// 动态 IP 变更时更新 bridge IPv6 配置
+		if req.IPv6CIDR != "" {
+			gw := req.IPv6Gateway
+			if gw == "" {
+				_, ipNet, _ := net.ParseCIDR(req.IPv6CIDR)
+				if ipNet != nil {
+					ip := ipNet.IP
+					if len(ip) == 16 {
+						ip[15] = 1
+					}
+					gw = ip.String()
+				}
+			}
+			ipv6Addr := ""
+			if gw != "" {
+				maskStr := "64"
+				if idx := strings.Index(req.IPv6CIDR, "/"); idx > 0 {
+					maskStr = req.IPv6CIDR[idx+1:]
+				}
+				ipv6Addr = gw + "/" + maskStr
+			}
+			if err := e.incusClient.UpdateBridgeNetwork(req.BridgeName, map[string]string{
+				"ipv6.address": ipv6Addr,
+			}); err != nil {
+				zap.L().Error("更新 bridge IPv6 配置失败", zap.String("bridge", req.BridgeName), zap.Error(err))
+				return nil, fmt.Errorf("更新 bridge IPv6 配置失败: %w", err)
+			}
+			zap.L().Info("bridge IPv6 配置更新成功", zap.String("bridge", req.BridgeName), zap.String("ipv6_cidr", req.IPv6CIDR))
+		}
+
 	case "delete":
 		if err := e.incusClient.DeleteBridgeNetwork(req.BridgeName); err != nil {
 			zap.L().Error("删除 bridge 网络失败", zap.String("bridge", req.BridgeName), zap.Error(err))
@@ -293,4 +325,50 @@ func (e *Executor) handleUnbindBridgeEgress(payload json.RawMessage) (json.RawMe
 		zap.String("bridge", req.BridgeName))
 
 	return json.Marshal(map[string]string{"status": "ok"})
+}
+
+// handleRenewIPv6DHCP 在 bridge IPv6 CIDR 变更后，触发 NAT 实例通过 DHCPv6 获取新 IPv6 地址
+// NAT 实例的 IPv6 由 Incus bridge 的 DHCPv6 管理，bridge ipv6.address 变更后容器需重新获取
+func (e *Executor) handleRenewIPv6DHCP(payload json.RawMessage) (json.RawMessage, error) {
+	var req struct {
+		BridgeName    string   `json:"bridge_name"`
+		IPv6CIDR      string   `json:"ipv6_cidr"`
+		IPv6Gateway   string   `json:"ipv6_gateway"`
+		InstanceNames []string `json:"instance_names"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil, fmt.Errorf("解析参数失败: %w", err)
+	}
+
+	zap.L().Info("[RenewDHCPv6] 开始触发 DHCPv6 续约",
+		zap.String("bridge", req.BridgeName),
+		zap.String("ipv6_cidr", req.IPv6CIDR),
+		zap.Int("instance_count", len(req.InstanceNames)))
+
+	// 确保 bridge 使用 DHCPv6 有状态模式
+	exec.Command("incus", "network", "set", req.BridgeName, "ipv6.dhcp", "true").Run()
+	exec.Command("incus", "network", "set", req.BridgeName, "ipv6.dhcp.stateful", "true").Run()
+
+	for _, instanceName := range req.InstanceNames {
+		// 在容器内触发 DHCPv6 续约：先释放旧地址再重新获取
+		// dhclient -6 -r eth0 释放，dhclient -6 eth0 重新获取
+		exec.Command("incus", "exec", instanceName, "--", "dhclient", "-6", "-r", "eth0").Run()
+		exec.Command("incus", "exec", instanceName, "--", "dhclient", "-6", "eth0").Run()
+
+		// 如果 dhclient 不存在，尝试用 nmcli 或 systemctl 重启网络
+		exec.Command("incus", "exec", instanceName, "--", "nmcli", "connection", "reload").Run()
+		exec.Command("incus", "exec", instanceName, "--", "systemctl", "restart", "networking").Run()
+
+		zap.L().Info("[RenewDHCPv6] 实例 DHCPv6 续约已触发",
+			zap.String("instance", instanceName))
+	}
+
+	zap.L().Info("[RenewDHCPv6] 所有实例 DHCPv6 续约已触发",
+		zap.String("bridge", req.BridgeName),
+		zap.Int("count", len(req.InstanceNames)))
+
+	return json.Marshal(map[string]interface{}{
+		"status":         "ok",
+		"instance_count": len(req.InstanceNames),
+	})
 }

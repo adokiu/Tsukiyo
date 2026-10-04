@@ -24,19 +24,20 @@ const (
 
 // EIPPool EIP 资源池
 type EIPPool struct {
-	ID            uuid.UUID     `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	NodeID        uuid.UUID     `gorm:"type:uuid;not null;index" json:"node_id"`
-	IPVersion     string        `gorm:"type:varchar(8);not null" json:"ip_version"`
-	CIDR          string        `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
-	Interface     string        `gorm:"type:varchar(32);not null;default:''" json:"interface"`
-	Gateway       string        `gorm:"type:varchar(64);not null;default:''" json:"gateway"`
-	PrefixLen     int           `gorm:"type:int;not null" json:"prefix_len"`
-	NetmaskPrefix int           `gorm:"column:netmask_prefix;type:int;not null;default:0" json:"netmask_prefix"`
-	Alias         string        `gorm:"type:varchar(128);not null;default:''" json:"alias"`
-	PoolType      EIPPoolType   `gorm:"type:varchar(8);not null;default:'eip'" json:"pool_type"`
-	Status        EIPPoolStatus `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
-	CreatedAt     time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
-	UpdatedAt     time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
+	ID             uuid.UUID     `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	NodeID         uuid.UUID     `gorm:"type:uuid;not null;index" json:"node_id"`
+	IPVersion      string        `gorm:"type:varchar(8);not null" json:"ip_version"`
+	CIDR           string        `gorm:"column:cidr;type:varchar(64);not null" json:"cidr"`
+	Interface      string        `gorm:"type:varchar(32);not null;default:''" json:"interface"`
+	Gateway        string        `gorm:"type:varchar(64);not null;default:''" json:"gateway"`
+	PrefixLen      int           `gorm:"type:int;not null" json:"prefix_len"`
+	NetmaskPrefix  int           `gorm:"column:netmask_prefix;type:int;not null;default:0" json:"netmask_prefix"`
+	Alias          string        `gorm:"type:varchar(128);not null;default:''" json:"alias"`
+	PoolType       EIPPoolType   `gorm:"type:varchar(8);not null;default:'eip'" json:"pool_type"`
+	DynamicBinding bool          `gorm:"type:boolean;not null;default:false" json:"dynamic_binding"`
+	Status         EIPPoolStatus `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
+	CreatedAt      time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
+	UpdatedAt      time.Time     `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
 
 	// 非持久化字段：使用统计
 	UsedCount int64 `gorm:"-" json:"used_count"`

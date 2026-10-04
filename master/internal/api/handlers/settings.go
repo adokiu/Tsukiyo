@@ -22,12 +22,14 @@ func GetSiteConfig(c *gin.Context) {
 
 // UpdateSiteConfig 更新站点配置
 type UpdateSiteConfigRequest struct {
-	SiteName        string `json:"site_name,omitempty" binding:"max=128"`
-	SiteSubtitle    string `json:"site_subtitle,omitempty"`
-	SiteDescription string `json:"site_description,omitempty"`
-	SiteURL         string `json:"site_url,omitempty"`
-	ContactEmail    string `json:"contact_email,omitempty"`
-	IncusRemoteURL  string `json:"incus_remote_url,omitempty"`
+	SiteName          string `json:"site_name,omitempty" binding:"max=128"`
+	SiteSubtitle      string `json:"site_subtitle,omitempty"`
+	SiteDescription   string `json:"site_description,omitempty"`
+	SiteURL           string `json:"site_url,omitempty"`
+	ContactEmail      string `json:"contact_email,omitempty"`
+	IncusRemoteURL    string `json:"incus_remote_url,omitempty"`
+	AllowRegistration *bool  `json:"allow_registration,omitempty"`
+	ForceEmailVerify  *bool  `json:"force_email_verify,omitempty"`
 }
 
 func UpdateSiteConfig(c *gin.Context) {
@@ -43,7 +45,7 @@ func UpdateSiteConfig(c *gin.Context) {
 		return
 	}
 
-	// 更新字段
+	// 更新字符串字段
 	if req.SiteName != "" {
 		site.SiteName = req.SiteName
 	}
@@ -61,6 +63,14 @@ func UpdateSiteConfig(c *gin.Context) {
 	}
 	if req.IncusRemoteURL != "" {
 		site.IncusRemoteURL = req.IncusRemoteURL
+	}
+
+	// 更新布尔字段
+	if req.AllowRegistration != nil {
+		site.AllowRegistration = *req.AllowRegistration
+	}
+	if req.ForceEmailVerify != nil {
+		site.ForceEmailVerify = *req.ForceEmailVerify
 	}
 
 	if err := db.DB.Save(&site).Error; err != nil {

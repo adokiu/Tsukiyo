@@ -3,12 +3,19 @@ import { Loader2, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
 import { Pagination } from './Pagination'
 import './DataTable.css'
 
+export interface RowContext {
+  level: number
+  expanded: boolean
+  canExpand: boolean
+  onToggleExpand?: (key: string | number) => void
+}
+
 export interface Column<T> {
   key: string
   title: string
   width?: number | string
   sortable?: boolean
-  render?: (row: T, index: number) => ReactNode
+  render?: (row: T, index: number, ctx?: RowContext) => ReactNode
 }
 
 export interface SortState {
@@ -38,6 +45,13 @@ interface DataTableProps<T> {
   onSortChange?: (sort: SortState) => void
   header?: ReactNode
   footer?: ReactNode
+  expandedRowKeys?: (string | number)[]
+  renderExpanded?: (row: T) => ReactNode
+  getChildren?: (row: T) => T[]
+  hasChildren?: (row: T) => boolean
+  expandedKeys?: Set<string | number>
+  onToggleExpand?: (key: string | number) => void
+  getLevel?: (row: T) => number
 }
 
 export function DataTable<T>({
@@ -56,6 +70,13 @@ export function DataTable<T>({
   onSortChange,
   header,
   footer,
+  expandedRowKeys,
+  renderExpanded,
+  getChildren,
+  hasChildren,
+  expandedKeys,
+  onToggleExpand,
+  getLevel,
 }: DataTableProps<T>) {
   const safeData = Array.isArray(data) ? data : []
   const allKeys = useMemo(() => safeData.map((r) => rowKey(r)), [safeData, rowKey])
@@ -89,6 +110,56 @@ export function DataTable<T>({
   )
 
   const colSpan = columns.length + (selectable ? 1 : 0)
+
+  const effectiveExpandedKeys = useMemo(() => {
+    if (expandedKeys) return expandedKeys
+    if (expandedRowKeys && expandedRowKeys.length > 0) return new Set(expandedRowKeys)
+    return null
+  }, [expandedKeys, expandedRowKeys])
+
+  const renderRow = (row: T, idx: number, level: number): ReactNode[] => {
+    const key = rowKey(row)
+    const checked = selectedKeys?.has(key) ?? false
+    const isExpanded = effectiveExpandedKeys?.has(key) ?? false
+    const canExpand = hasChildren ? hasChildren(row) : false
+    const rows: ReactNode[] = [
+      <tr key={key} className={checked ? 'data-table__row--selected' : ''}>
+        {selectable && (
+          <td>
+            <input
+              type="checkbox"
+              className="data-table__checkbox"
+              checked={checked}
+              onChange={() => toggleRow(key)}
+            />
+          </td>
+        )}
+        {columns.map((col) => (
+          <td key={col.key} className={col.key === 'action' ? 'data-table__td--sticky-right' : ''}>
+            {col.render
+              ? col.render(row, idx, { level, expanded: isExpanded, canExpand, onToggleExpand })
+              : String((row as Record<string, unknown>)[col.key] ?? '')}
+          </td>
+        ))}
+      </tr>,
+    ]
+    if (isExpanded && renderExpanded) {
+      rows.push(
+        <tr key={`${key}-expanded`} className="data-table__row--expanded">
+          <td colSpan={colSpan} style={{ padding: 0, border: 'none' }}>
+            {renderExpanded(row)}
+          </td>
+        </tr>,
+      )
+    }
+    if (isExpanded && getChildren && canExpand) {
+      const children = getChildren(row)
+      children.forEach((child, childIdx) => {
+        rows.push(...renderRow(child, childIdx, level + 1))
+      })
+    }
+    return rows
+  }
 
   return (
     <div className="data-table-wrapper">
@@ -154,31 +225,7 @@ export function DataTable<T>({
                 </td>
               </tr>
             ) : (
-              safeData.map((row, idx) => {
-                const key = rowKey(row)
-                const checked = selectedKeys?.has(key) ?? false
-                return (
-                  <tr key={key} className={checked ? 'data-table__row--selected' : ''}>
-                    {selectable && (
-                      <td>
-                        <input
-                          type="checkbox"
-                          className="data-table__checkbox"
-                          checked={checked}
-                          onChange={() => toggleRow(key)}
-                        />
-                      </td>
-                    )}
-                    {columns.map((col) => (
-                      <td key={col.key} className={col.key === 'action' ? 'data-table__td--sticky-right' : ''}>
-                        {col.render
-                          ? col.render(row, idx)
-                          : String((row as Record<string, unknown>)[col.key] ?? '')}
-                      </td>
-                    ))}
-                  </tr>
-                )
-              })
+              safeData.flatMap((row, idx) => renderRow(row, idx, getLevel ? getLevel(row) : 0))
             )}
           </tbody>
         </table>

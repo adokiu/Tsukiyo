@@ -46,6 +46,9 @@ func (s *Scheduler) Start() {
 
 	// 监控数据清理 (每天凌晨3点，保留30天)
 	go s.runDailyAt(3, 0, s.cleanupMetrics)
+
+	// 过期账单和订单清理 (每1分钟)
+	go s.runTicker(1*time.Minute, s.cancelExpiredBillsAndOrders)
 }
 
 // Stop 停止定时任务
@@ -100,6 +103,9 @@ func (s *Scheduler) checkExpiredInstances() {
 
 		// 如果实例正在运行，先下发停止任务
 		if inst.Status == models.InstanceStatusRunning {
+			payloadBytes, _ := json.Marshal(map[string]interface{}{
+				"instance_id": inst.IncusName,
+			})
 			task := models.Task{
 				ID:         uuid.New(),
 				Type:       models.TaskTypeStopInstance,
@@ -107,6 +113,7 @@ func (s *Scheduler) checkExpiredInstances() {
 				InstanceID: &inst.ID,
 				UserID:     inst.UserID,
 				Status:     models.TaskStatusPending,
+				Payload:    payloadBytes,
 			}
 			db.DB.Create(&task)
 		}
@@ -192,6 +199,9 @@ func (s *Scheduler) checkTrafficOverLimit() {
 			updates["status"] = models.InstanceStatusStopped
 			db.DB.Model(&inst).Updates(updates)
 			// 下发停止任务
+			payloadBytes, _ := json.Marshal(map[string]interface{}{
+				"instance_id": inst.IncusName,
+			})
 			task := models.Task{
 				ID:         uuid.New(),
 				Type:       models.TaskTypeStopInstance,
@@ -199,6 +209,7 @@ func (s *Scheduler) checkTrafficOverLimit() {
 				InstanceID: &inst.ID,
 				UserID:     inst.UserID,
 				Status:     models.TaskStatusPending,
+				Payload:    payloadBytes,
 			}
 			db.DB.Create(&task)
 		} else if inst.OverLimitAction == models.OverLimitActionThrottle {
@@ -323,4 +334,25 @@ func (s *Scheduler) cleanupMetrics() {
 // downsampleMetrics 降采样监控数据
 func (s *Scheduler) downsampleMetrics() {
 	monitor.DownsampleMetrics()
+}
+
+// cancelExpiredBillsAndOrders 取消过期的 pending 账单和订单
+func (s *Scheduler) cancelExpiredBillsAndOrders() {
+	now := time.Now()
+
+	// 取消过期 pending 账单
+	result := db.DB.Model(&models.Bill{}).
+		Where("status = ? AND expires_at IS NOT NULL AND expires_at < ?", models.BillStatusPending, now).
+		Update("status", models.BillStatusCancelled)
+	if result.RowsAffected > 0 {
+		zap.L().Info("过期账单已取消", zap.Int64("count", result.RowsAffected))
+	}
+
+	// 取消过期 pending 订单
+	result = db.DB.Model(&models.Order{}).
+		Where("status = ? AND expires_at IS NOT NULL AND expires_at < ?", models.OrderStatusPending, now).
+		Update("status", models.OrderStatusCancelled)
+	if result.RowsAffected > 0 {
+		zap.L().Info("过期订单已取消", zap.Int64("count", result.RowsAffected))
+	}
 }

@@ -39,7 +39,7 @@ func Login(c *gin.Context) {
 	resp, err := authService.Login(req, c.ClientIP())
 	if err != nil {
 		if serviceErr, ok := err.(*service.ServiceError); ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": serviceErr.Message})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": serviceErr.Message})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "登录失败"})
@@ -80,6 +80,31 @@ func Register(c *gin.Context) {
 	})
 }
 
+// SendRegisterCodeRequest 发送注册验证码请求
+type SendRegisterCodeRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+// SendRegisterCode 发送注册验证码
+func SendRegisterCode(c *gin.Context) {
+	var req SendRegisterCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数错误: " + err.Error()})
+		return
+	}
+
+	if err := authService.SendRegisterCode(req.Email); err != nil {
+		if serviceErr, ok := err.(*service.ServiceError); ok {
+			c.JSON(http.StatusOK, gin.H{"code": 400, "error": serviceErr.Message})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "发送验证码失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "验证码已发送"})
+}
+
 // ChangePassword 修改密码
 func ChangePassword(c *gin.Context) {
 	var req ChangePasswordRequest
@@ -95,7 +120,7 @@ func ChangePassword(c *gin.Context) {
 			return
 		}
 		if serviceErr, ok := err.(*service.ServiceError); ok && serviceErr.Message == "原密码错误" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "原密码错误"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "原密码错误"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "修改密码失败"})

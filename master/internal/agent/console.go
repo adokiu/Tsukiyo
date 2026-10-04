@@ -76,14 +76,14 @@ func (m *Manager) handleConsoleData(msgType string, payload json.RawMessage) {
 func (m *Manager) HandleConsoleWebSocket(c *gin.Context) {
 	token := c.Query("token")
 	if token == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "缺少 token"})
 		return
 	}
 
 	// 验证并消费 token（一次性，30秒有效）
 	session, err := console.ConsumeConsoleToken(token)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "token 无效或已过期"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "token 无效或已过期"})
 		return
 	}
 

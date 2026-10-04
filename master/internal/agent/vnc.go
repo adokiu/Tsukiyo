@@ -57,7 +57,7 @@ func (m *Manager) handleVNCData(msgType string, payload json.RawMessage) {
 func (m *Manager) HandleVNCWebSocket(c *gin.Context) {
 	token := c.Query("token")
 	if token == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少 token"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "缺少 token"})
 		return
 	}
 
@@ -69,7 +69,7 @@ func (m *Manager) HandleVNCWebSocket(c *gin.Context) {
 	session, err := console.ValidateConsoleToken(token)
 	if err != nil {
 		zap.L().Warn("VNC token 验证失败", zap.String("token", token), zap.Error(err))
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "token 无效或已过期"})
+		c.JSON(http.StatusOK, gin.H{"code": 401, "error": "token 无效或已过期"})
 		return
 	}
 

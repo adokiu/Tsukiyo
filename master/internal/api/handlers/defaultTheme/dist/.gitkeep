@@ -1,0 +1,3 @@
+此目录用于存放 frontend-user 的构建产物。
+构建后，frontend-user/dist 目录的内容应复制到此目录下的 dist/ 子目录。
+运行: cp -r ../../frontend-user/dist/* dist/

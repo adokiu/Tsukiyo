@@ -494,8 +494,11 @@ func (s *NetworkService) allocateBridgeEgressFromPool(poolID uuid.UUID, bridgeID
 	}
 
 	alloc, err := s.tryAllocateFromPool(pool, prefixLen, specificIP)
-	if err != nil || alloc == nil {
-		return nil, fmt.Errorf("从资源池分配失败: %w", err)
+	if err != nil {
+		return nil, err
+	}
+	if alloc == nil {
+		return nil, service.ErrNoAvailableEIP
 	}
 
 	// 设置 usage 为 bridge_nat_egress 并关联网桥

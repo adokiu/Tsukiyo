@@ -1,7 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/viper"
@@ -16,6 +19,13 @@ type Config struct {
 	JWT      JWTConfig      `mapstructure:"jwt"`
 	Log      LogConfig      `mapstructure:"log"`
 	Agent    AgentConfig    `mapstructure:"agent"`
+	Security SecurityConfig `mapstructure:"security"`
+}
+
+// SecurityConfig 安全相关配置
+type SecurityConfig struct {
+	AllowedOrigins        []string `mapstructure:"allowed_origins"`
+	AllowInsecureDefaults bool     `mapstructure:"allow_insecure_defaults"`
 }
 
 // ServerConfig 服务配置
@@ -103,8 +113,19 @@ func Init() error {
 	}
 
 	if AppConfig.JWT.Secret == "" {
-		AppConfig.JWT.Secret = generateRandomSecret(32)
-		zap.L().Warn("JWT Secret 未配置，已自动生成随机密钥")
+		if AppConfig.Security.AllowInsecureDefaults {
+			secret, err := generateRandomSecret(32)
+			if err != nil {
+				return fmt.Errorf("生成 JWT Secret 失败: %w", err)
+			}
+			AppConfig.JWT.Secret = secret
+			zap.L().Warn("JWT Secret 未配置，已自动生成随机密钥（仅适用于本地开发，重启后 Token 失效）")
+		} else {
+			return fmt.Errorf("JWT Secret 未配置：请在 config 中设置 jwt.secret，或仅在开发环境设置 security.allow_insecure_defaults: true")
+		}
+	}
+	if len(AppConfig.JWT.Secret) < 32 {
+		return fmt.Errorf("JWT Secret 长度不足 32 字符，请使用足够强度的随机密钥")
 	}
 
 	zap.L().Info("配置加载完成",
@@ -152,6 +173,19 @@ func setDefaults() {
 	viper.SetDefault("agent.heartbeat_timeout", "60s")
 	viper.SetDefault("agent.task_timeout", "600s")
 	viper.SetDefault("agent.metrics_retention_days", 30)
+
+	viper.SetDefault("security.allow_insecure_defaults", os.Getenv("TSUKIYO_DEV") == "1")
+}
+
+func generateRandomSecret(length int) (string, error) {
+	if length < 16 {
+		length = 16
+	}
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("生成随机密钥失败: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func (d *DatabaseConfig) DSN() string {
@@ -164,11 +198,3 @@ func (d *DatabaseConfig) URL() string {
 		d.User, d.Password, d.Host, d.Port, d.DBName, d.SSLMode)
 }
 
-func generateRandomSecret(length int) string {
-	charset := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[i%len(charset)]
-	}
-	return string(b)
-}

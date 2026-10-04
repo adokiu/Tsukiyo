@@ -55,6 +55,7 @@ export interface EIPPool {
   netmask_prefix: number
   alias: string
   pool_type: string
+  dynamic_binding: boolean
   status: string
   used_count: number
   total_ips: number
@@ -88,9 +89,10 @@ export interface EIPPoolDraftItem {
   netmask: string
   alias: string
   poolType: 'host' | 'eip'
+  dynamicBinding: boolean
   detecting: boolean
 }
 
 export function makeDraftItem(): EIPPoolDraftItem {
-  return { id: Math.random().toString(36).slice(2), cidr: '', cidrManual: false, gateway: '', gatewayManual: false, interface: '', prefix: '', hostAddr: '', netmask: '', alias: '', poolType: 'eip', detecting: false }
+  return { id: Math.random().toString(36).slice(2), cidr: '', cidrManual: false, gateway: '', gatewayManual: false, interface: '', prefix: '', hostAddr: '', netmask: '', alias: '', poolType: 'eip', dynamicBinding: false, detecting: false }
 }

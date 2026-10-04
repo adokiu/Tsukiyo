@@ -22,6 +22,7 @@ export function EIPPoolEditPanel({ open, pool, onClose, onSuccess }: EIPPoolEdit
   const [netmaskPrefix, setNetmaskPrefix] = useState(0)
   const [poolType, setPoolType] = useState('eip')
   const [status, setStatus] = useState('active')
+  const [dynamicBinding, setDynamicBinding] = useState(false)
 
   useEffect(() => {
     if (pool) {
@@ -31,6 +32,7 @@ export function EIPPoolEditPanel({ open, pool, onClose, onSuccess }: EIPPoolEdit
       setNetmaskPrefix(pool.netmask_prefix || 0)
       setPoolType(pool.pool_type || 'eip')
       setStatus(pool.status || 'active')
+      setDynamicBinding(pool.dynamic_binding || false)
     }
   }, [pool])
 
@@ -45,6 +47,7 @@ export function EIPPoolEditPanel({ open, pool, onClose, onSuccess }: EIPPoolEdit
         netmask_prefix: netmaskPrefix,
         pool_type: poolType,
         status,
+        dynamic_binding: dynamicBinding,
       })
       toast.success('EIP 池已更新')
       onSuccess()
@@ -109,6 +112,18 @@ export function EIPPoolEditPanel({ open, pool, onClose, onSuccess }: EIPPoolEdit
             ]}
             onChange={(v) => setPoolType(v as string)}
           />
+        </div>
+        <div>
+          <label className="flex items-center gap-2 text-sm font-medium text-secondary">
+            <input
+              type="checkbox"
+              checked={dynamicBinding}
+              onChange={(e) => setDynamicBinding(e.target.checked)}
+              className="w-4 h-4"
+            />
+            动态 IP 绑定
+          </label>
+          <p className="text-xs text-muted mt-1">开启后自动监听网卡 IP 变化，IP 变更时自动换绑新 IP 并重算所有分配</p>
         </div>
         <div>
           <label className="block text-sm font-medium text-secondary mb-1">状态</label>

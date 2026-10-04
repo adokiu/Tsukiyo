@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import apiClient from '@/api/client'
+import { useFormValidation } from '@/hooks/useFormValidation'
 import { useToastStore } from '@/stores/toast'
 import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
 import { Button } from '@/components/Button/Button'
@@ -37,6 +38,7 @@ interface Props {
 
 export default function CreateInstanceModal({ open, onClose, onSuccess }: Props) {
   const toast = useToastStore()
+  const { validate, hasError, clearError, reset } = useFormValidation()
   const [step, setStep] = useState(1)
   const [loading, setLoading] = useState(false)
 
@@ -220,8 +222,15 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
     : installedImages
 
   const handleSubmit = async () => {
-    if (!name || !nodeId || !templateId || assignToUserId === '') {
+    const result = validate([
+      { field: 'name', step: 0, valid: () => name.trim().length > 0 },
+      { field: 'nodeId', step: 0, valid: () => nodeId.trim().length > 0 },
+      { field: 'templateId', step: 0, valid: () => templateId.trim().length > 0 },
+      { field: 'assignToUserId', step: 0, valid: () => assignToUserId !== '' },
+    ])
+    if (!result.ok) {
       toast.error('请填写所有必填字段')
+      if (result.firstErrorStep !== undefined) setStep(result.firstErrorStep + 1)
       return
     }
     setLoading(true)
@@ -270,6 +279,7 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
       toast.success('创建实例任务已下发')
       onSuccess()
       onClose()
+      reset()
     } catch (err: any) {
       toast.error(err.response?.data?.error || '创建失败')
     } finally {
@@ -321,7 +331,7 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-secondary mb-1">名称 <span className="text-red-500">*</span></label>
-              <input value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 border border-surface-strong rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-black" placeholder="实例名称" />
+              <input value={name} onChange={(e) => { setName(e.target.value); clearError('name') }} className={`w-full px-3 py-2 border border-surface-strong rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-black ${hasError('name') ? 'field-error' : ''}`} placeholder="实例名称" />
             </div>
             <div>
               <label className="block text-sm font-medium text-secondary mb-1">类型</label>
@@ -337,18 +347,20 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
               <label className="block text-sm font-medium text-secondary mb-1">节点 <span className="text-red-500">*</span></label>
               <Select
                 value={nodeId}
+                error={hasError('nodeId')}
                 placeholder="选择节点"
                 options={nodes.map((n) => ({ label: `${n.name} (${n.status})`, value: n.id }))}
-                onChange={(v) => setNodeId(String(v))}
+                onChange={(v) => { setNodeId(String(v)); clearError('nodeId') }}
               />
             </div>
             <div>
               <label className="block text-sm font-medium text-secondary mb-1">分配给用户 <span className="text-red-500">*</span></label>
               <Select
                 value={assignToUserId}
+                error={hasError('assignToUserId')}
                 placeholder="选择用户"
                 options={users.map((u) => ({ label: u.username, value: u.id }))}
-                onChange={(v) => setAssignToUserId(Number(v))}
+                onChange={(v) => { setAssignToUserId(Number(v)); clearError('assignToUserId') }}
               />
             </div>
           </div>
@@ -366,9 +378,10 @@ export default function CreateInstanceModal({ open, onClose, onSuccess }: Props)
               <label className="block text-sm font-medium text-secondary mb-1">镜像版本 <span className="text-red-500">*</span></label>
               <Select
                 value={templateId}
+                error={hasError('templateId')}
                 placeholder="选择镜像"
                 options={filteredImages.map((img) => ({ label: `${img.display_name || img.alias} (${img.architecture})`, value: img.id }))}
-                onChange={(v) => setTemplateId(String(v))}
+                onChange={(v) => { setTemplateId(String(v)); clearError('templateId') }}
               />
             </div>
           </div>

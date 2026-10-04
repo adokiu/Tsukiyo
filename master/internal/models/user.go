@@ -11,22 +11,41 @@ type UserStatus string
 
 const (
 	UserStatusActive    UserStatus = "active"
+	UserStatusPending   UserStatus = "pending"
 	UserStatusSuspended UserStatus = "suspended"
+	UserStatusBanned    UserStatus = "banned"
 	UserStatusDeleted   UserStatus = "deleted"
+)
+
+// RealNameStatus 实名认证状态
+type RealNameStatus string
+
+const (
+	RealNameStatusNone     RealNameStatus = "none"
+	RealNameStatusPending  RealNameStatus = "pending"
+	RealNameStatusApproved RealNameStatus = "approved"
+	RealNameStatusRejected RealNameStatus = "rejected"
 )
 
 // User 用户表
 type User struct {
-	ID           uint           `gorm:"primaryKey;autoIncrement" json:"id"`
-	Username     string         `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
-	Email        string         `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
-	PasswordHash string         `gorm:"type:varchar(255);not null" json:"-"`
-	Status       UserStatus     `gorm:"type:varchar(16);default:'active'" json:"status"`
-	LastLoginAt  *time.Time     `gorm:"type:timestamptz" json:"last_login_at,omitempty"`
-	LastLoginIP  string         `gorm:"type:varchar(64)" json:"last_login_ip,omitempty"`
-	CreatedAt    time.Time      `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
-	UpdatedAt    time.Time      `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
-	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
+	ID             uint           `gorm:"primaryKey;autoIncrement" json:"id"`
+	Username       string         `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
+	Email          string         `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
+	PasswordHash   string         `gorm:"type:varchar(255);not null" json:"-"`
+	Status         UserStatus     `gorm:"type:varchar(16);default:'active'" json:"status"`
+	BalanceCents   int64          `gorm:"type:bigint;default:0" json:"balance_cents"`
+	Phone          string         `gorm:"type:varchar(32)" json:"phone,omitempty"`
+	QQ             string         `gorm:"type:varchar(32)" json:"qq,omitempty"`
+	RealNameStatus RealNameStatus `gorm:"type:varchar(16);default:'none'" json:"real_name_status"`
+	RealName       string         `gorm:"type:varchar(128)" json:"real_name,omitempty"`
+	IDCard         string         `gorm:"type:varchar(32)" json:"id_card,omitempty"`
+	LastLoginAt    *time.Time     `gorm:"type:timestamptz" json:"last_login_at,omitempty"`
+	LastLoginIP    string         `gorm:"type:varchar(64)" json:"last_login_ip,omitempty"`
+	EmailVerified  bool           `gorm:"type:boolean;not null;default:false" json:"email_verified"`
+	CreatedAt      time.Time      `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
+	UpdatedAt      time.Time      `gorm:"type:timestamptz;not null;default:now()" json:"updated_at"`
+	DeletedAt      gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 // TableName 指定表名
@@ -38,7 +57,6 @@ func (User) TableName() string {
 func (u *User) IsActive() bool {
 	return u.Status == UserStatusActive
 }
-
 
 // UserGroup 用户组表
 type UserGroup struct {
@@ -81,9 +99,9 @@ func (Permission) TableName() string {
 
 // GroupPermission 组权限关联表
 type GroupPermission struct {
-	GroupID      uint   `gorm:"primaryKey" json:"group_id"`
-	PermissionID string `gorm:"type:varchar(64);primaryKey" json:"permission_id"`
-	Scope        string `gorm:"type:varchar(16);default:'all'" json:"scope"`
+	GroupID      uint      `gorm:"primaryKey" json:"group_id"`
+	PermissionID string    `gorm:"type:varchar(64);primaryKey" json:"permission_id"`
+	Scope        string    `gorm:"type:varchar(16);default:'all'" json:"scope"`
 	CreatedAt    time.Time `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
 }
 

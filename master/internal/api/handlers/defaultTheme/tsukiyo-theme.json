@@ -1,0 +1,64 @@
+{
+  "name": "Tsukiyo Default",
+  "short": "default",
+  "description": "Tsukiyo 默认用户主题",
+  "version": "1.0.0",
+  "author": "Tsukiyo",
+  "url": "https://github.com/adokiu/Tsukiyo",
+  "preview": "",
+  "configuration": {
+    "type": "managed",
+    "pages": [
+      {
+        "key": "global",
+        "name": "全局设置",
+        "icon": "palette",
+        "items": [
+          { "key": "primaryColor", "name": "主色调", "type": "string", "default": "#38bdf8" },
+          { "key": "darkPrimaryColor", "name": "暗色主色调", "type": "string", "default": "#7dd3fc" },
+          { "key": "primaryColorHover", "name": "主色调悬停", "type": "string", "default": "#0ea5e9" },
+          { "key": "darkPrimaryColorHover", "name": "暗色主色调悬停", "type": "string", "default": "#bae6fd" },
+          { "key": "borderRadius", "name": "圆角", "type": "string", "default": "0.75rem" },
+          { "key": "siteName", "name": "站点名称", "type": "string", "default": "Tsukiyo" },
+          { "key": "siteSubtitle", "name": "站点副标题", "type": "string", "default": "" },
+          { "key": "footerText", "name": "页脚文字", "type": "string", "default": "" }
+        ]
+      },
+      {
+        "key": "background",
+        "name": "背景设置",
+        "icon": "image",
+        "items": [
+          { "key": "backgroundEnabled", "name": "自定义背景", "type": "switch", "default": false },
+          { "key": "backgroundType", "name": "背景类型", "type": "select", "options": "image,video", "default": "image" },
+          { "key": "lightBackgroundUrl", "name": "亮色背景URL", "type": "string", "default": "" },
+          { "key": "darkBackgroundUrl", "name": "暗色背景URL", "type": "string", "default": "" },
+          { "key": "backgroundBlur", "name": "背景模糊(px)", "type": "number", "default": 0 },
+          { "key": "backgroundOverlay", "name": "背景遮罩(%)", "type": "number", "default": 0 }
+        ]
+      },
+      {
+        "key": "landing",
+        "name": "首页",
+        "icon": "home",
+        "items": [
+          { "key": "heroTitle", "name": "首页标题", "type": "string", "default": "极速云端，触手可及" },
+          { "key": "heroDescription", "name": "首页描述", "type": "string", "default": "搭载 NVMe 存储与 DDR5 内存的新一代云平台，秒级开通、稳定可靠，让你的每一个想法都能快速落地。" },
+          { "key": "heroCtaItems", "name": "首页按钮(JSON数组)", "type": "string", "default": "[{\"label\":\"云服务器\",\"href\":\"/products\",\"variant\":\"accent\"},{\"label\":\"控制台\",\"href\":\"/login\",\"variant\":\"ghost\"},{\"label\":\"关于我们\",\"href\":\"/about\",\"variant\":\"ghost\"}]" },
+          { "key": "heroCharacterUrl", "name": "首页角色图URL", "type": "string", "default": "" },
+          { "key": "heroPatternUrl", "name": "首页背景图案URL", "type": "string", "default": "https://img.yaooa.cn/images/pc-lty/068ae8d1.avif" }
+        ]
+      },
+      {
+        "key": "navigation",
+        "name": "导航栏",
+        "icon": "menu",
+        "items": [
+          { "key": "navItems", "name": "导航菜单项(JSON数组)", "type": "string", "default": "[{\"label\":\"产品\",\"href\":\"/products\"},{\"label\":\"关于我们\",\"href\":\"/about\"},{\"label\":\"服务条款\",\"href\":\"/legal/terms\"}]" },
+          { "key": "showLoginButton", "name": "显示登录按钮", "type": "switch", "default": true },
+          { "key": "showRegisterButton", "name": "显示注册按钮", "type": "switch", "default": true }
+        ]
+      }
+    ]
+  }
+}

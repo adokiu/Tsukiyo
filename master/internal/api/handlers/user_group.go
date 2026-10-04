@@ -139,7 +139,7 @@ func UpdateUserGroup(c *gin.Context) {
 	}
 
 	if group.IsBuiltin {
-		c.JSON(http.StatusForbidden, gin.H{"error": "内置用户组不允许修改"})
+		c.JSON(http.StatusOK, gin.H{"code": 403, "error": "内置用户组不允许修改"})
 		return
 	}
 
@@ -196,7 +196,7 @@ func DeleteUserGroup(c *gin.Context) {
 	}
 
 	if group.IsBuiltin {
-		c.JSON(http.StatusForbidden, gin.H{"error": "内置用户组不允许删除"})
+		c.JSON(http.StatusOK, gin.H{"code": 403, "error": "内置用户组不允许删除"})
 		return
 	}
 

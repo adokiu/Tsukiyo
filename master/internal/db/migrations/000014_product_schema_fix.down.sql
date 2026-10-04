@@ -1,0 +1,49 @@
+-- 回滚：恢复旧字段，删除新字段
+
+-- 删除新字段
+ALTER TABLE products DROP COLUMN IF EXISTS vcpu_min;
+ALTER TABLE products DROP COLUMN IF EXISTS vcpu_max;
+ALTER TABLE products DROP COLUMN IF EXISTS vcpu_custom_mode;
+ALTER TABLE products DROP COLUMN IF EXISTS vcpu_tiers;
+
+ALTER TABLE products DROP COLUMN IF EXISTS memory_min_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS memory_max_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS memory_custom_mode;
+ALTER TABLE products DROP COLUMN IF EXISTS memory_tiers;
+ALTER TABLE products DROP COLUMN IF EXISTS memory_unit;
+
+ALTER TABLE products DROP COLUMN IF EXISTS disk_min_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS disk_max_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS disk_custom_mode;
+ALTER TABLE products DROP COLUMN IF EXISTS disk_tiers;
+
+ALTER TABLE products DROP COLUMN IF EXISTS data_disk_min_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS data_disk_max_mb;
+ALTER TABLE products DROP COLUMN IF EXISTS data_disk_custom_mode;
+ALTER TABLE products DROP COLUMN IF EXISTS data_disk_tiers;
+
+ALTER TABLE products DROP COLUMN IF EXISTS network_down_min_mbps;
+ALTER TABLE products DROP COLUMN IF EXISTS network_down_max_mbps;
+ALTER TABLE products DROP COLUMN IF EXISTS network_up_min_mbps;
+ALTER TABLE products DROP COLUMN IF EXISTS network_up_max_mbps;
+ALTER TABLE products DROP COLUMN IF EXISTS network_down_unit_price_cents;
+ALTER TABLE products DROP COLUMN IF EXISTS network_up_unit_price_cents;
+
+ALTER TABLE products DROP COLUMN IF EXISTS traffic_min_gb;
+ALTER TABLE products DROP COLUMN IF EXISTS traffic_max_gb;
+ALTER TABLE products DROP COLUMN IF EXISTS node_bridges;
+
+-- 恢复旧字段
+ALTER TABLE products ADD COLUMN IF NOT EXISTS vcpu INT NOT NULL DEFAULT 1;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS vcpu_allow_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS memory_mb INT NOT NULL DEFAULT 1024;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS memory_allow_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS disk_mb INT NOT NULL DEFAULT 10240;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS disk_allow_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS data_disk_default_mb INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS data_disk_allow_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS network_down_mbps INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS network_up_mbps INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS network_allow_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS network_unit_price_cents BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS traffic_limit_gb INT NOT NULL DEFAULT 0;

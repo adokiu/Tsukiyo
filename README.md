@@ -50,11 +50,12 @@ docs/            # 架构文档
 ## 快速开始
 
 ```bash
-# 编译 Master
-cd master && go build -o tsukiyo-master ./cmd/master
+# 编译 Master / Agent（产物在仓库根目录）
+./build.ps1
 
-# 编译 Agent（Linux 交叉编译）
-cd agent && GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -o tsukiyo-agent-linux-amd64 .
+# 或手动：
+# go build -o tsukiyo-master.exe ./master/cmd/master
+# GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o tsukiyo-agent ./agent/cmd/agent
 
 # 编译前端
 cd frontend && npm install && npm run build

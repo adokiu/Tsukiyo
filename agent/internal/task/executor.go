@@ -107,6 +107,9 @@ func (e *Executor) Execute(taskType string, payload json.RawMessage) (json.RawMe
 	case "release_eip":
 		zap.L().Info("执行实例 EIP 释放任务")
 		return e.handleReleaseEIP(payload)
+	case "renew_ipv6_dhcp":
+		zap.L().Info("执行 IPv6 DHCPv6 续约任务")
+		return e.handleRenewIPv6DHCP(payload)
 	case "add_disk":
 		return e.handleAddDisk(payload)
 	case "delete_disk":

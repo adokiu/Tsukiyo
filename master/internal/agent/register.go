@@ -44,7 +44,8 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 	}
 
 	if regMsg.Type != "register" {
-		zap.L().Warn("收到非注册消息", zap.String("type", regMsg.Type))
+		zap.L().Warn("收到非注册消息，关闭连接", zap.String("type", regMsg.Type))
+		conn.Close()
 		return
 	}
 
@@ -277,6 +278,12 @@ func (m *Manager) HandleWebSocket(c *gin.Context) {
 		zap.String("node_id", nodeID.String()),
 		zap.String("hostname", payload.Hostname),
 	)
+
+	// 发送注册确认
+	_ = conn.WriteJSON(map[string]interface{}{
+		"type":    "register_ack",
+		"payload": map[string]interface{}{"node_id": nodeID.String()},
+	})
 
 	// 启动读写 goroutine
 	go ac.writePump()

@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS coupon_usages;
+DROP TABLE IF EXISTS coupons;
+DROP TABLE IF EXISTS cart_items;

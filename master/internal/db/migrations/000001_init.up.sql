@@ -113,13 +113,17 @@ CREATE TABLE IF NOT EXISTS instances (
     bridge_id UUID,
     internal_ipv4 INET,
     internal_ipv6 VARCHAR(64) DEFAULT '',
+    ipv4_address VARCHAR(64) DEFAULT '',
+    ipv6_address VARCHAR(128) DEFAULT '',
     vcpu FLOAT DEFAULT 1,
     memory_mb INTEGER DEFAULT 512,
-    disk_gb INTEGER DEFAULT 10,
+    disk_mb INTEGER NOT NULL DEFAULT 10240,
+    swap_mb INTEGER NOT NULL DEFAULT 0,
     network_down_mbps INTEGER DEFAULT 0,
     network_up_mbps INTEGER DEFAULT 0,
-    io_read_mbps INTEGER DEFAULT 0,
-    io_write_mbps INTEGER DEFAULT 0,
+    io_read_iops INTEGER DEFAULT 0,
+    io_write_iops INTEGER DEFAULT 0,
+    throttle_mbps INTEGER DEFAULT 0,
     ipv4_mode VARCHAR(8) NOT NULL DEFAULT 'nat',
     ipv6_mode VARCHAR(8) NOT NULL DEFAULT 'none',
     ipv4_eip_allocation_id UUID,
@@ -136,8 +140,12 @@ CREATE TABLE IF NOT EXISTS instances (
     monthly_traffic_gb BIGINT DEFAULT 0,
     traffic_used_gb FLOAT DEFAULT 0,
     traffic_reset_date VARCHAR(7) DEFAULT '',
-    over_limit_action VARCHAR(16) DEFAULT 'shutdown',
+    over_limit_action VARCHAR(16) DEFAULT '',
     is_over_limit BOOLEAN DEFAULT false,
+    last_net_in_total BIGINT DEFAULT 0,
+    last_net_out_total BIGINT DEFAULT 0,
+    monthly_traffic_in_bytes BIGINT DEFAULT 0,
+    monthly_traffic_out_bytes BIGINT DEFAULT 0,
     snapshot_limit INTEGER DEFAULT 5,
     port_mapping_limit INTEGER DEFAULT 2,
     expires_at TIMESTAMPTZ,
@@ -172,10 +180,12 @@ CREATE TABLE IF NOT EXISTS data_disks (
     instance_id UUID NOT NULL,
     node_id UUID NOT NULL,
     name VARCHAR(64) NOT NULL,
-    size_gb INTEGER NOT NULL,
+    size_mb INTEGER NOT NULL,
     storage_pool VARCHAR(64) DEFAULT 'default',
     mount_point VARCHAR(255),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    status VARCHAR(16) NOT NULL DEFAULT 'attached',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_data_disks_instance_id ON data_disks (instance_id);
 CREATE INDEX IF NOT EXISTS idx_data_disks_node_id ON data_disks (node_id);
@@ -187,20 +197,36 @@ CREATE TABLE IF NOT EXISTS instance_metrics (
     node_id UUID NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     cpu_percent FLOAT DEFAULT 0,
+    cpu_max FLOAT DEFAULT 0,
+    cpu_min FLOAT DEFAULT 0,
     mem_used BIGINT DEFAULT 0,
+    mem_used_max BIGINT DEFAULT 0,
+    mem_used_min BIGINT DEFAULT 0,
     mem_total BIGINT DEFAULT 0,
     disk_used BIGINT DEFAULT 0,
+    disk_used_max BIGINT DEFAULT 0,
+    disk_used_min BIGINT DEFAULT 0,
     disk_total BIGINT DEFAULT 0,
     disk_read_bps BIGINT DEFAULT 0,
     disk_write_bps BIGINT DEFAULT 0,
+    disk_read_iops BIGINT DEFAULT 0,
+    disk_write_iops BIGINT DEFAULT 0,
+    disk_read_max BIGINT DEFAULT 0,
+    disk_write_max BIGINT DEFAULT 0,
     net_in_bps BIGINT DEFAULT 0,
-    net_out_bps BIGINT DEFAULT 0,
+    net_in_max BIGINT DEFAULT 0,
+    net_in_min BIGINT DEFAULT 0,
     net_in_total BIGINT DEFAULT 0,
-    net_out_total BIGINT DEFAULT 0
+    net_out_bps BIGINT DEFAULT 0,
+    net_out_max BIGINT DEFAULT 0,
+    net_out_min BIGINT DEFAULT 0,
+    net_out_total BIGINT DEFAULT 0,
+    sample_count INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_instance_metrics_instance_id ON instance_metrics (instance_id);
 CREATE INDEX IF NOT EXISTS idx_instance_metrics_node_id ON instance_metrics (node_id);
 CREATE INDEX IF NOT EXISTS idx_instance_metrics_timestamp ON instance_metrics (timestamp);
+CREATE INDEX IF NOT EXISTS idx_instance_metrics_instance_time ON instance_metrics (instance_id, timestamp);
 
 -- 端口映射表
 CREATE TABLE IF NOT EXISTS port_mappings (
@@ -255,7 +281,7 @@ CREATE TABLE IF NOT EXISTS bridges (
     ipv6_gateway VARCHAR(64) NOT NULL DEFAULT '',
     dns_servers JSONB NOT NULL DEFAULT '[]',
     nat_egress_ipv4_id UUID,
-    nat_egress_ipv6_id UUID,
+    ipv6_e_ip_pool_id UUID,
     port_range_start INTEGER NOT NULL DEFAULT 20000,
     port_range_end INTEGER NOT NULL DEFAULT 65535,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
@@ -264,7 +290,7 @@ CREATE TABLE IF NOT EXISTS bridges (
 );
 CREATE INDEX IF NOT EXISTS idx_bridges_node_id ON bridges (node_id);
 CREATE INDEX IF NOT EXISTS idx_bridges_nat_egress_ipv4_id ON bridges (nat_egress_ipv4_id);
-CREATE INDEX IF NOT EXISTS idx_bridges_nat_egress_ipv6_id ON bridges (nat_egress_ipv6_id);
+CREATE INDEX IF NOT EXISTS idx_bridges_ipv6_e_ip_pool_id ON bridges (ipv6_e_ip_pool_id);
 
 -- EIP 资源池表
 CREATE TABLE IF NOT EXISTS eip_pools (
@@ -275,6 +301,7 @@ CREATE TABLE IF NOT EXISTS eip_pools (
     interface VARCHAR(32) NOT NULL DEFAULT '',
     gateway VARCHAR(64) NOT NULL DEFAULT '',
     prefix_len INTEGER NOT NULL,
+    netmask_prefix INTEGER NOT NULL DEFAULT 0,
     alias VARCHAR(128) NOT NULL DEFAULT '',
     pool_type VARCHAR(8) NOT NULL DEFAULT 'eip',
     status VARCHAR(16) NOT NULL DEFAULT 'active',
@@ -294,6 +321,8 @@ CREATE TABLE IF NOT EXISTS eip_allocations (
     usage VARCHAR(20) NOT NULL,
     bridge_id UUID,
     instance_id UUID,
+    alias VARCHAR(64) NOT NULL DEFAULT '',
+    mapped_internal_ip VARCHAR(64) NOT NULL DEFAULT '',
     status VARCHAR(16) NOT NULL DEFAULT 'assigned',
     allocated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     released_at TIMESTAMPTZ
@@ -362,6 +391,9 @@ CREATE TABLE IF NOT EXISTS site_configs (
     contact_email VARCHAR(255),
     incus_remote_url VARCHAR(512) DEFAULT 'images:',
     is_initialized BOOLEAN NOT NULL DEFAULT false,
+    auto_release_days INTEGER NOT NULL DEFAULT 7,
+    theme VARCHAR(64) DEFAULT 'default',
+    admin_entry_path VARCHAR(32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -370,11 +402,20 @@ CREATE TABLE IF NOT EXISTS site_configs (
 CREATE TABLE IF NOT EXISTS node_images (
     id SERIAL PRIMARY KEY,
     node_id UUID NOT NULL,
-    image_id VARCHAR(255) NOT NULL,
+    image_id VARCHAR(255),
+    fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+    alias VARCHAR(255) NOT NULL DEFAULT '',
+    image_type VARCHAR(20) NOT NULL DEFAULT '',
+    architecture VARCHAR(50) NOT NULL DEFAULT '',
+    size_bytes BIGINT NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    upload_date VARCHAR(50) NOT NULL DEFAULT '',
+    image_source VARCHAR(50) NOT NULL DEFAULT 'manual',
     status VARCHAR(16) DEFAULT 'downloaded',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_node_image ON node_images (node_id, image_id);
+CREATE INDEX IF NOT EXISTS idx_node_image ON node_images (node_id, fingerprint, image_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_image_unique ON node_images (node_id, fingerprint, image_type);
 
 -- 镜像缓存表
 CREATE TABLE IF NOT EXISTS image_cache (
@@ -392,6 +433,34 @@ CREATE TABLE IF NOT EXISTS image_cache (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 节点镜像分类表
+CREATE TABLE IF NOT EXISTS node_image_categories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id UUID NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    image_type VARCHAR(20) NOT NULL,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_node_image_category ON node_image_categories (node_id, image_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_image_category_unique ON node_image_categories (node_id, name, image_type);
+
+-- 镜像别名映射表
+CREATE TABLE IF NOT EXISTS node_image_aliases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id UUID NOT NULL,
+    fingerprint VARCHAR(64) NOT NULL,
+    image_type VARCHAR(20) NOT NULL,
+    category_id UUID REFERENCES node_image_categories(id) ON DELETE SET NULL,
+    display_name VARCHAR(200) NOT NULL DEFAULT '',
+    install_ssh BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_node_image_alias ON node_image_aliases (node_id, fingerprint, image_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_image_alias_unique ON node_image_aliases (node_id, fingerprint, image_type);
 
 -- 安全告警表
 CREATE TABLE IF NOT EXISTS security_alerts (
@@ -421,3 +490,65 @@ CREATE INDEX IF NOT EXISTS idx_security_alerts_severity ON security_alerts (seve
 CREATE INDEX IF NOT EXISTS idx_security_alerts_status ON security_alerts (status);
 CREATE INDEX IF NOT EXISTS idx_security_alerts_detected_at ON security_alerts (detected_at);
 CREATE INDEX IF NOT EXISTS idx_security_alerts_deleted_at ON security_alerts (deleted_at);
+
+-- 主题配置表
+CREATE TABLE IF NOT EXISTS theme_configurations (
+    short VARCHAR(64) PRIMARY KEY,
+    data TEXT DEFAULT '{}'
+);
+
+-- 权限种子数据
+INSERT INTO permissions (id, name, resource, action, description) VALUES
+    ('instance:create', '创建实例', 'instance', 'create', '创建新实例'),
+    ('instance:read', '查看实例', 'instance', 'read', '查看实例信息'),
+    ('instance:update', '更新实例', 'instance', 'update', '修改实例配置'),
+    ('instance:delete', '删除实例', 'instance', 'delete', '删除实例'),
+    ('instance:start', '启动实例', 'instance', 'start', '启动实例'),
+    ('instance:stop', '停止实例', 'instance', 'stop', '停止实例'),
+    ('instance:restart', '重启实例', 'instance', 'restart', '重启实例'),
+    ('instance:reinstall', '重装实例', 'instance', 'reinstall', '重装实例系统'),
+    ('instance:console', '实例控制台', 'instance', 'console', '访问实例控制台'),
+    ('instance:snapshot', '实例快照', 'instance', 'snapshot', '管理实例快照'),
+    ('node:read', '查看节点', 'node', 'read', '查看节点信息'),
+    ('node:create', '创建节点', 'node', 'create', '添加新节点'),
+    ('node:delete', '删除节点', 'node', 'delete', '删除节点'),
+    ('node:update', '更新节点', 'node', 'update', '修改节点配置'),
+    ('user:read', '查看用户', 'user', 'read', '查看用户信息'),
+    ('user:create', '创建用户', 'user', 'create', '创建新用户'),
+    ('user:update', '更新用户', 'user', 'update', '修改用户信息'),
+    ('user:delete', '删除用户', 'user', 'delete', '删除用户'),
+    ('user:group_manage', '用户组管理', 'user', 'group_manage', '管理用户组和权限分配'),
+    ('image:read', '查看镜像', 'image', 'read', '查看镜像列表'),
+    ('image:create', '创建镜像', 'image', 'create', '上传新镜像'),
+    ('image:update', '更新镜像', 'image', 'update', '修改镜像配置'),
+    ('network:manage', '网络管理', 'network', 'manage', '管理网络配置'),
+    ('network:ip_allocate', 'IP分配', 'network', 'ip_allocate', '分配IP地址'),
+    ('network:port_forward', '端口转发', 'network', 'port_forward', '管理端口转发规则'),
+    ('system:config', '系统配置', 'system', 'config', '系统配置和仪表盘'),
+    ('audit:read', '审计日志', 'audit', 'read', '查看审计日志')
+ON CONFLICT (id) DO NOTHING;
+
+-- admin 权限组种子数据
+INSERT INTO user_groups (name, description, is_builtin) VALUES
+    ('admin', '管理员组，拥有全部权限', true),
+    ('user', '普通用户组', true)
+ON CONFLICT (name) DO NOTHING;
+
+-- admin 组拥有全部权限（scope=all）
+INSERT INTO group_permissions (group_id, permission_id, scope)
+SELECT g.id, p.id, 'all'
+FROM user_groups g
+CROSS JOIN permissions p
+WHERE g.name = 'admin'
+ON CONFLICT (group_id, permission_id) DO NOTHING;
+
+-- user 组拥有基本权限（scope=own）
+INSERT INTO group_permissions (group_id, permission_id, scope)
+SELECT g.id, p.id, 'own'
+FROM user_groups g
+CROSS JOIN permissions p
+WHERE g.name = 'user'
+  AND p.id IN ('instance:create', 'instance:read', 'instance:update', 'instance:delete',
+               'instance:start', 'instance:stop', 'instance:restart', 'instance:reinstall',
+               'instance:console', 'instance:snapshot')
+ON CONFLICT (group_id, permission_id) DO NOTHING;

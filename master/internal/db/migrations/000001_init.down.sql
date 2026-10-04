@@ -1,4 +1,7 @@
+DROP TABLE IF EXISTS theme_configurations CASCADE;
 DROP TABLE IF EXISTS security_alerts CASCADE;
+DROP TABLE IF EXISTS node_image_aliases CASCADE;
+DROP TABLE IF EXISTS node_image_categories CASCADE;
 DROP TABLE IF EXISTS image_cache CASCADE;
 DROP TABLE IF EXISTS node_images CASCADE;
 DROP TABLE IF EXISTS site_configs CASCADE;

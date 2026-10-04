@@ -3,30 +3,12 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
-
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  8192,
-	WriteBufferSize: 8192,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
-var vncUpgrader = websocket.Upgrader{
-	ReadBufferSize:  8192,
-	WriteBufferSize: 8192,
-	Subprotocols:    []string{"binary"},
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
 
 // ImageProgressPayload 镜像下载进度上报
 type ImageProgressPayload struct {
@@ -74,6 +56,9 @@ type Manager struct {
 	frontendMu      sync.RWMutex
 	consoleSessions map[string]*websocket.Conn // sessionID -> 前端 WS 连接
 	consoleMu       sync.RWMutex
+
+	// OnDynamicBindingCheck 动态绑定池 IP 变化检测回调，由 NetworkService 注入
+	OnDynamicBindingCheck func(nodeID uuid.UUID, networkInterfaces json.RawMessage)
 }
 
 // Connection Agent 连接

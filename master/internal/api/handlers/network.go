@@ -424,14 +424,15 @@ func ListAvailableIPv6FromBridge(c *gin.Context) {
 }
 
 type createEIPPoolRequest struct {
-	NodeID        string `json:"node_id" binding:"required"`
-	IPVersion     string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
-	CIDR          string `json:"cidr" binding:"required"`
-	Interface     string `json:"interface"`
-	Gateway       string `json:"gateway"`
-	Alias         string `json:"alias"`
-	PoolType      string `json:"pool_type"`
-	NetmaskPrefix int    `json:"netmask_prefix"`
+	NodeID         string `json:"node_id" binding:"required"`
+	IPVersion      string `json:"ip_version" binding:"required,oneof=ipv4 ipv6"`
+	CIDR           string `json:"cidr" binding:"required"`
+	Interface      string `json:"interface"`
+	Gateway        string `json:"gateway"`
+	Alias          string `json:"alias"`
+	PoolType       string `json:"pool_type"`
+	NetmaskPrefix  int    `json:"netmask_prefix"`
+	DynamicBinding bool   `json:"dynamic_binding"`
 }
 
 func CreateEIPPool(c *gin.Context) {
@@ -447,15 +448,16 @@ func CreateEIPPool(c *gin.Context) {
 	}
 	userID, _ := c.Get("user_id")
 	pool, err := networkService.CreateEIPPool(infrastructure.CreateEIPPoolRequest{
-		NodeID:        nodeID,
-		IPVersion:     req.IPVersion,
-		CIDR:          req.CIDR,
-		Interface:     req.Interface,
-		Gateway:       req.Gateway,
-		Alias:         req.Alias,
-		PoolType:      req.PoolType,
-		NetmaskPrefix: req.NetmaskPrefix,
-		UserID:        userID.(uint),
+		NodeID:         nodeID,
+		IPVersion:      req.IPVersion,
+		CIDR:           req.CIDR,
+		Interface:      req.Interface,
+		Gateway:        req.Gateway,
+		Alias:          req.Alias,
+		PoolType:       req.PoolType,
+		NetmaskPrefix:  req.NetmaskPrefix,
+		DynamicBinding: req.DynamicBinding,
+		UserID:         userID.(uint),
 	})
 	if err != nil {
 		if err == service.ErrNodeNotFound {
@@ -468,6 +470,10 @@ func CreateEIPPool(c *gin.Context) {
 		}
 		if err == service.ErrEIPPoolCIDROverlap {
 			c.JSON(http.StatusConflict, gin.H{"error": "CIDR 网段与已有资源池重叠"})
+			return
+		}
+		if err == service.ErrDynamicBindingPoolExists {
+			c.JSON(http.StatusConflict, gin.H{"error": "同一网卡同一IP版本只能有一个动态绑定池"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -496,12 +502,13 @@ func DeleteEIPPool(c *gin.Context) {
 }
 
 type updateEIPPoolRequest struct {
-	Interface     string `json:"interface"`
-	Gateway       string `json:"gateway"`
-	Alias         string `json:"alias"`
-	NetmaskPrefix int    `json:"netmask_prefix"`
-	PoolType      string `json:"pool_type"`
-	Status        string `json:"status"`
+	Interface      string `json:"interface"`
+	Gateway        string `json:"gateway"`
+	Alias          string `json:"alias"`
+	NetmaskPrefix  int    `json:"netmask_prefix"`
+	PoolType       string `json:"pool_type"`
+	Status         string `json:"status"`
+	DynamicBinding *bool  `json:"dynamic_binding"`
 }
 
 func UpdateEIPPool(c *gin.Context) {
@@ -516,16 +523,21 @@ func UpdateEIPPool(c *gin.Context) {
 		return
 	}
 	pool, err := networkService.UpdateEIPPool(id, infrastructure.UpdateEIPPoolRequest{
-		Interface:     req.Interface,
-		Gateway:       req.Gateway,
-		Alias:         req.Alias,
-		NetmaskPrefix: req.NetmaskPrefix,
-		PoolType:      req.PoolType,
-		Status:        req.Status,
+		Interface:      req.Interface,
+		Gateway:        req.Gateway,
+		Alias:          req.Alias,
+		NetmaskPrefix:  req.NetmaskPrefix,
+		PoolType:       req.PoolType,
+		Status:         req.Status,
+		DynamicBinding: req.DynamicBinding,
 	})
 	if err != nil {
 		if err == service.ErrEIPPoolNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "资源池不存在"})
+			return
+		}
+		if err == service.ErrDynamicBindingPoolExists {
+			c.JSON(http.StatusConflict, gin.H{"error": "同一网卡同一IP版本只能有一个动态绑定池"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -719,7 +731,7 @@ func AddPortMapping(c *gin.Context) {
 		return
 	}
 	if instance.IPv4EIPAllocationID != nil || instance.IPv6EIPAllocationID != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "该实例已分配公网 IP，无需端口映射"})
+		c.JSON(http.StatusOK, gin.H{"code": 403, "error": "该实例已分配公网 IP，无需端口映射"})
 		return
 	}
 

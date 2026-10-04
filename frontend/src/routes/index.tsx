@@ -16,6 +16,19 @@ import StoragePage from '@/pages/admin/StoragePage'
 import SecurityPage from '@/pages/admin/SecurityPage'
 import SecurityPlaceholderPage from '@/pages/admin/SecurityPlaceholderPage'
 import SettingsPage from '@/pages/admin/SettingsPage'
+import PushSettingsPage from '@/pages/admin/PushSettingsPage'
+import ThemeManagementPage from '@/pages/admin/ThemeManagementPage'
+import ThemeSettingsPage from '@/pages/admin/ThemeSettingsPage'
+import UsersPage from '@/pages/admin/UsersPage'
+import UserGroupsPage from '@/pages/admin/UserGroupsPage'
+import FinanceOverviewPage from '@/pages/admin/FinanceOverviewPage'
+import FinanceBillsPage from '@/pages/admin/FinanceBillsPage'
+import FinanceChannelsPage from '@/pages/admin/FinanceChannelsPage'
+import ProductCategoriesPage from '@/pages/admin/commerce/ProductCategoriesPage'
+import ProductsPage from '@/pages/admin/commerce/ProductsPage'
+import CommercePlaceholderPage from '@/pages/admin/commerce/CommercePlaceholderPage'
+import TicketsPage from '@/pages/admin/TicketsPage'
+import TicketDetailPage from '@/pages/admin/TicketDetailPage'
 import ConsolePage from '@/pages/console/ConsolePage'
 import VNCPage from '@/pages/console/VNCPage'
 
@@ -81,11 +94,25 @@ export default function AppRoutes() {
           <Route path="instanceManagement/vm" element={<InstancesPage instanceType="vm" />} />
           <Route path="instanceManagement/container" element={<InstancesPage instanceType="container" />} />
           <Route path="instanceManagement/instances/:id" element={<InstanceDetailPage />} />
+          <Route path="userManagement/users" element={<UsersPage />} />
+          <Route path="userManagement/groups" element={<UserGroupsPage />} />
+          <Route path="financeManagement/overview" element={<FinanceOverviewPage />} />
+          <Route path="financeManagement/bills" element={<FinanceBillsPage />} />
+          <Route path="financeManagement/channels" element={<FinanceChannelsPage />} />
+          <Route path="commerceManagement/categories" element={<ProductCategoriesPage />} />
+          <Route path="commerceManagement/products" element={<ProductsPage />} />
+          <Route path="commerceManagement/coupons" element={<CommercePlaceholderPage titleKey="nav.coupons" />} />
+          <Route path="commerceManagement/promo-codes" element={<CommercePlaceholderPage titleKey="nav.promoCodes" />} />
+          <Route path="ticketManagement/tickets" element={<TicketsPage />} />
+          <Route path="ticketManagement/tickets/:id" element={<TicketDetailPage />} />
           <Route path="securityManagement/security" element={<SecurityPage />} />
           <Route path="securityManagement/firewall" element={<SecurityPlaceholderPage titleKey="nav.firewallManagement" />} />
           <Route path="securityManagement/acl" element={<SecurityPlaceholderPage titleKey="nav.aclRules" />} />
           <Route path="securityManagement/url-filter" element={<SecurityPlaceholderPage titleKey="nav.urlFilter" />} />
           <Route path="systemManagement/settings" element={<SettingsPage />} />
+          <Route path="systemManagement/pushSettings" element={<PushSettingsPage />} />
+          <Route path="systemManagement/themes" element={<ThemeManagementPage />} />
+          <Route path="themeSettings/:pageKey" element={<ThemeSettingsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/admin" replace />} />
       </Routes>

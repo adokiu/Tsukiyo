@@ -116,12 +116,16 @@ func (m *Manager) handleMetrics(nodeID uuid.UUID, payload json.RawMessage) {
 
 		// 缓存最新指标
 		metricKey := fmt.Sprintf("instance:%s:metrics", instance.ID)
+		memTotalBytes := int64(instance.MemoryMB) * 1024 * 1024
+		diskTotalBytes := int64(instance.DiskMB) * 1024 * 1024
+		memUsedBytes := (im.MemUsed + (int64(instance.MemoryMB) - im.MemTotal)) * 1024 * 1024
+		diskUsedBytes := (im.DiskUsed + (int64(instance.DiskMB) - im.DiskTotal)) * 1024 * 1024
 		metricData, _ := json.Marshal(map[string]interface{}{
 			"cpu_percent":     im.CPUPercent,
-			"mem_used":        im.MemUsed * 1024 * 1024,   // MB -> bytes
-			"mem_total":       im.MemTotal * 1024 * 1024,  // MB -> bytes
-			"disk_used":       im.DiskUsed * 1024 * 1024,  // MB -> bytes
-			"disk_total":      im.DiskTotal * 1024 * 1024, // MB -> bytes
+			"mem_used":        memUsedBytes,
+			"mem_total":       memTotalBytes,
+			"disk_used":       diskUsedBytes,
+			"disk_total":      diskTotalBytes,
 			"disk_read_bps":   im.DiskReadBps,
 			"disk_write_bps":  im.DiskWriteBps,
 			"disk_read_iops":  im.DiskReadIops,
@@ -137,10 +141,10 @@ func (m *Manager) handleMetrics(nodeID uuid.UUID, payload json.RawMessage) {
 		// 通过 WebSocket 推送实时监控指标给前端
 		m.BroadcastInstanceMetrics(instance.ID, map[string]interface{}{
 			"cpu_usage":       im.CPUPercent,
-			"memory_usage":    im.MemUsed * 1024 * 1024,
-			"memory_total":    im.MemTotal * 1024 * 1024,
-			"disk_used":       im.DiskUsed * 1024 * 1024,
-			"disk_total":      im.DiskTotal * 1024 * 1024,
+			"memory_used":     memUsedBytes,
+			"memory_total":    memTotalBytes,
+			"disk_used":       diskUsedBytes,
+			"disk_total":      diskTotalBytes,
 			"disk_read_bps":   im.DiskReadBps,
 			"disk_write_bps":  im.DiskWriteBps,
 			"disk_read_iops":  im.DiskReadIops,
@@ -171,6 +175,9 @@ func (m *Manager) handleTrafficOverLimit(instance *models.Instance, usedGB float
 		updates["status"] = models.InstanceStatusStopped
 		db.DB.Model(instance).Updates(updates)
 		// 下发停止任务
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"instance_id": instance.IncusName,
+		})
 		task := models.Task{
 			ID:         uuid.New(),
 			Type:       models.TaskTypeStopInstance,
@@ -178,6 +185,7 @@ func (m *Manager) handleTrafficOverLimit(instance *models.Instance, usedGB float
 			InstanceID: &instance.ID,
 			UserID:     instance.UserID,
 			Status:     models.TaskStatusPending,
+			Payload:    payloadBytes,
 		}
 		db.DB.Create(&task)
 
@@ -208,6 +216,9 @@ func (m *Manager) handleTrafficOverLimit(instance *models.Instance, usedGB float
 		// 默认 shutdown
 		updates["status"] = models.InstanceStatusStopped
 		db.DB.Model(instance).Updates(updates)
+		payloadBytes, _ := json.Marshal(map[string]interface{}{
+			"instance_id": instance.IncusName,
+		})
 		task := models.Task{
 			ID:         uuid.New(),
 			Type:       models.TaskTypeStopInstance,
@@ -215,6 +226,7 @@ func (m *Manager) handleTrafficOverLimit(instance *models.Instance, usedGB float
 			InstanceID: &instance.ID,
 			UserID:     instance.UserID,
 			Status:     models.TaskStatusPending,
+			Payload:    payloadBytes,
 		}
 		db.DB.Create(&task)
 	}

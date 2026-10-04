@@ -87,3 +87,214 @@
   border-top: 1px solid var(--color-gray-200);
   flex-shrink: 0;
 }
+
+.slide-steps {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--color-gray-200);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.slide-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-gray-500);
+  white-space: nowrap;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+
+.slide-step:hover {
+  color: var(--color-gray-700);
+}
+
+.slide-step--active {
+  color: var(--color-black);
+  font-weight: 600;
+}
+
+.slide-step__num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--color-gray-100);
+  color: var(--color-gray-500);
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.slide-step--active .slide-step__num {
+  background: var(--color-black);
+  color: var(--color-white);
+}
+
+.slide-step--done .slide-step__num {
+  background: var(--color-gray-300);
+  color: var(--color-white);
+}
+
+/* 步骤存在未填错误时的标记 */
+.slide-step--error {
+  color: var(--color-red-500);
+}
+
+.slide-step--error .slide-step__num {
+  background: var(--color-red-500);
+  color: var(--color-white);
+}
+
+/* 通用字段错误态：原生 input/textarea 红框 */
+.field-error {
+  border-color: var(--color-red-500) !important;
+}
+
+.field-error:focus {
+  border-color: var(--color-red-500) !important;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.12) !important;
+}
+
+.slide-step__divider {
+  width: 24px;
+  height: 1px;
+  background: var(--color-gray-200);
+  flex-shrink: 0;
+}
+
+.slide-step-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.slide-step-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.slide-step-section__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-black);
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-gray-100);
+}
+
+.slide-form-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.slide-form-grid--2 {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.slide-form-grid--3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.slide-form-grid--4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.slide-form-grid--5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.slide-form-grid--6 {
+  grid-template-columns: repeat(6, 1fr);
+}
+
+.slide-form-grid--1 {
+  grid-template-columns: 1fr;
+}
+
+.slide-form-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slide-form-item__label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-gray-600);
+}
+
+.slide-form-item__hint {
+  font-size: 11px;
+  color: var(--color-gray-400);
+}
+
+.slide-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding-top: 22px;
+}
+
+.slide-checkbox-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-gray-700);
+  cursor: pointer;
+}
+
+.slide-node-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.slide-node-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--color-gray-200);
+  font-size: 13px;
+  color: var(--color-gray-600);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.slide-node-chip--active {
+  border-color: var(--color-black);
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--color-black);
+  font-weight: 500;
+}
+
+.slide-storage-pool-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.slide-storage-pool-row__name {
+  font-size: 13px;
+  color: var(--color-gray-700);
+  width: 120px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -8,6 +8,7 @@ import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
 import { Modal } from '@/components/Modal/Modal'
 import { TaskProgressModal } from '@/components/TaskProgressModal/TaskProgressModal'
 import { useToastStore } from '@/stores/toast'
+import { useFormValidation } from '@/hooks/useFormValidation'
 import '@/components/PageTransition/PageTransition.css'
 
 // ============== 类型定义 ==============
@@ -236,6 +237,7 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
   onTaskCreated: (taskId: string, taskType: string) => void
 }) {
   const toast = useToastStore()
+  const { validate, hasError, clearError, reset } = useFormValidation()
   const [loading, setLoading] = useState(false)
   const [name, setName] = useState('')
   const [driver, setDriver] = useState('dir')
@@ -254,6 +256,7 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
       setLoopbackSize(20)
       setThinpoolName('')
       setZfsPoolName('')
+      reset()
     }
   }, [open])
 
@@ -271,9 +274,16 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
   }
 
   const handleSubmit = async () => {
-    if (!nodeId || !name || !driver) return
-    if (!loopback && !source && driver !== 'dir') {
-      toast.error('请选择源设备')
+    const rules: { field: string; valid: () => boolean }[] = [
+      { field: 'name', valid: () => name.trim().length > 0 },
+      { field: 'driver', valid: () => driver.trim().length > 0 },
+    ]
+    if (!loopback && driver !== 'dir') {
+      rules.push({ field: 'source', valid: () => source.trim().length > 0 })
+    }
+    const result = validate(rules)
+    if (!result.ok) {
+      toast.error('请填写必填字段')
       return
     }
     setLoading(true)
@@ -297,6 +307,7 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
       onTaskCreated(res.data.task_id, 'init_storage')
       onSuccess()
       onClose()
+      reset()
     } catch (err: any) {
       toast.error(err.response?.data?.error || '操作失败')
     } finally {
@@ -322,8 +333,8 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
           <label className="block text-sm font-medium text-secondary mb-1">存储池名称 <span className="text-red-500">*</span></label>
           <input
             value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-2 border border-surface-strong rounded-lg text-sm"
+            onChange={(e) => { setName(e.target.value); clearError('name') }}
+            className={`w-full px-3 py-2 border border-surface-strong rounded-lg text-sm ${hasError('name') ? 'field-error' : ''}`}
             placeholder="如：data-pool-01"
           />
         </div>
@@ -391,9 +402,10 @@ function CreatePoolPanel({ open, nodeId, disks, onClose, onSuccess, onTaskCreate
                 <label className="block text-sm font-medium text-secondary mb-1">源设备</label>
                 <Select
                   value={source}
+                  error={hasError('source')}
                   options={sourceOptions}
                   placeholder="选择设备或分区"
-                  onChange={(v) => setSource(v as string)}
+                  onChange={(v) => { setSource(v as string); clearError('source') }}
                 />
               </div>
             )}

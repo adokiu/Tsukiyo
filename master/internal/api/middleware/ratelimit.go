@@ -11,23 +11,26 @@ import (
 	"tsukiyo/master/internal/db"
 )
 
-// RateLimitMiddleware API 限流中间件
-func RateLimitMiddleware(requests int, window time.Duration) gin.HandlerFunc {
+// RateLimitMiddleware API 限流；scope 区分不同接口，strict 为 true 时 Redis 故障拒绝请求。
+func RateLimitMiddleware(scope string, requests int, window time.Duration, strict bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		clientIP := c.ClientIP()
-		key := fmt.Sprintf("rate_limit:%s", clientIP)
+		key := fmt.Sprintf("rate_limit:%s:%s", scope, clientIP)
 
 		ctx := c.Request.Context()
 
-		// 尝试递增计数
 		count, err := db.RedisClient.Incr(ctx, key).Result()
 		if err != nil {
-			zap.L().Warn("限流计数失败", zap.Error(err))
+			zap.L().Warn("限流计数失败", zap.Error(err), zap.String("scope", scope))
+			if strict {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "服务繁忙，请稍后重试"})
+				c.Abort()
+				return
+			}
 			c.Next()
 			return
 		}
 
-		// 首次请求设置过期时间
 		if count == 1 {
 			db.RedisClient.Expire(ctx, key, window)
 		}

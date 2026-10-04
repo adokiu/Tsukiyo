@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
+import { useQuery } from '@tanstack/react-query'
+import apiClient from '@/api/client'
 import {
   LayoutDashboard,
   Server,
@@ -23,6 +25,18 @@ import {
   ShieldCheck,
   Globe,
   SlidersHorizontal,
+  Palette,
+  Users,
+  UsersRound,
+  Wallet,
+  Receipt,
+  CreditCard,
+  ShoppingCart,
+  FolderTree,
+  Package,
+  Ticket,
+  QrCode,
+  Mail,
 } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
 import { useThemeStore } from '@/stores/theme'
@@ -72,6 +86,44 @@ const menuConfig: MenuGroup[] = [
     ],
   },
   {
+    id: 'user',
+    labelKey: 'nav.userManagement',
+    icon: Users,
+    children: [
+      { path: '/admin/userManagement/users', labelKey: 'nav.users', icon: Users },
+      { path: '/admin/userManagement/groups', labelKey: 'nav.userGroups', icon: UsersRound },
+    ],
+  },
+  {
+    id: 'finance',
+    labelKey: 'nav.financeManagement',
+    icon: Wallet,
+    children: [
+      { path: '/admin/financeManagement/overview', labelKey: 'nav.financeOverview', icon: Wallet },
+      { path: '/admin/financeManagement/bills', labelKey: 'nav.billManagement', icon: Receipt },
+      { path: '/admin/financeManagement/channels', labelKey: 'nav.paymentChannels', icon: CreditCard },
+    ],
+  },
+  {
+    id: 'commerce',
+    labelKey: 'nav.commerceManagement',
+    icon: ShoppingCart,
+    children: [
+      { path: '/admin/commerceManagement/categories', labelKey: 'nav.productCategories', icon: FolderTree },
+      { path: '/admin/commerceManagement/products', labelKey: 'nav.products', icon: Package },
+      { path: '/admin/commerceManagement/coupons', labelKey: 'nav.coupons', icon: Ticket },
+      { path: '/admin/commerceManagement/promo-codes', labelKey: 'nav.promoCodes', icon: QrCode },
+    ],
+  },
+  {
+    id: 'ticket',
+    labelKey: 'nav.ticketManagement',
+    icon: Ticket,
+    children: [
+      { path: '/admin/ticketManagement/tickets', labelKey: 'nav.tickets', icon: Ticket },
+    ],
+  },
+  {
     id: 'security',
     labelKey: 'nav.securityManagement',
     icon: Shield,
@@ -88,7 +140,15 @@ const menuConfig: MenuGroup[] = [
     icon: Settings,
     children: [
       { path: '/admin/systemManagement/settings', labelKey: 'nav.generalSettings', icon: Settings },
+      { path: '/admin/systemManagement/pushSettings', labelKey: 'nav.pushSettings', icon: Mail },
+      { path: '/admin/systemManagement/themes', labelKey: 'nav.themeManagement', icon: Palette },
     ],
+  },
+  {
+    id: 'themeSettings',
+    labelKey: 'nav.themeSettings',
+    icon: Palette,
+    children: [],
   },
 ]
 
@@ -103,16 +163,58 @@ function matchGroup(locationPath: string, group: MenuGroup): boolean {
 }
 
 export default function AppLayout() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const navigate = useNavigate()
   const location = useLocation()
   const logout = useAuthStore((s) => s.logout)
   const { theme, setTheme } = useThemeStore()
   const [collapsed, setCollapsed] = useState(false)
 
+  const lang = i18n.language?.startsWith('zh') ? 'zh' : 'en'
+
+  const { data: siteConfig } = useQuery({
+    queryKey: ['site-config'],
+    queryFn: async () => {
+      const res = await apiClient.get('/settings/site')
+      return res.data
+    },
+  })
+
+  const { data: themes } = useQuery({
+    queryKey: ['themes'],
+    queryFn: async () => {
+      const res = await apiClient.get('/theme/list')
+      return res.data as any[]
+    },
+  })
+
+  const dynamicMenuConfig = useMemo(() => {
+    const config = [...menuConfig]
+    const currentThemeShort = siteConfig?.theme || 'default'
+    const currentTheme = themes?.find((th: any) => th.short === currentThemeShort)
+    const pages = currentTheme?.configuration?.pages
+    if (pages && Array.isArray(pages)) {
+      const themeSettingsIdx = config.findIndex((g) => g.id === 'themeSettings')
+      if (themeSettingsIdx >= 0) {
+        config[themeSettingsIdx] = {
+          ...config[themeSettingsIdx],
+          children: pages.map((page: any) => {
+            const pageName = typeof page.name === 'string' ? page.name : (page.name?.[lang] || page.name?.['en'] || page.name?.['zh'] || page.key)
+            return {
+              path: `/admin/themeSettings/${page.key}`,
+              labelKey: pageName,
+              icon: Palette,
+            }
+          }),
+        }
+      }
+    }
+    return config
+  }, [siteConfig, themes, lang])
+
   const activeGroup = useMemo(
-    () => menuConfig.find((g) => matchGroup(location.pathname, g)) ?? menuConfig[0],
-    [location.pathname]
+    () => dynamicMenuConfig.find((g) => matchGroup(location.pathname, g)) ?? dynamicMenuConfig[0],
+    [location.pathname, dynamicMenuConfig]
   )
 
   const handleLogout = () => {
@@ -160,7 +262,7 @@ export default function AppLayout() {
         <div className="sidebar-menus">
           <nav className="sidebar-primary">
             <ul className="menu-list">
-              {menuConfig.map((group) => {
+              {dynamicMenuConfig.map((group) => {
                 const Icon = group.icon
                 const isActive = activeGroup.id === group.id
                 return (

@@ -1,0 +1,15 @@
+-- IPv4 EIP 多IP增配配置
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ipv4_eip_min INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ipv4_eip_max INT NOT NULL DEFAULT 0;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ipv4_eip_custom_mode VARCHAR(16) NOT NULL DEFAULT 'unlimited';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ipv4_eip_tiers JSONB NOT NULL DEFAULT '[]';
+
+-- IPv6 多前缀增配配置（JSON数组）
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ipv6_configs JSONB NOT NULL DEFAULT '[]';
+
+-- 库存配置（0表示不限）
+ALTER TABLE products ADD COLUMN IF NOT EXISTS stock INT NOT NULL DEFAULT 0;
+
+-- 删除旧字段
+ALTER TABLE products DROP COLUMN IF EXISTS ipv4_eip_allow_custom;
+ALTER TABLE products DROP COLUMN IF EXISTS ipv6_prefix_len;

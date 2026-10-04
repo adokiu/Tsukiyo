@@ -1,0 +1,29 @@
+{
+  "name": "Tsukiyo Default",
+  "short": "default",
+  "description": "Tsukiyo 默认用户主题",
+  "version": "1.0.0",
+  "author": "Tsukiyo",
+  "configuration": {
+    "type": "managed",
+    "data": [
+      { "key": "primaryColor", "name": "主色调", "type": "string", "default": "#087ed1" },
+      { "key": "darkPrimaryColor", "name": "暗色主色调", "type": "string", "default": "#38bdf8" },
+      { "key": "primaryColorHover", "name": "主色调悬停", "type": "string", "default": "#0a6bc4" },
+      { "key": "darkPrimaryColorHover", "name": "暗色主色调悬停", "type": "string", "default": "#0ea5e9" },
+      { "key": "borderRadius", "name": "圆角", "type": "string", "default": "0.75rem" },
+      { "key": "fontFamily", "name": "字体", "type": "string", "default": "Inter, 'MiSans VF', sans-serif" },
+      { "key": "backgroundEnabled", "name": "自定义背景", "type": "switch", "default": false },
+      { "key": "backgroundType", "name": "背景类型", "type": "select", "options": "image,video", "default": "image" },
+      { "key": "lightBackgroundUrl", "name": "亮色背景URL", "type": "string", "default": "" },
+      { "key": "darkBackgroundUrl", "name": "暗色背景URL", "type": "string", "default": "" },
+      { "key": "backgroundBlur", "name": "背景模糊(px)", "type": "number", "default": 0 },
+      { "key": "backgroundOverlay", "name": "背景遮罩(%)", "type": "number", "default": 0 },
+      { "key": "showLoginButton", "name": "显示登录按钮", "type": "switch", "default": true },
+      { "key": "enableRegister", "name": "允许注册", "type": "switch", "default": true },
+      { "key": "siteName", "name": "站点名称", "type": "string", "default": "Tsukiyo" },
+      { "key": "siteSubtitle", "name": "站点副标题", "type": "string", "default": "" },
+      { "key": "footerText", "name": "页脚文字", "type": "string", "default": "" }
+    ]
+  }
+}

@@ -1,0 +1,1 @@
+ALTER TABLE node_images DROP COLUMN IF EXISTS status;

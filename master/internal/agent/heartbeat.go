@@ -64,6 +64,10 @@ func (m *Manager) handleHeartbeat(nodeID uuid.UUID, payload json.RawMessage) {
 	if len(hb.NetworkInterfaces) > 0 {
 		db.DB.Model(&models.Node{}).Where("id = ?", nodeID).UpdateColumn("system_info", gorm.Expr("jsonb_set(COALESCE(system_info, '{}'::jsonb), '{network_interfaces}', ?::jsonb)", string(hb.NetworkInterfaces)))
 		m.checkHostEIPPoolExpired(nodeID, hb.NetworkInterfaces)
+		// 检测动态绑定池 IP 变化
+		if m.OnDynamicBindingCheck != nil {
+			m.OnDynamicBindingCheck(nodeID, hb.NetworkInterfaces)
+		}
 	}
 
 	// 广播心跳数据到前端 WebSocket
@@ -108,9 +112,9 @@ func (m *Manager) checkHostEIPPoolExpired(nodeID uuid.UUID, networkInterfaces js
 			poolIP = pool.CIDR[:idx]
 		}
 		if !currentIPs[poolIP] {
-			// IP 已不在网卡上，标记为 inactive
-			db.DB.Model(pool).Update("status", "inactive")
-			zap.L().Warn("host EIP 池 IP 已失效，标记为 inactive", zap.String("pool_id", pool.ID.String()), zap.String("old_ip", poolIP), zap.String("interface", pool.Interface))
+			// IP 已不在网卡上，标记为 disabled
+			db.DB.Model(pool).Update("status", models.EIPPoolStatusDisabled)
+			zap.L().Warn("host EIP 池 IP 已失效，标记为 disabled", zap.String("pool_id", pool.ID.String()), zap.String("old_ip", poolIP), zap.String("interface", pool.Interface))
 		}
 	}
 }

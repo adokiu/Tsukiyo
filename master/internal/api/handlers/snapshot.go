@@ -69,7 +69,7 @@ func CreateSnapshot(c *gin.Context) {
 			return
 		}
 		if serviceErr, ok := err.(*service.ServiceError); ok && serviceErr.Message == "快照数量已达上限" {
-			c.JSON(http.StatusForbidden, gin.H{"error": "快照数量已达上限"})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": "快照数量已达上限"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建任务失败"})

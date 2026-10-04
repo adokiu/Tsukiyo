@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { X, CheckCircle, XCircle, Loader2 } from 'lucide-react'
 import apiClient from '@/api/client'
+import { buildAuthenticatedWebSocketUrl } from '@/utils/wsUrl'
 
 interface TaskLogEntry {
   level: string
@@ -74,9 +75,7 @@ export function TaskProgressModal({ taskId, taskType, onClose }: TaskProgressMod
     let manualClose = false
 
     const connectWS = () => {
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${proto}//${window.location.host}/ws/tasks`
-      const ws = new WebSocket(wsUrl)
+      const ws = new WebSocket(buildAuthenticatedWebSocketUrl('/ws/tasks'))
       wsRef.current = ws
 
       ws.onmessage = (event) => {

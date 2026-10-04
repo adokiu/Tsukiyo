@@ -6,6 +6,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"tsukiyo/master/internal/auth"
 	"tsukiyo/master/internal/db"
 	"tsukiyo/master/internal/models"
 	"tsukiyo/master/internal/service"
@@ -20,17 +21,49 @@ func NewUserService() *UserService {
 }
 
 // ListUsers 获取用户列表
-func (s *UserService) ListUsers(page, pageSize int) ([]models.User, int64, error) {
+func (s *UserService) ListUsers(page, pageSize int, search, statusFilter string) ([]models.User, int64, error) {
+	query := db.DB.Model(&models.User{})
+	if search != "" {
+		query = query.Where("username ILIKE ? OR email ILIKE ?", "%"+search+"%", "%"+search+"%")
+	}
+	if statusFilter != "" {
+		query = query.Where("status = ?", statusFilter)
+	}
+
+	var total int64
+	query.Count(&total)
+
 	var users []models.User
-	if err := db.DB.Order("created_at DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&users).Error; err != nil {
+	if err := query.Order("created_at DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&users).Error; err != nil {
 		zap.L().Error("查询用户列表失败", zap.Error(err))
 		return nil, 0, err
 	}
 
-	var total int64
-	db.DB.Model(&models.User{}).Count(&total)
-
 	return users, total, nil
+}
+
+// GetUserGroups 批量获取用户组
+func (s *UserService) GetUserGroups(userIDs []uint) (map[uint][]string, error) {
+	if len(userIDs) == 0 {
+		return make(map[uint][]string), nil
+	}
+	type userGroupRow struct {
+		UserID    uint   `json:"user_id"`
+		GroupName string `json:"group_name"`
+	}
+	var rows []userGroupRow
+	if err := db.DB.Table("user_group_members as m").
+		Select("m.user_id, g.name as group_name").
+		Joins("INNER JOIN user_groups g ON g.id = m.group_id").
+		Where("m.user_id IN ?", userIDs).
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make(map[uint][]string)
+	for _, r := range rows {
+		result[r.UserID] = append(result[r.UserID], r.GroupName)
+	}
+	return result, nil
 }
 
 // GetUser 获取用户详情
@@ -55,13 +88,38 @@ func (s *UserService) GetUser(userID uint) (*models.User, []models.UserGroup, er
 }
 
 // UpdateUser 更新用户
-func (s *UserService) UpdateUser(userID uint, email, status string) error {
+func (s *UserService) UpdateUser(userID uint, email, status string, balanceCents *int64, password, phone, qq, realNameStatus, realName, idCard string) error {
 	updates := make(map[string]interface{})
 	if email != "" {
 		updates["email"] = email
 	}
 	if status != "" {
 		updates["status"] = status
+	}
+	if balanceCents != nil {
+		updates["balance_cents"] = *balanceCents
+	}
+	if password != "" {
+		hash, err := auth.HashPassword(password)
+		if err != nil {
+			return err
+		}
+		updates["password_hash"] = hash
+	}
+	if phone != "" {
+		updates["phone"] = phone
+	}
+	if qq != "" {
+		updates["qq"] = qq
+	}
+	if realNameStatus != "" {
+		updates["real_name_status"] = realNameStatus
+	}
+	if realName != "" {
+		updates["real_name"] = realName
+	}
+	if idCard != "" {
+		updates["id_card"] = idCard
 	}
 
 	if len(updates) == 0 {

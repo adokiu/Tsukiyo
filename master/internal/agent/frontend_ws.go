@@ -13,6 +13,10 @@ import (
 
 // HandleFrontendWebSocket 处理前端 WebSocket 连接
 func (m *Manager) HandleFrontendWebSocket(c *gin.Context) {
+	if _, ok := authenticateStaffWebSocket(c); !ok {
+		return
+	}
+
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		zap.L().Error("前端 WebSocket 升级失败", zap.Error(err))

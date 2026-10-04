@@ -3,6 +3,7 @@ import apiClient from '@/api/client'
 import { Button } from '@/components/Button/Button'
 import { Select } from '@/components/Select/Select'
 import { SlidePanel } from '@/components/SlidePanel/SlidePanel'
+import { useFormValidation } from '@/hooks/useFormValidation'
 import { useToastStore } from '@/stores/toast'
 import type { Bridge, EIPPool } from './types'
 
@@ -18,6 +19,7 @@ interface BridgeFormPanelProps {
 
 export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, onClose, onSuccess }: BridgeFormPanelProps) {
   const toast = useToastStore()
+  const { validate, hasError, clearError, reset } = useFormValidation()
   const [loading, setLoading] = useState(false)
   const [eipPools, setEipPools] = useState<EIPPool[]>([])
 
@@ -143,8 +145,18 @@ export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, o
     .map(p => ({ label: `${p.cidr} (${p.interface || '无网卡'}) [${p.pool_type === 'host' ? '宿主机' : 'EIP'}]`, value: p.id }))
 
   const handleSubmit = async () => {
-    if (!nodeId || !name || !ipv4Cidr) {
-      toast.error('请填写名称和 IPv4 CIDR')
+    const rules: { field: string; valid: () => boolean }[] = [
+      { field: 'name', valid: () => name.trim().length > 0 },
+    ]
+    if (ipv4Enabled) {
+      rules.push({ field: 'ipv4_cidr', valid: () => ipv4Cidr.trim().length > 0 })
+    }
+    if (ipv6Enabled) {
+      rules.push({ field: 'ipv6_eip_pool', valid: () => ipv6EipPoolId.trim().length > 0 })
+    }
+    const result = validate(rules)
+    if (!result.ok) {
+      toast.error('请填写必填字段')
       return
     }
     setLoading(true)
@@ -178,6 +190,7 @@ export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, o
       }
       onSuccess()
       onClose()
+      reset()
     } catch (err: any) {
       toast.error(err.response?.data?.error || '操作失败')
     } finally {
@@ -235,7 +248,7 @@ export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, o
       <div className="space-y-4">
         <div>
           <label className="block text-sm font-medium text-secondary mb-1">Bridge 名称 <span className="text-red-500">*</span></label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 border border-surface-strong rounded-lg text-sm" placeholder="如：生产网络-01" />
+          <input value={name} onChange={(e) => { setName(e.target.value); clearError('name') }} className={`w-full px-3 py-2 border border-surface-strong rounded-lg text-sm ${hasError('name') ? 'field-error' : ''}`} placeholder="如：生产网络-01" />
         </div>
 
         {/* IPv4 配置 */}
@@ -249,7 +262,7 @@ export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, o
               <div>
                 <label className="block text-sm font-medium text-secondary mb-1">IPv4 CIDR <span className="text-red-500">*</span> {hasInstances && <span className="text-amber-600 text-xs">(已锁定)</span>}</label>
                 <div className="flex gap-2">
-                  <input value={ipv4Cidr} disabled={hasInstances} onChange={(e) => setIpv4Cidr(e.target.value)} className="w-full px-3 py-2 border border-surface-strong rounded-lg text-sm disabled:bg-surface-secondary" placeholder="10.10.1.0/24" />
+                  <input value={ipv4Cidr} disabled={hasInstances} onChange={(e) => { setIpv4Cidr(e.target.value); clearError('ipv4_cidr') }} className={`w-full px-3 py-2 border border-surface-strong rounded-lg text-sm disabled:bg-surface-secondary ${hasError('ipv4_cidr') ? 'field-error' : ''}`} placeholder="10.10.1.0/24" />
                   {!hasInstances && (
                     <button type="button" onClick={autoGenerateV4Cidr} className="shrink-0 px-3 py-2 border border-surface-strong rounded-lg text-xs text-tertiary hover:bg-surface-secondary whitespace-nowrap">自动生成</button>
                   )}
@@ -275,9 +288,10 @@ export function BridgeFormPanel({ open, mode, bridge, nodeId, existingBridges, o
                 <label className="block text-sm font-medium text-secondary mb-1">IPv6 EIP 资源池 <span className="text-red-500">*</span></label>
                 <Select
                   value={ipv6EipPoolId}
+                  error={hasError('ipv6_eip_pool')}
                   options={v6PoolOptions}
                   placeholder="选择 IPv6 EIP 资源池"
-                  onChange={(v) => { setIpv6EipPoolId(v as string); setIpv6SpecificIP('') }}
+                  onChange={(v) => { setIpv6EipPoolId(v as string); setIpv6SpecificIP(''); clearError('ipv6_eip_pool') }}
                 />
                 {v6PoolOptions.length === 0 && (
                   <p className="text-xs text-muted mt-1">暂无 IPv6 EIP 资源池，请先创建</p>

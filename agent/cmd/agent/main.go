@@ -549,7 +549,7 @@ func main() {
 }
 
 func syncLocalImages(ic *incus.Client, wsClient *ws.Client) {
-	if !ic.IsAvailable() {
+	if !wsClient.IsConnected() || !ic.IsAvailable() {
 		return
 	}
 	aliases, err := ic.ListImages()

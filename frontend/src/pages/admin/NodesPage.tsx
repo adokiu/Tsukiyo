@@ -11,6 +11,7 @@ import { SearchInput } from '@/components/SearchInput/SearchInput'
 import { FilterBar, type FilterField } from '@/components/FilterBar/FilterBar'
 import { PageLayout } from '@/components/PageLayout/PageLayout'
 import { useListQuery } from '@/hooks/useListQuery'
+import { useFormValidation } from '@/hooks/useFormValidation'
 import { useToastStore } from '@/stores/toast'
 import { getOSImage } from '@/utils/osImageHelper'
 import '@/components/PageTransition/PageTransition.css'
@@ -225,6 +226,7 @@ export default function NodesPage() {
   const [currentNode, setCurrentNode] = useState<Node | null>(null)
   const [nodeName, setNodeName] = useState('')
   const [newToken, setNewToken] = useState('')
+  const { validate, hasError, clearError, reset } = useFormValidation()
 
   // 确认弹窗状态
   const [confirmOpen, setConfirmOpen] = useState(false)
@@ -236,13 +238,20 @@ export default function NodesPage() {
   const [confirmRequireValue, setConfirmRequireValue] = useState('')
 
   const handleCreate = async () => {
-    if (!nodeName.trim()) return
+    const result = validate([
+      { field: 'nodeName', valid: () => nodeName.trim().length > 0 },
+    ])
+    if (!result.ok) {
+      toast.error(t('common.required'))
+      return
+    }
     const res = await apiClient.post('/nodes', { name: nodeName })
     const data = res.data
     toast.success(`节点创建成功: ${data.name}`)
     setNewToken(data.token)
     setTokenOpen(true)
     setNodeName('')
+    reset()
     setPanelOpen(false)
     refresh()
   }
@@ -302,9 +311,18 @@ export default function NodesPage() {
 
   const handleSaveConfig = async () => {
     if (!currentNode) return
+    const result = validate([
+      { field: 'incus_socket_path', valid: () => cfgForm.incus_socket_path.trim().length > 0 },
+      { field: 'agent_url', valid: () => cfgForm.agent_url.trim().length > 0 },
+    ])
+    if (!result.ok) {
+      toast.error(t('common.required'))
+      return
+    }
     await apiClient.put(`/nodes/${currentNode.id}/config`, cfgForm)
     toast.success('配置已保存并下发给 Agent')
     await refresh()
+    reset()
     setConfigOpen(false)
   }
 
@@ -631,10 +649,10 @@ export default function NodesPage() {
         <div className="space-y-4">
           <label className="block text-sm font-medium text-primary">节点名称</label>
           <input
-            className="w-full rounded-lg border border-surface px-3 py-2 text-sm focus:border-surface-strong focus:outline-none focus:ring-2 focus:ring-black/5"
+            className={`w-full rounded-lg border border-surface px-3 py-2 text-sm focus:border-surface-strong focus:outline-none focus:ring-2 focus:ring-black/5 ${hasError('nodeName') ? 'field-error' : ''}`}
             placeholder="输入节点名称"
             value={nodeName}
-            onChange={(e) => setNodeName(e.target.value)}
+            onChange={(e) => { setNodeName(e.target.value); clearError('nodeName') }}
           />
         </div>
       </SlidePanel>
@@ -939,9 +957,9 @@ token: "${newToken}"`}
           <div>
             <label className="block text-sm font-medium text-primary">Incus Socket 路径</label>
             <input
-              className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
+              className={`w-full rounded-lg border border-surface px-3 py-2 text-sm ${hasError('incus_socket_path') ? 'field-error' : ''}`}
               value={cfgForm.incus_socket_path}
-              onChange={(e) => setCfgForm({ ...cfgForm, incus_socket_path: e.target.value })}
+              onChange={(e) => { setCfgForm({ ...cfgForm, incus_socket_path: e.target.value }); clearError('incus_socket_path') }}
             />
           </div>
           <div className="grid grid-cols-2 gap-4">
@@ -969,9 +987,9 @@ token: "${newToken}"`}
             <input
               type="text"
               placeholder="https://us-lax.testnode.com"
-              className="w-full rounded-lg border border-surface px-3 py-2 text-sm"
+              className={`w-full rounded-lg border border-surface px-3 py-2 text-sm ${hasError('agent_url') ? 'field-error' : ''}`}
               value={cfgForm.agent_url}
-              onChange={(e) => setCfgForm({ ...cfgForm, agent_url: e.target.value })}
+              onChange={(e) => { setCfgForm({ ...cfgForm, agent_url: e.target.value }); clearError('agent_url') }}
             />
             <p className="mt-1 text-xs text-tertiary">用于前端直连宿主机 VNC / WebSSH 等服务，需包含协议（http/https）</p>
           </div>

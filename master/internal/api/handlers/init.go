@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"tsukiyo/master/internal/auth"
 	"tsukiyo/master/internal/db"
@@ -54,7 +58,7 @@ func InitSetup(c *gin.Context) {
 	var count int64
 	db.DB.Model(&models.User{}).Count(&count)
 	if count > 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "系统已初始化，无法重复设置"})
+		c.JSON(http.StatusOK, gin.H{"code": 403, "error": "系统已初始化，无法重复设置"})
 		return
 	}
 
@@ -71,6 +75,15 @@ func InitSetup(c *gin.Context) {
 		}
 	}()
 
+	// 生成随机安全入口路径
+	entryPathBytes := make([]byte, 4)
+	if _, err := rand.Read(entryPathBytes); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成安全入口失败"})
+		return
+	}
+	adminEntryPath := hex.EncodeToString(entryPathBytes)
+
 	// 创建站点配置
 	site := models.SiteConfig{
 		SiteName:        req.SiteName,
@@ -80,6 +93,8 @@ func InitSetup(c *gin.Context) {
 		ContactEmail:    req.ContactEmail,
 		IncusRemoteURL:  req.IncusRemoteURL,
 		IsInitialized:   true,
+		Theme:           "default",
+		AdminEntryPath:  adminEntryPath,
 	}
 	if err := tx.Create(&site).Error; err != nil {
 		tx.Rollback()
@@ -131,9 +146,18 @@ func InitSetup(c *gin.Context) {
 		return
 	}
 
+	// 输出安全入口路径到控制台
+	zap.L().Info("========================================")
+	zap.L().Info("管理员安全入口路径已生成",
+		zap.String("entry_path", adminEntryPath),
+		zap.String("url", fmt.Sprintf("/%s", adminEntryPath)))
+	zap.L().Info("请妥善保存此路径，未登录访问 /admin/* 将返回 404")
+	zap.L().Info("========================================")
+
 	c.JSON(http.StatusOK, gin.H{
-		"message":   "初始化成功",
-		"site_name": site.SiteName,
-		"admin_id":  admin.ID,
+		"message":    "初始化成功",
+		"site_name":  site.SiteName,
+		"admin_id":   admin.ID,
+		"entry_path": adminEntryPath,
 	})
 }

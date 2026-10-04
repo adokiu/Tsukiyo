@@ -1,0 +1,3 @@
+-- 站点配置表添加注册相关字段
+ALTER TABLE site_configs ADD COLUMN IF NOT EXISTS allow_registration BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE site_configs ADD COLUMN IF NOT EXISTS force_email_verify BOOLEAN NOT NULL DEFAULT FALSE;

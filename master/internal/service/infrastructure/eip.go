@@ -83,15 +83,16 @@ func (s *NetworkService) ListEIPPools(nodeID string, search string, filters map[
 }
 
 type CreateEIPPoolRequest struct {
-	NodeID        uuid.UUID
-	IPVersion     string
-	CIDR          string
-	Interface     string
-	Gateway       string
-	Alias         string
-	PoolType      string
-	NetmaskPrefix int
-	UserID        uint
+	NodeID         uuid.UUID
+	IPVersion      string
+	CIDR           string
+	Interface      string
+	Gateway        string
+	Alias          string
+	PoolType       string
+	NetmaskPrefix  int
+	DynamicBinding bool
+	UserID         uint
 }
 
 func (s *NetworkService) CreateEIPPool(req CreateEIPPoolRequest) (*models.EIPPool, error) {
@@ -118,6 +119,16 @@ func (s *NetworkService) CreateEIPPool(req CreateEIPPoolRequest) (*models.EIPPoo
 		}
 	}
 
+	// 动态绑定唯一性校验：同一网卡同一IP版本只能有一个动态绑定池
+	if req.DynamicBinding && req.Interface != "" {
+		var count int64
+		db.DB.Model(&models.EIPPool{}).Where("node_id = ? AND ip_version = ? AND interface = ? AND dynamic_binding = true AND status = ?",
+			req.NodeID, req.IPVersion, req.Interface, models.EIPPoolStatusActive).Count(&count)
+		if count > 0 {
+			return nil, service.ErrDynamicBindingPoolExists
+		}
+	}
+
 	// 校验 CIDR 不与同节点同 IP 版本其他池重复
 	var existingPools []models.EIPPool
 	db.DB.Where("node_id = ? AND ip_version = ?", req.NodeID, req.IPVersion).Find(&existingPools)
@@ -140,17 +151,18 @@ func (s *NetworkService) CreateEIPPool(req CreateEIPPoolRequest) (*models.EIPPoo
 	alias := req.Alias
 
 	pool := models.EIPPool{
-		ID:            uuid.New(),
-		NodeID:        req.NodeID,
-		IPVersion:     req.IPVersion,
-		CIDR:          req.CIDR,
-		Interface:     req.Interface,
-		Gateway:       req.Gateway,
-		PrefixLen:     ones,
-		NetmaskPrefix: req.NetmaskPrefix,
-		Alias:         alias,
-		PoolType:      poolType,
-		Status:        models.EIPPoolStatusActive,
+		ID:             uuid.New(),
+		NodeID:         req.NodeID,
+		IPVersion:      req.IPVersion,
+		CIDR:           req.CIDR,
+		Interface:      req.Interface,
+		Gateway:        req.Gateway,
+		PrefixLen:      ones,
+		NetmaskPrefix:  req.NetmaskPrefix,
+		Alias:          alias,
+		PoolType:       poolType,
+		DynamicBinding: req.DynamicBinding,
+		Status:         models.EIPPoolStatusActive,
 	}
 
 	if err := db.DB.Create(&pool).Error; err != nil {
@@ -185,12 +197,13 @@ func (s *NetworkService) DeleteEIPPool(poolID uuid.UUID) error {
 }
 
 type UpdateEIPPoolRequest struct {
-	Interface     string
-	Gateway       string
-	Alias         string
-	NetmaskPrefix int
-	PoolType      string
-	Status        string
+	Interface      string
+	Gateway        string
+	Alias          string
+	NetmaskPrefix  int
+	PoolType       string
+	Status         string
+	DynamicBinding *bool
 }
 
 func (s *NetworkService) UpdateEIPPool(poolID uuid.UUID, req UpdateEIPPoolRequest) (*models.EIPPool, error) {
@@ -219,6 +232,16 @@ func (s *NetworkService) UpdateEIPPool(poolID uuid.UUID, req UpdateEIPPoolReques
 		}
 	}
 
+	// 动态绑定唯一性校验：开启时同一网卡同一IP版本只能有一个动态绑定池
+	if req.DynamicBinding != nil && *req.DynamicBinding && pool.Interface != "" {
+		var count int64
+		db.DB.Model(&models.EIPPool{}).Where("node_id = ? AND ip_version = ? AND interface = ? AND dynamic_binding = true AND status = ? AND id != ?",
+			pool.NodeID, pool.IPVersion, pool.Interface, models.EIPPoolStatusActive, poolID).Count(&count)
+		if count > 0 {
+			return nil, service.ErrDynamicBindingPoolExists
+		}
+	}
+
 	updates := map[string]interface{}{
 		"interface":      req.Interface,
 		"gateway":        req.Gateway,
@@ -234,6 +257,9 @@ func (s *NetworkService) UpdateEIPPool(poolID uuid.UUID, req UpdateEIPPoolReques
 		updates["status"] = models.EIPPoolStatusActive
 	} else if req.Status == "disabled" {
 		updates["status"] = models.EIPPoolStatusDisabled
+	}
+	if req.DynamicBinding != nil {
+		updates["dynamic_binding"] = *req.DynamicBinding
 	}
 
 	if err := db.DB.Model(&pool).Updates(updates).Error; err != nil {
@@ -736,10 +762,11 @@ func (s *NetworkService) ListAvailableEIPsFromPool(poolID uuid.UUID, prefixLen i
 	ipLen := len(ipNet.IP)
 
 	if pool.IPVersion == "ipv4" {
-		// 网络地址
-		excludeRanges = append(excludeRanges, ipRange{start: poolStart, end: poolStart})
-		// 广播地址
-		excludeRanges = append(excludeRanges, ipRange{start: poolEnd, end: poolEnd})
+		// /31、/32 单地址或点对点池（常见于宿主机 NAT 出口）不应排除「网络/广播」
+		if poolOnes < 31 {
+			excludeRanges = append(excludeRanges, ipRange{start: poolStart, end: poolStart})
+			excludeRanges = append(excludeRanges, ipRange{start: poolEnd, end: poolEnd})
+		}
 		// 网关地址（仅在网关位于池范围内时）
 		if pool.Gateway != "" {
 			gwIP := net.ParseIP(pool.Gateway)
@@ -758,14 +785,6 @@ func (s *NetworkService) ListAvailableEIPsFromPool(poolID uuid.UUID, prefixLen i
 	// 对齐起始地址到子段边界
 	poolStart = new(big.Int).Div(poolStart, subnetSize)
 	poolStart = new(big.Int).Mul(poolStart, subnetSize)
-
-	// IPv4 /32 时跳过网络地址和广播地址（已在 excludeRanges 中处理）
-	if pool.IPVersion == "ipv4" && prefixLen == 32 {
-		if poolStart.Sign() == 0 {
-			poolStart = new(big.Int).Add(poolStart, big.NewInt(1))
-		}
-		poolEnd = new(big.Int).Sub(poolEnd, big.NewInt(1))
-	}
 
 	results := make([]string, 0, maxCount)
 	for cur := new(big.Int).Set(poolStart); new(big.Int).Sub(new(big.Int).Add(cur, subnetSize), big.NewInt(1)).Cmp(poolEnd) <= 0 && len(results) < maxCount; cur = new(big.Int).Add(cur, subnetSize) {
@@ -853,10 +872,13 @@ func (s *NetworkService) tryAllocateFromPool(pool models.EIPPool, prefixLen int,
 	subnetSize := new(big.Int).Lsh(big.NewInt(1), uint(poolBits-prefixLen))
 	poolStart, poolEnd := cidrToRange(ipNet)
 
-	// IPv4 时总是跳过网络地址和广播地址
-	if pool.IPVersion == "ipv4" {
-		poolStart = new(big.Int).Add(poolStart, big.NewInt(1))
-		poolEnd = new(big.Int).Sub(poolEnd, big.NewInt(1))
+	// IPv4 时排除网络地址和广播地址（将它们加入 usedRanges）
+	if pool.IPVersion == "ipv4" && poolOnes < 31 {
+		networkAddr := big.NewInt(0).SetBytes(ipNet.IP)
+		broadcastAddr := new(big.Int).Add(poolStart, new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), uint(poolBits-poolOnes)), big.NewInt(1)))
+		broadcastAddr = new(big.Int).Sub(broadcastAddr, big.NewInt(1))
+		usedRanges = append(usedRanges, ipRange{start: networkAddr, end: networkAddr})
+		usedRanges = append(usedRanges, ipRange{start: broadcastAddr, end: broadcastAddr})
 	}
 
 	// 排除网关地址（仅在网关位于池范围内时）

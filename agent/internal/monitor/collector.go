@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -96,6 +97,13 @@ func NewCollector(cfg *config.Config, wsClient *ws.Client, incusClient *incus.Cl
 	}
 }
 
+func shouldLogSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !errors.Is(err, ws.ErrNotRegistered)
+}
+
 // Start 启动监控采集循环
 func (c *Collector) Start() {
 	zap.L().Info("监控采集器启动", zap.Duration("interval", c.cfg.MetricsInterval()))
@@ -169,13 +177,16 @@ func (c *Collector) syncImages() {
 		}
 		return
 	}
-	if err := c.wsClient.SendLocalImages(aliases); err != nil {
+	if err := c.wsClient.SendLocalImages(aliases); err != nil && shouldLogSendError(err) {
 		zap.L().Warn("定期镜像同步: 上报失败", zap.Error(err))
 	}
 }
 
 // collectAndReport 采集并上报
 func (c *Collector) collectAndReport() {
+	if !c.wsClient.IsConnected() {
+		return
+	}
 	if !c.incusClient.IsAvailable() {
 		return
 	}
@@ -227,14 +238,14 @@ func (c *Collector) collectAndReport() {
 
 	// 上报实例状态
 	if len(statuses) > 0 {
-		if err := c.wsClient.SendInstanceStatus(statuses); err != nil {
+		if err := c.wsClient.SendInstanceStatus(statuses); err != nil && shouldLogSendError(err) {
 			zap.L().Warn("上报实例状态失败", zap.Error(err))
 		}
 	}
 
 	// 上报监控指标
 	if len(metrics) > 0 {
-		if err := c.wsClient.SendMetrics(metrics); err != nil {
+		if err := c.wsClient.SendMetrics(metrics); err != nil && shouldLogSendError(err) {
 			zap.L().Warn("上报监控指标失败", zap.Error(err))
 		}
 	}
@@ -632,7 +643,7 @@ func (c *Collector) sendHeartbeat() {
 	}
 
 	if err := c.wsClient.SendHeartbeat(cpuPercent, memUsed, memTotal, diskUsed, diskTotal,
-		netIn, netOut, uptime, instanceCount, running, publicIPv4s, ipv6Prefixes, networkInterfaces); err != nil {
+		netIn, netOut, uptime, instanceCount, running, publicIPv4s, ipv6Prefixes, networkInterfaces); err != nil && shouldLogSendError(err) {
 		zap.L().Warn("发送心跳失败", zap.Error(err))
 	}
 }

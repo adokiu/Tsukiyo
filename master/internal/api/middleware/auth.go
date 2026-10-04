@@ -17,14 +17,14 @@ func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "缺少认证信息"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "缺少认证信息"})
 			c.Abort()
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "认证格式错误"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "认证格式错误"})
 			c.Abort()
 			return
 		}
@@ -33,7 +33,7 @@ func AuthMiddleware() gin.HandlerFunc {
 
 		// 检查 Token 是否被吊销
 		if auth.IsTokenRevoked(tokenString) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token 已吊销"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "Token 已吊销"})
 			c.Abort()
 			return
 		}
@@ -41,7 +41,7 @@ func AuthMiddleware() gin.HandlerFunc {
 		claims, err := auth.ParseToken(tokenString)
 		if err != nil {
 			zap.L().Warn("Token 解析失败", zap.Error(err))
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的 Token"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "无效的 Token"})
 			c.Abort()
 			return
 		}
@@ -49,13 +49,13 @@ func AuthMiddleware() gin.HandlerFunc {
 		// 检查用户状态
 		var user models.User
 		if err := db.DB.Where("id = ?", claims.UserID).First(&user).Error; err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "用户不存在"})
+			c.JSON(http.StatusOK, gin.H{"code": 401, "error": "用户不存在"})
 			c.Abort()
 			return
 		}
 
 		if !user.IsActive() {
-			c.JSON(http.StatusForbidden, gin.H{"error": "用户已被禁用"})
+			c.JSON(http.StatusOK, gin.H{"code": 403, "error": "用户已被禁用"})
 			c.Abort()
 			return
 		}

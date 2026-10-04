@@ -2,16 +2,26 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"tsukiyo/master/internal/agent"
 	"tsukiyo/master/internal/api/handlers"
 	"tsukiyo/master/internal/api/middleware"
+	"tsukiyo/master/internal/service/commerce"
+	fin "tsukiyo/master/internal/service/finance"
 	infra "tsukiyo/master/internal/service/infrastructure"
 	inst "tsukiyo/master/internal/service/instance"
+	mailSvc "tsukiyo/master/internal/service/mail"
+	_ "tsukiyo/master/internal/service/payment/balance" // 余额支付驱动自注册
+	_ "tsukiyo/master/internal/service/payment/epay"    // 易支付驱动自注册
+	_ "tsukiyo/master/internal/service/payment/manual"  // 人工入账驱动自注册
+	sup "tsukiyo/master/internal/service/support"
 	sys "tsukiyo/master/internal/service/system"
+	themeSvc "tsukiyo/master/internal/service/theme"
 	usr "tsukiyo/master/internal/service/user"
 )
 
@@ -22,6 +32,7 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 
 	// 全局中间件
 	r.Use(gin.Recovery())
+	r.Use(middleware.SecurityHeadersMiddleware())
 	r.Use(middleware.CORSMiddleware())
 	r.Use(gin.Logger())
 
@@ -40,6 +51,8 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	r.GET("/ws/nodes", agentMgr.HandleFrontendWebSocket)
 	// 前端 WebSocket 推送端点（实例状态等实时数据）
 	r.GET("/ws/instances", agentMgr.HandleFrontendWebSocket)
+	// 用户前台 WebSocket 端点（实例实时指标，token 鉴权）
+	r.GET("/ws/user/metrics", agentMgr.HandleUserMetricsWebSocket)
 	// 控制台 WebSocket 端点（通过 token 鉴权，Master 代理转发到 Agent）
 	r.GET("/api/v1/console/ssh", agentMgr.HandleConsoleWebSocket)
 	r.GET("/api/v1/console/vnc", agentMgr.HandleVNCWebSocket)
@@ -52,6 +65,7 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	userService := usr.NewUserService()
 	handlers.InitUserService(userService)
 	networkService := infra.NewNetworkService(agentMgr)
+	agentMgr.OnDynamicBindingCheck = networkService.CheckDynamicBindingPools
 	handlers.InitNetworkService(networkService)
 	instanceService := inst.NewInstanceService(networkService, agentMgr)
 	handlers.InitInstanceService(instanceService)
@@ -63,17 +77,76 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 	handlers.InitStorageService(storageService)
 	authService := usr.NewAuthService()
 	handlers.InitAuthService(authService)
+	mailService := mailSvc.NewMailService()
+	handlers.InitMailService(mailService)
 	auditService := sys.NewAuditService()
 	handlers.InitAuditService(auditService)
+	themeService := themeSvc.NewThemeService()
+	handlers.InitThemeService(themeService)
+	financeService := fin.NewFinanceService()
+	handlers.InitFinanceService(financeService)
+	commerceService := commerce.NewCommerceService()
+	handlers.InitCommerceService(commerceService)
+	commerce.SetInstanceService(instanceService)
+	supportService := sup.NewSupportService()
+	handlers.InitSupportService(supportService)
+
+	// 注入订单支付成功回调：外部支付渠道回调成功后触发订单履约
+	financeService.SetOrderPaidCallback(func(orderID uuid.UUID, userID uint, username string) {
+		commerceService.FulfillOrder(orderID, userID, username)
+	})
 
 	// API v1
 	v1 := r.Group("/api/v1")
 
 	// 公开接口 (无需认证)
 	v1.GET("/init/status", handlers.GetInitStatus)
-	v1.POST("/init/setup", handlers.InitSetup)
-	v1.POST("/auth/login", handlers.Login)
-	v1.POST("/auth/register", handlers.Register)
+	v1.POST("/init/setup",
+		middleware.RateLimitMiddleware("init_setup", 3, time.Hour, true),
+		handlers.InitSetup,
+	)
+	v1.POST("/auth/login",
+		middleware.RateLimitMiddleware("auth_login", 20, time.Minute, true),
+		handlers.Login,
+	)
+	v1.POST("/auth/register",
+		middleware.RateLimitMiddleware("auth_register", 10, time.Minute, true),
+		handlers.Register,
+	)
+	v1.POST("/auth/register/send-code",
+		middleware.RateLimitMiddleware("auth_register_code", 5, 10*time.Minute, true),
+		handlers.SendRegisterCode,
+	)
+
+	// 公开站点信息 (无需认证，供用户前台初始化)
+	v1.GET("/public/info", handlers.GetPublicInfo)
+
+	// 公开商品接口 (无需认证，未登录用户可浏览商品)
+	v1.GET("/public/products", handlers.GetPublicProducts)
+	v1.GET("/public/products/:id", handlers.GetPublicProduct)
+	v1.GET("/public/products/:id/images", handlers.ListProductNodeImages)
+	v1.GET("/public/products/:id/bridges", handlers.ListProductNodeBridges)
+	v1.GET("/public/product-categories", handlers.GetPublicProductCategories)
+
+	// 管理员安全入口 (通过随机路径访问管理后台登录页)
+	// 路由格式: /{entry_path} -> 前端管理员登录页
+	// API: POST /api/v1/auth/admin/login -> 管理员登录
+	r.GET("/:entry_path", func(c *gin.Context) {
+		entryPath := c.Param("entry_path")
+		// 如果路径匹配 API 前缀，跳过
+		if len(entryPath) > 3 && (entryPath == "api" || entryPath == "ws" || entryPath == "themes" || entryPath == "console" || entryPath == "vnc" || entryPath == "health") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "接口不存在"})
+			return
+		}
+		// 验证 entry_path 是否匹配
+		handlers.ValidateAdminEntryPath()(c)
+		if c.IsAborted() {
+			return
+		}
+		// 返回管理后台登录页 HTML
+		// 实际由静态文件服务处理，这里仅做路径验证
+		c.JSON(http.StatusOK, gin.H{"entry_path": entryPath, "valid": true})
+	})
 
 	// 需要认证的接口
 	authGroup := v1.Group("")
@@ -94,6 +167,16 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.POST("/user-groups", handlers.CreateUserGroup)
 		authGroup.PUT("/user-groups/:id", handlers.UpdateUserGroup)
 		authGroup.DELETE("/user-groups/:id", handlers.DeleteUserGroup)
+
+		// 财务管理
+		authGroup.GET("/finance/payment-drivers", handlers.GetPaymentDrivers)
+		authGroup.GET("/finance/overview", handlers.GetFinanceOverview)
+		authGroup.GET("/finance/bills", handlers.ListBills)
+		authGroup.GET("/finance/bills/:id", handlers.GetBill)
+		authGroup.GET("/finance/payment-channels", handlers.ListPaymentChannels)
+		authGroup.POST("/finance/payment-channels", handlers.CreatePaymentChannel)
+		authGroup.PUT("/finance/payment-channels/:id", handlers.UpdatePaymentChannel)
+		authGroup.DELETE("/finance/payment-channels/:id", handlers.DeletePaymentChannel)
 
 		// 节点管理
 		authGroup.GET("/nodes", handlers.ListNodes)
@@ -238,17 +321,126 @@ func SetupRouter(agentMgr *agent.Manager) *gin.Engine {
 		authGroup.GET("/settings/site", handlers.GetSiteConfig)
 		authGroup.PUT("/settings/site", handlers.UpdateSiteConfig)
 
+		// SMTP推送配置
+		authGroup.GET("/settings/smtp", handlers.GetSMTPConfig)
+		authGroup.PUT("/settings/smtp", handlers.UpdateSMTPConfig)
+		authGroup.POST("/settings/smtp/test", handlers.TestSMTP)
+
 		// 控制台（前端通过 GetInstanceConsole 获取直连 Agent 的 URL 和 Token）
 		// 不再通过 Master 代理 WebSocket，减少带宽开销
 
 		// 控制台凭据（通过 token 换取实例密码）
 		authGroup.GET("/console/credentials", handlers.GetConsoleCredentials)
+
+		// 主题管理
+		authGroup.PUT("/theme/upload", handlers.UploadTheme)
+		authGroup.GET("/theme/list", handlers.ListThemes)
+		authGroup.GET("/theme/set", handlers.SetTheme)
+		authGroup.POST("/theme/delete", handlers.DeleteTheme)
+		authGroup.POST("/theme/import", handlers.ImportTheme)
+		authGroup.POST("/theme/settings", handlers.UpdateThemeSettings)
+		authGroup.GET("/theme/settings", handlers.GetThemeSettings)
+
+		// 安全入口管理
+		authGroup.GET("/admin/entry-path", handlers.GetAdminEntryPath)
+		authGroup.POST("/admin/entry-path/regenerate", handlers.RegenerateAdminEntryPath)
+
+		// 商品分类管理
+		authGroup.GET("/commerce/categories", handlers.ListProductCategories)
+		authGroup.POST("/commerce/categories", handlers.CreateProductCategory)
+		authGroup.PUT("/commerce/categories/:id", handlers.UpdateProductCategory)
+		authGroup.DELETE("/commerce/categories/:id", handlers.DeleteProductCategory)
+
+		// 商品管理
+		authGroup.GET("/commerce/products", handlers.ListProducts)
+		authGroup.POST("/commerce/products", handlers.CreateProduct)
+		authGroup.GET("/commerce/products/:id", handlers.GetProduct)
+		authGroup.PUT("/commerce/products/:id", handlers.UpdateProduct)
+		authGroup.DELETE("/commerce/products/:id", handlers.DeleteProduct)
+
+		// 工单管理
+		authGroup.GET("/tickets", handlers.ListTickets)
+		authGroup.GET("/tickets/:id", handlers.GetTicket)
+		authGroup.POST("/tickets/:id/reply", handlers.StaffReplyTicket)
+		authGroup.PUT("/tickets/:id/status", handlers.UpdateTicketStatus)
+		authGroup.PUT("/tickets/:id/assign", handlers.AssignTicket)
+		authGroup.PUT("/tickets/:id/priority", handlers.UpdateTicketPriority)
+
+		// 用户前台接口（需要认证，但不需要管理员权限）
+		userGroup := v1.Group("")
+		userGroup.Use(middleware.AuthMiddleware())
+		{
+			userGroup.GET("/auth/me", handlers.GetCurrentUser)
+			userGroup.GET("/user/dashboard", handlers.GetUserDashboard)
+			userGroup.GET("/user/instances", handlers.ListUserInstances)
+			userGroup.GET("/user/instances/metrics", handlers.BatchUserInstanceMetrics)
+			userGroup.GET("/user/instances/:id", handlers.GetUserInstance)
+			userGroup.POST("/user/instances/:id/start", handlers.StartUserInstance)
+			userGroup.POST("/user/instances/:id/stop", handlers.StopUserInstance)
+			userGroup.POST("/user/instances/:id/restart", handlers.RestartUserInstance)
+			userGroup.DELETE("/user/instances/:id", handlers.DeleteUserInstance)
+			userGroup.GET("/user/instances/:id/console", handlers.GetUserInstanceConsole)
+			userGroup.GET("/user/instances/:id/metrics", handlers.GetUserInstanceMetrics)
+			userGroup.GET("/user/instances/:id/metrics/history", handlers.GetUserInstanceMetricsHistory)
+			userGroup.POST("/user/instances/:id/reset-password", handlers.ResetUserInstancePassword)
+			userGroup.POST("/user/instances/:id/reinstall", handlers.ReinstallUserInstance)
+			userGroup.GET("/user/instances/:id/snapshots", handlers.ListUserSnapshots)
+			userGroup.POST("/user/instances/:id/snapshots", handlers.CreateUserSnapshot)
+			userGroup.POST("/user/instances/:id/snapshots/:name/restore", handlers.RestoreUserSnapshot)
+			userGroup.DELETE("/user/instances/:id/snapshots/:name", handlers.DeleteUserSnapshot)
+
+			// 用户充值
+			userGroup.GET("/payment/channels", handlers.ListUserPaymentChannels)
+			userGroup.POST("/payment/recharge", handlers.CreateRecharge)
+			userGroup.GET("/payment/recharge/:bill_no/status", handlers.GetRechargeStatus)
+
+			// 用户端商品下单（需要认证）
+			userGroup.POST("/user/products/:id/order", handlers.UserCreateOrder)
+			userGroup.GET("/user/products/:id/images", handlers.ListProductNodeImages)
+			userGroup.GET("/user/products/:id/bridges", handlers.ListProductNodeBridges)
+
+			// 购物车
+			userGroup.GET("/user/cart", handlers.ListCart)
+			userGroup.POST("/user/cart", handlers.AddToCart)
+			userGroup.PUT("/user/cart/:id", handlers.UpdateCart)
+			userGroup.DELETE("/user/cart/:id", handlers.RemoveFromCart)
+			userGroup.DELETE("/user/cart", handlers.ClearCart)
+
+			// 优惠码
+			userGroup.POST("/user/coupon/validate", handlers.ValidateCoupon)
+
+			// 结算与订单
+			userGroup.POST("/user/checkout", handlers.Checkout)
+			userGroup.POST("/user/orders/:id/pay", handlers.PayOrder)
+			userGroup.GET("/user/orders/:id", handlers.GetOrder)
+			userGroup.GET("/user/orders", handlers.ListOrders)
+
+			// 账单与流水
+			userGroup.GET("/user/bills", handlers.ListUserBills)
+			userGroup.GET("/user/bills/:id", handlers.GetUserBill)
+			userGroup.GET("/user/wallet/transactions", handlers.ListUserWalletTransactions)
+
+			// 发票
+			userGroup.GET("/user/orders/:id/invoice", handlers.GetInvoice)
+
+			// 工单
+			userGroup.GET("/user/tickets", handlers.ListUserTickets)
+			userGroup.POST("/user/tickets", handlers.CreateUserTicket)
+			userGroup.GET("/user/tickets/:id", handlers.GetUserTicket)
+			userGroup.POST("/user/tickets/:id/reply", handlers.ReplyUserTicket)
+			userGroup.POST("/user/tickets/:id/close", handlers.CloseUserTicket)
+		}
+
 	}
 
-	// 404 处理
-	r.NoRoute(func(c *gin.Context) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "接口不存在"})
-	})
+	// 支付回调 (无需认证，独立限流)
+	v1.Any("/payment/notify/:channel_id",
+		middleware.RateLimitMiddleware("payment_notify", 120, time.Minute, false),
+		handlers.PaymentNotify,
+	)
+
+	// 主题静态文件路由和 SPA 回退由 SetupThemeStaticRoutes 处理
+	// 在 main.go 中调用 SetupThemeStaticRoutes 注册
 
 	zap.L().Info("路由配置完成")
 	return r

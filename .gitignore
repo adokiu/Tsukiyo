@@ -5,10 +5,11 @@
 *.dylib
 *.out
 
-# Build outputs
-/agent/tsukiyo-agent*
-/master/tsukiyo-master*
-/master/cmd/master/master
+# Build outputs (项目根目录 tsukiyo-*)
+/tsukiyo-master
+/tsukiyo-master.exe
+/tsukiyo-agent
+/agent/dist/
 
 # Images (large files, built locally)
 /images/vm/*.img
@@ -41,13 +42,17 @@ node_modules/
 .env
 .env.local
 
+# Local secrets (use config.example.yaml as template)
+/master/configs/config.yaml
+/agent/config.yaml
+
 # Temporary
 tmp/
 temp/
 *.tmp
 
 # Examples (large reference projects, not part of main codebase)
-examples/
+#examples/
  
 # scripts
 *.py
